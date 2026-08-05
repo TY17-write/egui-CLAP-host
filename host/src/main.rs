@@ -516,14 +516,17 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // ヘッダー行 (ロード操作と状態)
+            // ヘッダー行 (状態表示)
             ui.horizontal(|ui| {
                 ui.heading("CLAP ミニホスト");
                 ui.separator();
+                // .clap のロードはトラック欄の「♪」から行うので、ここでは出さない
+                /*
                 if ui.button(".clap ファイルを開く…").clicked() {
                     // ヘッダーからのロードはトラック1へ
                     self.open_file_dialog(0);
                 }
+                */
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::RED, error);
                 }
@@ -532,11 +535,20 @@ impl eframe::App for App {
                 }
             });
 
-            // プラグイン選択 (1ファイルに複数入っている場合)
+            // プラグイン選択。1つの .clap に複数入っていて、まだ選んでいないときだけ出す
+            // (1つだけのファイルはトラック欄の「♪」でそのまま載るので出さない)。
             let mut instantiate_index = None;
-            if let Some(candidates) = &self.candidates {
+            if let Some(candidates) = self
+                .candidates
+                .as_ref()
+                .filter(|candidates| candidates.plugins.len() > 1)
+            {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("ファイル: {}", candidates.path.display()));
+                    ui.label(format!(
+                        "トラック {} に読み込むプラグインを選択 ({}):",
+                        candidates.target_track + 1,
+                        file_label(&candidates.path)
+                    ));
                     for (i, plugin) in candidates.plugins.iter().enumerate() {
                         if ui
                             .button(format!("▶ {} ({})", plugin.name, plugin.id))
@@ -550,6 +562,8 @@ impl eframe::App for App {
             if let Some(i) = instantiate_index {
                 let track = self.candidates.as_ref().map_or(0, |c| c.target_track);
                 self.instantiate(i, track);
+                // 選び終わったら候補を片付ける (選択行を残さない)
+                self.candidates = None;
             }
 
             // ロード済みプラグインの操作 UI (トラックごと)
@@ -665,7 +679,7 @@ impl eframe::App for App {
             }
 
             if self.tracks.iter().flatten().count() == 0 {
-                ui.label("音色となるプラグインが未ロードです (「.clap ファイルを開く…」から選択)。ロードしなくてもシーケンスの編集はできます。");
+                ui.label("音色となるプラグインが未ロードです (左のトラック欄の「♪」から .clap を選択)。ロードしなくてもシーケンスの編集はできます。");
                 ui.add_space(8.0);
             }
 
@@ -727,11 +741,16 @@ impl eframe::App for App {
                                     (self.editor.editor.length_quarters_bar_aligned() as f64 * spq)
                                         as u64;
                                 for track in 0..self.editor.editor.track_count() {
-                                    let events = self
-                                        .editor
-                                        .editor
-                                        .to_events_for_track(track, sample_rate)
-                                        .into_boxed_slice();
+                                    // ミュート/ソロで鳴らさないトラックは空にして送る
+                                    // (再生中でも即座に止まる)
+                                    let events = if self.editor.editor.is_audible(track) {
+                                        self.editor
+                                            .editor
+                                            .to_events_for_track(track, sample_rate)
+                                            .into_boxed_slice()
+                                    } else {
+                                        Vec::new().into_boxed_slice()
+                                    };
                                     let _ = engine.producer.push(GuiMsg::Transport(
                                         TransportMsg::SetSequence {
                                             track,

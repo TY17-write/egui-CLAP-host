@@ -19,7 +19,7 @@ const RULER_H: f32 = 22.0;
 const EDGE_W: f32 = 10.0;
 
 /// 左のトラック欄の幅
-const GUTTER_W: f32 = 152.0;
+const GUTTER_W: f32 = 200.0;
 
 /// Alt+ホイール1ノッチあたりのベロシティ変化量
 const VELOCITY_WHEEL_STEP: i32 = 4;
@@ -808,6 +808,18 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("ドラッグ", "まとめて移動"),
                     ("端ドラッグ", "掴んだ端を全員同じだけ伸縮 (音価の相対関係は保つ)"),
                     ("Alt+ホイール", "全員のベロシティをまとめて増減"),
+                ],
+            );
+
+            help_section(
+                ui,
+                "トラック欄 (左)",
+                &[
+                    ("M", "ミュート (このトラックを鳴らさない)"),
+                    ("S", "ソロ (どれか1つでもソロなら、それ以外は鳴らない)"),
+                    ("♪", "音源 (.clap) を読み込む / 差し替える"),
+                    ("+ / −", "そのトラックの段を増減する (ノートのある段は消せません)"),
+                    ("上の + / −", "トラックを増減する"),
                 ],
             );
 
@@ -2048,6 +2060,41 @@ fn track_gutter_content(
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         content.set_clip_rect(rect);
+
+        // ミュート / ソロ。編集ではないのでアンドゥ履歴には積まない。
+        // 変更したらシーケンスを送り直す (鳴らす/止めるの切り替えのため)。
+        let muted = state.editor.tracks[track].muted;
+        let soloed = state.editor.tracks[track].soloed;
+        if content
+            .add(egui::SelectableLabel::new(
+                muted,
+                egui::RichText::new("M").size(10.0).color(if muted {
+                    palette::RED
+                } else {
+                    palette::FG_DIM
+                }),
+            ))
+            .on_hover_text("ミュート")
+            .clicked()
+        {
+            state.editor.tracks[track].muted = !muted;
+            state.dirty = true;
+        }
+        if content
+            .add(egui::SelectableLabel::new(
+                soloed,
+                egui::RichText::new("S").size(10.0).color(if soloed {
+                    palette::YELLOW
+                } else {
+                    palette::FG_DIM
+                }),
+            ))
+            .on_hover_text("ソロ (どれか1つでもソロなら、それ以外は鳴りません)")
+            .clicked()
+        {
+            state.editor.tracks[track].soloed = !soloed;
+            state.dirty = true;
+        }
 
         let name = state.editor.tracks[track].name.clone();
         content.allocate_ui(vec2(52.0, ROW_H - 4.0), |ui| {

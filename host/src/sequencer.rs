@@ -86,6 +86,10 @@ pub struct TrackInfo {
     pub name: String,
     /// このトラックが持つ段数 (1 以上)
     pub lanes: usize,
+    /// 消音中か
+    pub muted: bool,
+    /// ソロ指定中か (どれか1つでもソロなら、ソロ以外は鳴らさない)
+    pub soloed: bool,
 }
 
 impl TrackInfo {
@@ -93,6 +97,8 @@ impl TrackInfo {
         Self {
             name: format!("トラック {}", index + 1),
             lanes: DEFAULT_LANES,
+            muted: false,
+            soloed: false,
         }
     }
 }
@@ -141,6 +147,24 @@ impl MidiEditor {
     /// 全トラックの段を上から並べたときの行数
     pub fn total_rows(&self) -> usize {
         self.tracks.iter().map(|info| info.lanes.max(1)).sum()
+    }
+
+    /// ソロ指定のトラックがあるか
+    pub fn has_solo(&self) -> bool {
+        self.tracks.iter().any(|info| info.soloed)
+    }
+
+    /// そのトラックの音を出すか。
+    /// ソロが1つでもあれば、ソロのトラックだけが鳴る (ミュートより優先)。
+    pub fn is_audible(&self, track: usize) -> bool {
+        let Some(info) = self.tracks.get(track) else {
+            return false;
+        };
+        if self.has_solo() {
+            info.soloed
+        } else {
+            !info.muted
+        }
     }
 
     /// トラックを末尾に追加する
@@ -352,6 +376,38 @@ mod tests {
         editor.add_lane(1);
         assert!(editor.remove_last_lane(1));
         assert_eq!(editor.lanes(1), last_lane + 1);
+    }
+
+    /// ミュートとソロ: ソロがあればソロだけが鳴り、無ければミュート以外が鳴ること
+    #[test]
+    fn mute_and_solo_decide_audibility() {
+        let mut editor = MidiEditor::default();
+        editor.tracks = vec![TrackInfo::new(0), TrackInfo::new(1), TrackInfo::new(2)];
+
+        // 既定では全部鳴る
+        assert!((0..3).all(|track| editor.is_audible(track)));
+
+        // ミュートしたトラックだけ鳴らない
+        editor.tracks[1].muted = true;
+        assert!(editor.is_audible(0));
+        assert!(!editor.is_audible(1));
+        assert!(editor.is_audible(2));
+
+        // ソロがあればソロだけ (ミュートより優先)
+        editor.tracks[2].soloed = true;
+        assert!(!editor.is_audible(0));
+        assert!(!editor.is_audible(1));
+        assert!(editor.is_audible(2));
+
+        // ミュートされたトラックをソロにしたら、それが鳴る
+        editor.tracks[1].soloed = true;
+        assert!(editor.is_audible(1), "ソロはミュートより優先されること");
+
+        // ソロを解除すると元の判定に戻る
+        editor.tracks[1].soloed = false;
+        editor.tracks[2].soloed = false;
+        assert!(editor.is_audible(0));
+        assert!(!editor.is_audible(1));
     }
 
     /// 読み込んだノートが画面外に隠れないよう、トラックと段が広がること
