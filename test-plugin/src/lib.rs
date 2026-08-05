@@ -236,6 +236,13 @@ impl TestSineAudioProcessor<'_> {
             Some(CoreEventSpace::NoteOff(event)) => {
                 self.stop_voices(event.channel(), event.key(), event.note_id());
             }
+            // ホストが停止・シーク・シーケンス差し替えのときに送ってくる消音イベント。
+            // 無視すると、鳴っている最中に停止したときボイスが残って鳴りっぱなしになる。
+            // 本来はリリースを持たせず即座に切るものだが、このプラグインはエンベロープを
+            // 持たないので NoteOff と同じ扱いでよい。
+            Some(CoreEventSpace::NoteChoke(event)) => {
+                self.stop_voices(event.channel(), event.key(), event.note_id());
+            }
             Some(CoreEventSpace::ParamValue(event)) => {
                 self.shared.handle_param_event(event);
             }

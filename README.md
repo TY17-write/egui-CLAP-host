@@ -44,8 +44,12 @@ Windows で開発・確認しています (他プラットフォームは未検�
 ```powershell
 cargo build --workspace
 
-# .clap は DLL のリネーム
-Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap -Force
+# .clap は DLL のリネーム。
+# 先に消してからコピーすること。cargo が DLL を作り直すと .clap 側が古いまま
+# 取り残されるうえ、-Force だけでは上書きされないことがある (直したはずの
+# プラグインで古い挙動が出たらこれを疑う)
+Remove-Item target\debug\test_plugin.clap -ErrorAction SilentlyContinue
+Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap
 
 # GUI ホストを起動 (--bin の指定が必要。smoke 系のバイナリも同居しているため)
 cargo run -p clap-host-test --bin clap-host-test -- target\debug\test_plugin.clap
@@ -57,6 +61,7 @@ cargo run -p clap-host-test --bin clap-host-test -- "C:\Program Files\Common Fil
 cargo run -p clap-host-test --bin smoke -- target\debug\test_plugin.clap      # ロード→発音→波形確認
 cargo run -p clap-host-test --bin seq_smoke -- target\debug\test_plugin.clap  # 再生エンジンの検証
 cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap  # WAV 書き出しの検証
+cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
 
 # ユニットテスト
 cargo test -p clap-host-test --lib
