@@ -599,6 +599,8 @@ impl eframe::App for App {
                         };
                         let msg = match command {
                             EditorCommand::Commit => {
+                                // 今は音源が1つなので全トラック分をまとめて送る。
+                                // トラックごとの音源に対応する段階で分割する。
                                 let events = self
                                     .editor
                                     .editor
@@ -607,7 +609,11 @@ impl eframe::App for App {
                                 let end_sample =
                                     (self.editor.editor.length_quarters_bar_aligned() as f64 * spq)
                                         as u64;
-                                GuiMsg::Transport(TransportMsg::SetSequence { events, end_sample })
+                                GuiMsg::Transport(TransportMsg::SetSequence {
+                                    track: 0,
+                                    events,
+                                    end_sample,
+                                })
                             }
                             EditorCommand::Play => GuiMsg::Transport(TransportMsg::Play),
                             EditorCommand::Stop => GuiMsg::Transport(TransportMsg::Stop),

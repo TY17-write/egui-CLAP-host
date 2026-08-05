@@ -248,9 +248,10 @@ impl StreamAudioProcessor {
             }
         }
 
-        // 再生中のシーケンスイベントを発行 (ブロック内オフセット付き)
-        self.transport
-            .process_block(&mut self.clap_events_buffer, self.note_port, sample_count);
+        // 再生中のシーケンスイベントを発行 (ブロック内オフセット付き)。
+        // 今はトラック1本ぶんだけ (複数トラックは以降の段階で対応する)。
+        let mut outputs = [(&mut self.clap_events_buffer, self.note_port)];
+        self.transport.process_block(&mut outputs, sample_count);
     }
 
     /// CPAL の出力バッファ1回分を処理する

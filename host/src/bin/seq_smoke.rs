@@ -82,7 +82,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let note_port = Some((0u16, false)); // テストプラグインは CLAP ダイアレクト
 
     transport.handle_msg(
-        TransportMsg::SetSequence { events, end_sample },
+        TransportMsg::SetSequence {
+            track: 0,
+            events,
+            end_sample,
+        },
         &mut event_buffer,
         note_port,
     );
@@ -105,7 +109,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     for _ in 0..total_blocks {
         event_buffer.clear();
-        transport.process_block(&mut event_buffer, note_port, BLOCK_SIZE as u64);
+        let mut outputs = [(&mut event_buffer, note_port)];
+        transport.process_block(&mut outputs, BLOCK_SIZE as u64);
         let events_in = event_buffer.as_input();
 
         let inputs = input_ports.with_input_buffers([AudioPortBuffer {

@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 /// GUI からトランスポートへ送る操作
 pub enum TransportMsg {
-    /// シーケンスを差し替える。end_sample はループ/停止判定用の終端。
+    /// 指定トラックのシーケンスを差し替える。
+    /// end_sample はループ/停止判定用の終端 (全トラック共通)。
     SetSequence {
+        track: usize,
         events: Box<[SeqEvent]>,
         end_sample: u64,
     },
@@ -46,37 +48,65 @@ impl Default for TransportShared {
     }
 }
 
-/// 再生エンジン本体
-pub struct Transport {
+/// トラック1本ぶんのシーケンス。
+/// 再生位置はトランスポートが1つだけ持ち、ここでは自分のイベント列だけを見る。
+struct TrackSequence {
     events: Box<[SeqEvent]>,
+    /// 次に発行するイベントのインデックス
+    next_event: usize,
+}
+
+impl TrackSequence {
+    fn new() -> Self {
+        Self {
+            events: Box::new([]),
+            next_event: 0,
+        }
+    }
+
+    /// pos 以降で最初のイベントを指すようインデックスを更新する
+    fn seek_to(&mut self, pos: u64) {
+        self.next_event = self.events.partition_point(|e| e.sample_time < pos);
+    }
+}
+
+/// 再生エンジン本体。
+/// 再生位置・テンポは全トラックで共有し、イベント列だけトラックごとに持つ。
+pub struct Transport {
+    tracks: Vec<TrackSequence>,
     end_sample: u64,
     playing: bool,
     looping: bool,
     /// 現在位置 (サンプル)
     pos: u64,
-    /// 次に発行するイベントのインデックス
-    next_event: usize,
     shared: TransportShared,
 }
 
 impl Transport {
     pub fn new(shared: TransportShared) -> Self {
         Self {
-            events: Box::new([]),
+            tracks: vec![TrackSequence::new()],
             end_sample: 0,
             playing: false,
             looping: false,
             pos: 0,
-            next_event: 0,
             shared,
         }
     }
 
-    /// 現在位置以降で最初のイベントを指すようインデックスを更新する
+    /// トラック数を確保する (足りなければ空のシーケンスで埋める)
+    fn ensure_track(&mut self, track: usize) {
+        while self.tracks.len() <= track {
+            self.tracks.push(TrackSequence::new());
+        }
+    }
+
+    /// 全トラックのイベント位置を現在位置に合わせ直す
     fn recompute_next_event(&mut self) {
-        self.next_event = self
-            .events
-            .partition_point(|e| e.sample_time < self.pos);
+        let pos = self.pos;
+        for track in &mut self.tracks {
+            track.seek_to(pos);
+        }
     }
 
     fn publish_state(&self) {
@@ -93,8 +123,13 @@ impl Transport {
         note_port: Option<(u16, bool)>,
     ) {
         match msg {
-            TransportMsg::SetSequence { events, end_sample } => {
-                self.events = events;
+            TransportMsg::SetSequence {
+                track,
+                events,
+                end_sample,
+            } => {
+                self.ensure_track(track);
+                self.tracks[track].events = events;
                 self.end_sample = end_sample;
                 self.recompute_next_event();
                 if self.playing {
@@ -130,10 +165,13 @@ impl Transport {
     }
 
     /// 1ブロック分 (sample_count フレーム) のイベントを発行し、位置を進める。
+    ///
+    /// `outputs` はトラックごとの (イベントバッファ, ノートポート)。
+    /// 各トラックのイベントは自分のバッファにだけ入るので、そのまま
+    /// 対応するプラグインへ渡せる。
     pub fn process_block(
         &mut self,
-        buffer: &mut EventBuffer,
-        note_port: Option<(u16, bool)>,
+        outputs: &mut [(&mut EventBuffer, Option<(u16, bool)>)],
         sample_count: u64,
     ) {
         if !self.playing {
@@ -152,13 +190,18 @@ impl Transport {
             };
 
             let span_end = self.pos + span;
-            while let Some(event) = self.events.get(self.next_event) {
-                if event.sample_time >= span_end {
-                    break;
+            for (index, track) in self.tracks.iter_mut().enumerate() {
+                let Some((buffer, note_port)) = outputs.get_mut(index) else {
+                    continue; // 音源の無いトラックは鳴らさない
+                };
+                while let Some(event) = track.events.get(track.next_event) {
+                    if event.sample_time >= span_end {
+                        break;
+                    }
+                    let offset = (block_offset + (event.sample_time - self.pos)) as u32;
+                    push_note_event(buffer, *note_port, offset, event);
+                    track.next_event += 1;
                 }
-                let offset = (block_offset + (event.sample_time - self.pos)) as u32;
-                push_note_event(buffer, note_port, offset, event);
-                self.next_event += 1;
             }
 
             self.pos = span_end;
@@ -171,18 +214,25 @@ impl Transport {
                 // これを怠ると、小節境界で終わるノートのノートオフが
                 // ブロック境界と終端が一致したときに欠落し、音が鳴りっぱなしになる。
                 let flush_offset = block_offset.min(sample_count.saturating_sub(1)) as u32;
-                while let Some(event) = self.events.get(self.next_event) {
-                    if event.sample_time > self.end_sample {
-                        break;
+                for (index, track) in self.tracks.iter_mut().enumerate() {
+                    let Some((buffer, note_port)) = outputs.get_mut(index) else {
+                        continue;
+                    };
+                    while let Some(event) = track.events.get(track.next_event) {
+                        if event.sample_time > self.end_sample {
+                            break;
+                        }
+                        push_note_event(buffer, *note_port, flush_offset, event);
+                        track.next_event += 1;
                     }
-                    push_note_event(buffer, note_port, flush_offset, event);
-                    self.next_event += 1;
                 }
 
                 if self.looping {
                     // 先頭に巻き戻して同じブロックの残りを処理する
                     self.pos = 0;
-                    self.next_event = 0;
+                    for track in &mut self.tracks {
+                        track.next_event = 0;
+                    }
                 } else {
                     self.playing = false;
                     self.pos = self.end_sample;
@@ -220,6 +270,7 @@ mod tests {
         let mut buffer = EventBuffer::with_capacity(16);
         transport.handle_msg(
             TransportMsg::SetSequence {
+                track: 0,
                 events: events.into_boxed_slice(),
                 end_sample,
             },
@@ -227,6 +278,12 @@ mod tests {
             PORT,
         );
         (transport, shared)
+    }
+
+    /// トラック1本ぶんのブロック処理 (テスト用の短縮形)
+    fn process_block(transport: &mut Transport, buffer: &mut EventBuffer, sample_count: u64) {
+        let mut outputs = [(buffer, PORT)];
+        transport.process_block(&mut outputs, sample_count);
     }
 
     fn on(sample_time: u64) -> SeqEvent {
@@ -255,11 +312,11 @@ mod tests {
         transport.handle_msg(TransportMsg::Play, &mut buffer, PORT);
 
         buffer.clear();
-        transport.process_block(&mut buffer, PORT, 100); // [0,100)
+        process_block(&mut transport, &mut buffer, 100); // [0,100)
         assert_eq!(buffer.as_input().len(), 1); // ノートオンのみ
 
         buffer.clear();
-        transport.process_block(&mut buffer, PORT, 100); // [100,200) + 終端フラッシュ
+        process_block(&mut transport, &mut buffer, 100); // [100,200) + 終端フラッシュ
         assert_eq!(buffer.as_input().len(), 1); // ノートオフが欠落しないこと
 
         assert!(!shared.playing.load(Ordering::Relaxed)); // 自動停止していること
@@ -288,7 +345,7 @@ mod tests {
         transport.handle_msg(TransportMsg::Play, &mut buffer, PORT);
 
         buffer.clear();
-        transport.process_block(&mut buffer, PORT, 64);
+        process_block(&mut transport, &mut buffer, 64);
 
         let velocities: Vec<f64> = buffer
             .as_input()
@@ -317,10 +374,10 @@ mod tests {
         transport.handle_msg(TransportMsg::Play, &mut buffer, PORT);
 
         buffer.clear();
-        transport.process_block(&mut buffer, PORT, 100); // [0,100)
+        process_block(&mut transport, &mut buffer, 100); // [0,100)
         buffer.clear();
         // [100,200) + 終端フラッシュ + 巻き戻して [0,100) → オフ1 + オン1
-        transport.process_block(&mut buffer, PORT, 200);
+        process_block(&mut transport, &mut buffer, 200);
         assert_eq!(buffer.as_input().len(), 2);
     }
 }
