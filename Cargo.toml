@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["host", "test-plugin"]
+
+[workspace.dependencies]
+clack-host = { git = "https://github.com/prokopyl/clack.git" }
+clack-plugin = { git = "https://github.com/prokopyl/clack.git" }
+clack-extensions = { git = "https://github.com/prokopyl/clack.git", features = [
+    "clack-host",
+    "clack-plugin",
+    "audio-ports",
+    "note-ports",
+    "params",
+    "gui",
+    "log",
+    "timer",
+] }
