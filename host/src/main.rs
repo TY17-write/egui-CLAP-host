@@ -106,8 +106,9 @@ struct Candidates {
 struct Engine {
     _stream: cpal::Stream,
     producer: rtrb::Producer<GuiMsg>,
-    /// オーディオスレッドから返ってきた音源 (メインスレッドで deactivate する)
-    retired: rtrb::Consumer<Box<audio::TrackProcessor>>,
+    /// オーディオスレッドから返ってきた音源 (メインスレッドで deactivate する)。
+    /// どのインスタンスへ返すか分かるようトラック番号が付く。
+    retired: rtrb::Consumer<(usize, Box<audio::TrackProcessor>)>,
     /// 再生位置・再生中フラグの共有
     transport_shared: TransportShared,
     /// 全プラグイン共通のストリーム構成
@@ -158,6 +159,9 @@ struct App {
     engine: Option<Engine>,
     /// トラックごとの音源 (エディタのトラック数に合わせて伸ばす)
     tracks: Vec<Option<TrackAudio>>,
+    /// 差し替えで外したが、まだ処理器が返ってきていないインスタンス。
+    /// 返却時に正しいインスタンスへ deactivate するため、ここで生かしておく。
+    retiring: std::collections::VecDeque<(usize, TrackAudio)>,
     error: Option<String>,
     /// 起動時に自動ロードする .clap ファイル (パス, GUI も開くか)
     autoload: Option<(PathBuf, bool)>,
@@ -177,12 +181,16 @@ struct App {
 }
 
 impl App {
-    fn open_file_dialog(&mut self, target_track: usize) {
+    /// .clap を選ばせて候補を読み込む。
+    /// 戻り値は「候補を新しく読み込めたか」。キャンセルや失敗では false を返し、
+    /// 前回の候補には触れない (キャンセルで前のプラグインが載らないようにするため)。
+    fn open_file_dialog(&mut self, target_track: usize) -> bool {
         let picked = rfd::FileDialog::new()
             .add_filter("CLAP プラグイン", &["clap"])
             .pick_file();
 
-        let Some(path) = picked else { return };
+        // キャンセルされたら何もしない (前回の候補もそのまま残す)
+        let Some(path) = picked else { return false };
 
         match discovery::load_clap_file(&path) {
             Ok((entry, plugins)) => {
@@ -193,8 +201,12 @@ impl App {
                     plugins,
                     target_track,
                 });
+                true
             }
-            Err(e) => self.error = Some(format!("ロード失敗: {e}")),
+            Err(e) => {
+                self.error = Some(format!("ロード失敗: {e}"));
+                false
+            }
         }
     }
 
@@ -332,6 +344,10 @@ impl App {
                     .push(GuiMsg::Transport(TransportMsg::Seek { sample }));
 
                 self.ensure_track_slots(track);
+                // 前の音源は、処理器が返ってくるまで生かしておく
+                if let Some(previous) = self.tracks[track].take() {
+                    self.retiring.push_back((track, previous));
+                }
                 self.tracks[track] = Some(audio_track);
                 // 新しいプラグインにシーケンスを送り直す
                 self.editor.dirty = true;
@@ -439,11 +455,28 @@ impl eframe::App for App {
 
         // オーディオスレッドから返ってきた音源をここで停止・解放する
         // (オーディオスレッドで解放してはいけないため)。
-        // どのトラックのものか分からないので、載っているインスタンスへ順に返す。
+        // 差し替えで外したインスタンスが待っていればそちらへ、
+        // 無ければ今そのトラックに載っているインスタンスへ返す。
         if let Some(engine) = &mut self.engine {
-            while let Ok(processor) = engine.retired.pop() {
-                if let Some(track) = self.tracks.iter_mut().flatten().next() {
-                    track.instance.deactivate(processor.into_stopped());
+            while let Ok((track, processor)) = engine.retired.pop() {
+                let stopped = processor.into_stopped();
+                let waiting = self
+                    .retiring
+                    .iter()
+                    .position(|(index, _)| *index == track);
+
+                match waiting {
+                    Some(at) => {
+                        if let Some((_, mut old)) = self.retiring.remove(at) {
+                            old.instance.deactivate(stopped);
+                            // old はここで破棄される (GUI も閉じられる)
+                        }
+                    }
+                    None => {
+                        if let Some(Some(current)) = self.tracks.get_mut(track) {
+                            current.instance.deactivate(stopped);
+                        }
+                    }
                 }
             }
         }
@@ -655,17 +688,29 @@ impl eframe::App for App {
                 None => false,
             };
 
+            // トラック欄に出す音源名を渡す
+            self.editor.track_plugins = (0..self.editor.editor.track_count())
+                .map(|track| {
+                    self.tracks
+                        .get(track)
+                        .and_then(|slot| slot.as_ref())
+                        .map(|audio| audio.name.clone())
+                })
+                .collect();
+
             let commands =
                 editor_ui::editor_panel(ui, &mut self.editor, self.pos_quarters, playing);
 
             // ファイルダイアログは self 全体を触るので、ループを抜けてから実行する
             let mut file_action = None;
+            let mut load_plugin_track = None;
 
             for command in commands {
                 match command {
                     EditorCommand::ImportMidi => file_action = Some(FileAction::Import),
                     EditorCommand::ExportMidi => file_action = Some(FileAction::Export),
                     EditorCommand::SaveMidi => file_action = Some(FileAction::Save),
+                    EditorCommand::LoadPlugin { track } => load_plugin_track = Some(track),
                     // エンジンが無いときは送り先がないので、再生ヘッドの移動だけ
                     // 自前で処理する。ロード時に位置とシーケンスを送り直す。
                     EditorCommand::Seek { quarters } if self.engine.is_none() => {
@@ -710,7 +755,8 @@ impl eframe::App for App {
                             // ファイル操作はループの外で処理済み
                             EditorCommand::ImportMidi
                             | EditorCommand::ExportMidi
-                            | EditorCommand::SaveMidi => continue,
+                            | EditorCommand::SaveMidi
+                            | EditorCommand::LoadPlugin { .. } => continue,
                         };
                         let _ = engine.producer.push(msg);
                     }
@@ -722,6 +768,21 @@ impl eframe::App for App {
                 Some(FileAction::Export) => self.export_midi(true),
                 Some(FileAction::Save) => self.export_midi(false),
                 None => {}
+            }
+
+            // トラック欄からの音源ロード (ダイアログを開く)。
+            // 新しく読み込めたときだけ装填する (キャンセルでは何もしない)
+            if let Some(track) = load_plugin_track {
+                if self.open_file_dialog(track) {
+                    // 候補が1つだけならそのまま載せる (選択の手間を省く)
+                    let single = self
+                        .candidates
+                        .as_ref()
+                        .is_some_and(|candidates| candidates.plugins.len() == 1);
+                    if single {
+                        self.instantiate(0, track);
+                    }
+                }
             }
         });
 

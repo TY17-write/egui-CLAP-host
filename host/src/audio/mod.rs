@@ -87,7 +87,7 @@ impl TrackProcessor {
 /// 解放しないため)。
 pub fn start_engine(
     gui_events: Consumer<GuiMsg>,
-    retired: rtrb::Producer<Box<TrackProcessor>>,
+    retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
     transport_shared: TransportShared,
 ) -> Result<(Stream, StreamAudioConfig), Box<dyn Error>> {
     let cpal_host = cpal::default_host();
@@ -227,8 +227,9 @@ fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<(u16, 
 struct StreamAudioProcessor {
     /// トラックごとの音源。None は音源未ロードのトラック。
     tracks: Vec<Option<Box<TrackProcessor>>>,
-    /// 外した音源をメインスレッドへ返す口 (ここで解放しないため)
-    retired: rtrb::Producer<Box<TrackProcessor>>,
+    /// 外した音源を (トラック番号, 音源) でメインスレッドへ返す口。
+    /// どのインスタンスへ返すか分かるようトラック番号を添える。
+    retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
     gui_events: Consumer<GuiMsg>,
     /// 全トラックの出力を足し込むバッファ (インターリーブ済み)
     mix: Vec<f32>,
@@ -240,7 +241,7 @@ struct StreamAudioProcessor {
 impl StreamAudioProcessor {
     fn new(
         gui_events: Consumer<GuiMsg>,
-        retired: rtrb::Producer<Box<TrackProcessor>>,
+        retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
         transport_shared: TransportShared,
         output_channel_count: usize,
     ) -> Self {
@@ -264,9 +265,9 @@ impl StreamAudioProcessor {
 
     /// 外した音源をメインスレッドへ返す。返せなければやむなくここで解放する
     /// (リングバッファが詰まるのは異常時だけ)。
-    fn retire(&mut self, processor: Option<Box<TrackProcessor>>) {
+    fn retire(&mut self, track: usize, processor: Option<Box<TrackProcessor>>) {
         if let Some(processor) = processor {
-            let _ = self.retired.push(processor);
+            let _ = self.retired.push((track, processor));
         }
     }
 
@@ -344,12 +345,12 @@ impl StreamAudioProcessor {
                 GuiMsg::SetTrack { track, processor } => {
                     self.ensure_track(track);
                     let previous = self.tracks[track].replace(processor);
-                    self.retire(previous);
+                    self.retire(track, previous);
                 }
                 GuiMsg::ClearTrack { track } => {
                     if let Some(slot) = self.tracks.get_mut(track) {
                         let previous = slot.take();
-                        self.retire(previous);
+                        self.retire(track, previous);
                     }
                 }
             }

@@ -19,7 +19,7 @@ const RULER_H: f32 = 22.0;
 const EDGE_W: f32 = 10.0;
 
 /// 左のトラック欄の幅
-const GUTTER_W: f32 = 132.0;
+const GUTTER_W: f32 = 152.0;
 
 /// Alt+ホイール1ノッチあたりのベロシティ変化量
 const VELOCITY_WHEEL_STEP: i32 = 4;
@@ -127,6 +127,8 @@ pub struct EditorState {
     grid_scroll_y: f32,
     /// MIDI の保存先 (表示用。実際のパス管理は main 側)
     pub midi_path: Option<String>,
+    /// トラックごとに載っている音源の名前 (表示用。main 側が毎フレーム更新する)
+    pub track_plugins: Vec<Option<String>>,
     /// 再生を始めたときの再生ヘッド位置。停止・終端到達でここへ戻す。
     play_return: Option<f64>,
     /// 前フレームの再生状態 (終端に達して自分で止まったことの検出用)
@@ -157,6 +159,7 @@ impl Default for EditorState {
             show_help: false,
             grid_scroll_y: 0.0,
             midi_path: None,
+            track_plugins: Vec::new(),
             play_return: None,
             was_playing: false,
             track_last_note: false,
@@ -645,6 +648,8 @@ pub enum EditorCommand {
     ExportMidi,
     /// MIDI として保存する (保存先が未設定なら選ばせる)
     SaveMidi,
+    /// 指定トラックに音源 (.clap) を読み込む
+    LoadPlugin { track: usize },
 }
 
 /// エディタパネルを描画する。pos_quarters は現在の再生位置 (四分音符単位)。
@@ -688,7 +693,7 @@ pub fn editor_panel(
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .vertical_scroll_offset(state.grid_scroll_y)
                 .show(ui, |ui| {
-                    track_gutter(ui, state);
+                    track_gutter(ui, state, &mut commands);
                 });
         });
 
@@ -2012,13 +2017,17 @@ fn track_gutter_header(ui: &mut egui::Ui, state: &mut EditorState) {
 
 /// 左のトラック欄。トラックごとに名前と段の増減ボタンを、
 /// グリッドの段と同じ高さで並べる (行の位置が揃うようにするため)。
-fn track_gutter(ui: &mut egui::Ui, state: &mut EditorState) {
+fn track_gutter(ui: &mut egui::Ui, state: &mut EditorState, commands: &mut Vec<EditorCommand>) {
     // ScrollArea の中身は親のレイアウトを引き継ぐ (ここは横並びの中なので)。
     // 縦並びを明示しないとトラックが横に並んでしまう。
-    ui.vertical(|ui| track_gutter_content(ui, state));
+    ui.vertical(|ui| track_gutter_content(ui, state, commands));
 }
 
-fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
+fn track_gutter_content(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    commands: &mut Vec<EditorCommand>,
+) {
     for track in 0..state.editor.track_count() {
         let lanes = state.editor.lanes(track);
         let height = lanes as f32 * ROW_H;
@@ -2041,11 +2050,30 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
         content.set_clip_rect(rect);
 
         let name = state.editor.tracks[track].name.clone();
-        content.allocate_ui(vec2(58.0, ROW_H - 4.0), |ui| {
+        content.allocate_ui(vec2(52.0, ROW_H - 4.0), |ui| {
             ui.add(
                 egui::Label::new(egui::RichText::new(name).size(11.0).color(palette::FG))
                     .truncate(),
             );
+        });
+
+        // 音源 (.clap) の読み込み。載っていればボタンを色付きにして名前を出す
+        let plugin = state
+            .track_plugins
+            .get(track)
+            .cloned()
+            .flatten();
+        let label = egui::RichText::new("♪").size(11.0).color(match &plugin {
+            Some(_) => palette::GREEN,
+            None => palette::FG_DIM,
+        });
+        let response = content.add(egui::Button::new(label).small());
+        if response.clicked() {
+            commands.push(EditorCommand::LoadPlugin { track });
+        }
+        response.on_hover_text(match &plugin {
+            Some(name) => format!("音源: {name} (クリックで差し替え)"),
+            None => "音源 (.clap) を読み込む".to_string(),
         });
 
         if content
