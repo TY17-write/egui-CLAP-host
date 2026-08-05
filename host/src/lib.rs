@@ -2,6 +2,7 @@
 //! main.rs (GUI) と bin/smoke.rs (オフライン検証) の両方から使う。
 
 pub mod audio;
+pub mod ccs;
 pub mod discovery;
 pub mod editor_ui;
 pub mod gui;

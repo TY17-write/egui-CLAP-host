@@ -650,6 +650,8 @@ pub enum EditorCommand {
     SaveMidi,
     /// シーケンス全体を音声ファイル (WAV) に書き出す
     ExportWav,
+    /// 1トラック目を CeVIO のプロジェクトファイル (CCS) に書き出す
+    ExportCcs,
     /// 指定トラックに音源 (.clap) を読み込む
     LoadPlugin { track: usize },
 }
@@ -746,6 +748,14 @@ pub fn editor_panel(
                 .clicked()
             {
                 commands.push(EditorCommand::ExportWav);
+                ui.close_menu();
+            }
+            if ui
+                .button("CCS ファイルとして出力")
+                .on_hover_text("CeVIO のプロジェクトファイルに書き出す (1トラック目のみ)")
+                .clicked()
+            {
+                commands.push(EditorCommand::ExportCcs);
                 ui.close_menu();
             }
         });
@@ -849,6 +859,10 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     (
                         "出力 > WAV",
                         "音源を鳴らして音声ファイルに書き出す (音源のロードが必要。書き出し中は画面が固まります)",
+                    ),
+                    (
+                        "出力 > CCS",
+                        "CeVIO のプロジェクトに書き出す (1トラック目のみ。段ごとにパートを分けます)",
                     ),
                 ],
             );

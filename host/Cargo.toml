@@ -20,3 +20,6 @@ windows-sys = { version = "0.59", features = [
 ] }
 # parallel (rayon) は不要なので既定機能を切る
 midly = { version = "0.5.3", default-features = false, features = ["std", "alloc"] }
+# CeVIO の .ccs 書き出し用 (どちらも純 Rust。C のビルド環境は不要)
+quick-xml = "0.37"
+uuid = { version = "1", features = ["v4"] }

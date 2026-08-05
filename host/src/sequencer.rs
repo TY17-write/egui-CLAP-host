@@ -13,6 +13,13 @@ pub enum ScaleMode {
     BohlenPierce13,
 }
 
+/// ボーレン・ピアースの基準となるキー番号。
+/// (半音3, オクターブ4) にあたり、12平均律の E♭4 と同じノート番号。
+const BOHLEN_PIERCE_REFERENCE_KEY: f64 = 63.0;
+
+/// 基準キーの周波数 (Hz)。12平均律の E♭4 (440 / √2) と同じ高さ。
+const BOHLEN_PIERCE_REFERENCE_HZ: f64 = 311.127;
+
 impl ScaleMode {
     /// 1オクターブ (ボーレン・ピアースではトライターブ) あたりのステップ数
     pub fn steps_per_octave(self) -> i32 {
@@ -25,6 +32,33 @@ impl ScaleMode {
     /// 半音として指定できる最大値
     pub fn max_semitone(self) -> i32 {
         self.steps_per_octave() - 1
+    }
+
+    /// (半音, オクターブ) に対応する MIDI ノート番号。
+    /// 0..=127 に収まらない値もそのまま返す (範囲の判定は呼び出し側)。
+    ///
+    /// (半音0, オクターブ4) が常に 60 (中央ハ) になるよう基準を取る。
+    pub fn key_number(self, semitone: i32, octave: i32) -> i32 {
+        60 + (octave - 4) * self.steps_per_octave() + semitone
+    }
+
+    /// この音律での実際の周波数 (Hz)。
+    ///
+    /// 再生時はノート番号をプラグインに渡すだけで、音高はプラグイン側の音律設定
+    /// (Scala の .scl など) が決める。この関数は「ホストが想定している音高」を
+    /// 返すもので、周波数そのものを書き出す形式 (CCS の LogF0 など) で使う。
+    ///
+    /// キー番号が 1 増えると音律の 1 ステップぶん上がるので、基準点との差だけで決まる。
+    pub fn frequency(self, semitone: i32, octave: i32) -> f64 {
+        let key = self.key_number(semitone, octave) as f64;
+        match self {
+            // A4 (キー69) = 440Hz、1オクターブ = 2倍を12等分
+            ScaleMode::Equal12 => 440.0 * 2f64.powf((key - 69.0) / 12.0),
+            // キー63 = 311.127Hz、1トライターブ = 3倍を13等分
+            ScaleMode::BohlenPierce13 => {
+                BOHLEN_PIERCE_REFERENCE_HZ * 3f64.powf((key - BOHLEN_PIERCE_REFERENCE_KEY) / 13.0)
+            }
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -65,8 +99,13 @@ impl Note {
     /// 12平均律なら (0,4)=60 / (9,4)=69、ボーレン・ピアースなら
     /// (0,4)=60 / (3,4)=63 (平均律の E♭4 と同じノート番号) となる。
     pub fn key(&self, scale: ScaleMode) -> Option<u8> {
-        let key = 60 + (self.octave - 4) * scale.steps_per_octave() + self.semitone;
+        let key = scale.key_number(self.semitone, self.octave);
         u8::try_from(key).ok().filter(|k| *k <= 127)
+    }
+
+    /// この音律でのノートの周波数 (Hz)
+    pub fn frequency(&self, scale: ScaleMode) -> f64 {
+        scale.frequency(self.semitone, self.octave)
     }
 
     /// "(半音, オクターブ)" 形式の表示名。例: (0,4)
@@ -442,6 +481,35 @@ mod tests {
         editor.scale = ScaleMode::BohlenPierce13;
         let keys: Vec<u8> = editor.to_events(44100.0).iter().map(|e| e.key).collect();
         assert_eq!(keys, vec![73, 73], "B-P で (0,5) は 73 になること");
+    }
+
+    /// 周波数が基準の音高と一致すること。
+    /// (CCS の LogF0 はこの値をそのまま書き出すので、ここがずれると音痴になる)
+    #[test]
+    fn frequency_matches_the_reference_pitches() {
+        let eq = ScaleMode::Equal12;
+        assert!((eq.frequency(9, 4) - 440.0).abs() < 1e-9, "A4 = 440Hz");
+        assert!((eq.frequency(0, 4) - 261.625_565).abs() < 1e-4, "C4");
+        assert!((eq.frequency(9, 5) - 880.0).abs() < 1e-9, "1オクターブで倍");
+        // B-P の基準キー63 = (半音3, オクターブ4)
+        let bp = ScaleMode::BohlenPierce13;
+        assert!((bp.frequency(3, 4) - 311.127).abs() < 1e-9, "基準は 311.127Hz");
+    }
+
+    /// ボーレン・ピアースの1オクターブ表記が、実際にはトライターブ (3:1) であること
+    #[test]
+    fn bohlen_pierce_spans_a_tritave() {
+        let bp = ScaleMode::BohlenPierce13;
+        let low = bp.frequency(0, 4);
+        let high = bp.frequency(0, 5);
+        assert!(
+            (high / low - 3.0).abs() < 1e-9,
+            "オクターブ違いは3倍になること (実測 {})",
+            high / low
+        );
+        // 1ステップは 3^(1/13) ≒ 146.3 セント (半音より広い)
+        let step = bp.frequency(1, 4) / bp.frequency(0, 4);
+        assert!((step - 3f64.powf(1.0 / 13.0)).abs() < 1e-9);
     }
 
     #[test]

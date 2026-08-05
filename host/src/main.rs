@@ -1,6 +1,8 @@
 //! CLAP ミニホスト: .clap ファイルをロードして egui から鳴らすテスト用ホスト。
 
-use clap_host_test::{audio, discovery, editor_ui, gui, host, midi, params, sequencer, theme, wav};
+use clap_host_test::{
+    audio, ccs, discovery, editor_ui, gui, host, midi, params, sequencer, theme, wav,
+};
 
 use audio::config::StreamAudioConfig;
 use audio::offline::{RenderSetup, TAIL_SECONDS};
@@ -146,6 +148,7 @@ enum FileAction {
     Export,
     Save,
     ExportWav,
+    ExportCcs,
 }
 
 /// 処理結果の通知。
@@ -392,7 +395,9 @@ impl App {
         }
 
         // 時間のかかる処理に入る前に保存先を聞く
-        let Some(path) = self.ask_wav_path() else { return };
+        let Some(path) = self.ask_save_path("WAV ファイル", "wav", "mix.wav") else {
+            return;
+        };
 
         let sample_rate = config.sample_rate as f64;
         let spq = self.editor.editor.samples_per_quarter(sample_rate);
@@ -494,18 +499,60 @@ impl App {
         self.notice = Some(Notice::error("WAV を書き出せません", message));
     }
 
-    /// WAV の保存先を選ばせる
-    fn ask_wav_path(&mut self) -> Option<PathBuf> {
+    /// 1トラック目を CeVIO のプロジェクトファイル (.ccs) に書き出す。
+    /// 音を鳴らさないデータ変換なので、音源が未ロードでも使える。
+    fn export_ccs(&mut self) {
+        // 変換に失敗するならダイアログを出す前に知らせる
+        let exported = match ccs::export(&self.editor.editor) {
+            Ok(exported) => exported,
+            Err(e) => {
+                self.notice = Some(Notice::error("CCS を書き出せません", e));
+                return;
+            }
+        };
+
+        let Some(path) = self.ask_save_path("CeVIO プロジェクト", "ccs", "song.ccs") else {
+            return;
+        };
+
+        match std::fs::write(&path, &exported.bytes) {
+            Ok(()) => {
+                self.last_directory = path.parent().map(PathBuf::from);
+                self.error = None;
+
+                let mut body = format!(
+                    "{}\n\n{} パート / {} ノート\n音律: {}",
+                    path.display(),
+                    exported.parts,
+                    exported.notes,
+                    self.editor.editor.scale.label(),
+                );
+                if exported.skipped > 0 {
+                    body.push_str(&format!(
+                        "\n\n※ 音域外または音価0のノート {} 個は書き出していません。",
+                        exported.skipped
+                    ));
+                }
+                self.status = Some(format!("書き出しました: {}", file_label(&path)));
+                self.notice = Some(Notice::ok("CCS を書き出しました", body));
+            }
+            Err(e) => {
+                self.notice = Some(Notice::error("CCS を書き出せません", format!("保存できません:\n{e}")));
+            }
+        }
+    }
+
+    /// 保存先を選ばせる。拡張子を省略されたら補う。
+    fn ask_save_path(&mut self, filter: &str, extension: &str, default_name: &str) -> Option<PathBuf> {
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("WAV ファイル", &["wav"])
-            .set_file_name("mix.wav");
+            .add_filter(filter, &[extension])
+            .set_file_name(default_name);
         if let Some(directory) = self.dialog_directory() {
             dialog = dialog.set_directory(directory);
         }
         let path = dialog.save_file()?;
-        // 拡張子を省略されたときは .wav を補う
         Some(if path.extension().is_none() {
-            path.with_extension("wav")
+            path.with_extension(extension)
         } else {
             path
         })
@@ -975,6 +1022,7 @@ impl eframe::App for App {
                     EditorCommand::ExportMidi => file_action = Some(FileAction::Export),
                     EditorCommand::SaveMidi => file_action = Some(FileAction::Save),
                     EditorCommand::ExportWav => file_action = Some(FileAction::ExportWav),
+                    EditorCommand::ExportCcs => file_action = Some(FileAction::ExportCcs),
                     EditorCommand::LoadPlugin { track } => load_plugin_track = Some(track),
                     // エンジンが無いときは送り先がないので、再生ヘッドの移動だけ
                     // 自前で処理する。ロード時に位置とシーケンスを送り直す。
@@ -1027,6 +1075,7 @@ impl eframe::App for App {
                             | EditorCommand::ExportMidi
                             | EditorCommand::SaveMidi
                             | EditorCommand::ExportWav
+                            | EditorCommand::ExportCcs
                             | EditorCommand::LoadPlugin { .. } => continue,
                         };
                         let _ = engine.producer.push(msg);
@@ -1039,6 +1088,7 @@ impl eframe::App for App {
                 Some(FileAction::Export) => self.export_midi(true),
                 Some(FileAction::Save) => self.export_midi(false),
                 Some(FileAction::ExportWav) => self.export_wav(),
+                Some(FileAction::ExportCcs) => self.export_ccs(),
                 None => {}
             }
 
