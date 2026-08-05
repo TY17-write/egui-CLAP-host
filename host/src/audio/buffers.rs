@@ -150,11 +150,11 @@ impl HostAudioBuffers {
         )
     }
 
-    /// プラグイン出力を CPAL バッファに書き出す (ダウンミックス/インターリーブ込み)
-    pub fn write_to_cpal_buffer<S: FromSample<f32>>(&mut self, destination: &mut [S]) {
+    /// プラグイン出力を CPAL 用のインターリーブ形式に整える (内部バッファへ)
+    fn muxed_output(&mut self, len: usize) -> &[f32] {
         let main_output = &self.output_port_channels
             [self.config.plugin_output_port_config.main_port_index as usize];
-        let muxed = &mut self.muxed[..destination.len()];
+        let muxed = &mut self.muxed[..len];
 
         let plugin_output_channel_count = self
             .config
@@ -167,15 +167,29 @@ impl HostAudioBuffers {
             plugin_output_channel_count,
             self.config.output_channel_count,
         ) {
-            (1, 1) => muxed.copy_from_slice(main_output),
+            (1, 1) => muxed.copy_from_slice(&main_output[..len]),
             (n, 1) => mix_mono(main_output, muxed, n as usize),
             (1, 2) => mono_to_multi(main_output, muxed, 2),
             (_, 2) => mux(main_output, muxed, 2),
             (_, _) => unreachable!(),
         }
+        muxed
+    }
 
+    /// プラグイン出力を CPAL バッファに書き出す (ダウンミックス/インターリーブ込み)
+    pub fn write_to_cpal_buffer<S: FromSample<f32>>(&mut self, destination: &mut [S]) {
+        let muxed = self.muxed_output(destination.len());
         for (out, muxed) in destination.iter_mut().zip(muxed) {
             *out = muxed.to_sample();
+        }
+    }
+
+    /// プラグイン出力をミックス用バッファに**加算**する。
+    /// トラックごとの出力を1つの出力にまとめるために使う。
+    pub fn mix_into(&mut self, accumulator: &mut [f32]) {
+        let muxed = self.muxed_output(accumulator.len());
+        for (out, muxed) in accumulator.iter_mut().zip(muxed) {
+            *out += *muxed;
         }
     }
 }

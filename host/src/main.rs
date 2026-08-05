@@ -108,6 +108,8 @@ struct Loaded {
     receiver: Receiver<MainThreadMessage>,
     sender: Sender<MainThreadMessage>,
     producer: rtrb::Producer<GuiMsg>,
+    /// オーディオスレッドから返ってきた音源 (メインスレッドで deactivate する)
+    retired: rtrb::Consumer<Box<audio::TrackProcessor>>,
     #[allow(dead_code)] // パラメータ UI 無効化中
     params: Vec<ParamUi>,
     #[allow(dead_code)] // 鍵盤 UI 無効化中
@@ -328,10 +330,21 @@ fn instantiate_and_start(
         &host_info,
     )?;
 
-    let (producer, consumer) = rtrb::RingBuffer::new(256);
+    let (mut producer, consumer) = rtrb::RingBuffer::new(256);
+    // 外した音源をメインスレッドへ返す口 (オーディオスレッドで解放しないため)
+    let (retired_producer, retired) = rtrb::RingBuffer::new(8);
     let transport_shared = TransportShared::new();
-    let (stream, sample_rate) =
-        audio::activate_to_stream(&mut instance, consumer, transport_shared.clone())?;
+
+    // ストリームは1本だけ作り、音源はメッセージで載せる
+    let (stream, stream_config) =
+        audio::start_engine(consumer, retired_producer, transport_shared.clone())?;
+    let processor = audio::activate_track(&mut instance, &stream_config)?;
+    let _ = producer.push(GuiMsg::SetTrack {
+        track: 0,
+        processor,
+    });
+
+    let sample_rate = stream_config.sample_rate;
     let params = params::read_params(&mut instance);
 
     // gui 拡張があれば GUI マネージャを用意する
@@ -345,6 +358,7 @@ fn instantiate_and_start(
         receiver,
         sender,
         producer,
+        retired,
         params,
         pressed_keys: HashSet::new(),
         gui,
@@ -380,6 +394,14 @@ impl eframe::App for App {
                     }
                 }
                 Err(e) => self.error = Some(format!("自動ロード失敗: {e}")),
+            }
+        }
+
+        // オーディオスレッドから返ってきた音源をここで停止・解放する
+        // (オーディオスレッドで解放してはいけないため)
+        if let Some(loaded) = &mut self.loaded {
+            while let Ok(processor) = loaded.retired.pop() {
+                loaded.instance.deactivate(processor.into_stopped());
             }
         }
 
@@ -504,6 +526,7 @@ impl eframe::App for App {
                                 }
                                 if ui.add(slider).changed() {
                                     let _ = loaded.producer.push(GuiMsg::ParamValue {
+                                        track: 0,
                                         id: param.id,
                                         value: param.value,
                                     });
@@ -542,12 +565,16 @@ impl eframe::App for App {
 
                         if is_down && !was_down {
                             loaded.pressed_keys.insert(key);
-                            let _ = loaded
-                                .producer
-                                .push(GuiMsg::NoteOn { key, velocity: 0.8 });
+                            let _ = loaded.producer.push(GuiMsg::NoteOn {
+                                track: 0,
+                                key,
+                                velocity: 0.8,
+                            });
                         } else if !is_down && was_down {
                             loaded.pressed_keys.remove(&key);
-                            let _ = loaded.producer.push(GuiMsg::NoteOff { key });
+                            let _ = loaded
+                                .producer
+                                .push(GuiMsg::NoteOff { track: 0, key });
                         }
                     }
                 });

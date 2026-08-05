@@ -81,16 +81,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut event_buffer = EventBuffer::with_capacity(512);
     let note_port = Some((0u16, false)); // テストプラグインは CLAP ダイアレクト
 
-    transport.handle_msg(
-        TransportMsg::SetSequence {
-            track: 0,
-            events,
-            end_sample,
-        },
-        &mut event_buffer,
-        note_port,
-    );
-    transport.handle_msg(TransportMsg::Play, &mut event_buffer, note_port);
+    let _ = transport.handle_msg(TransportMsg::SetSequence {
+        track: 0,
+        events,
+        end_sample,
+    });
+    let _ = transport.handle_msg(TransportMsg::Play);
     event_buffer.clear();
 
     // ---- オフライン処理 ----
@@ -109,8 +105,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     for _ in 0..total_blocks {
         event_buffer.clear();
-        let mut outputs = [(&mut event_buffer, note_port)];
-        transport.process_block(&mut outputs, BLOCK_SIZE as u64);
+        let plan = transport.plan_block(BLOCK_SIZE as u64);
+        transport.emit_track(0, &plan, &mut event_buffer, note_port);
         let events_in = event_buffer.as_input();
 
         let inputs = input_ports.with_input_buffers([AudioPortBuffer {

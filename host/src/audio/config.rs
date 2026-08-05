@@ -31,7 +31,90 @@ pub struct FullAudioConfig {
     pub sample_format: SampleFormat,
 }
 
+/// ストリーム側だけの構成 (プラグインに依存しない部分)。
+///
+/// トラックごとに音源を持つと、1本のストリームを全プラグインで共有するため、
+/// サンプルレートやバッファ長はプラグインより先に決めておく必要がある。
+#[derive(Clone, Copy, Debug)]
+pub struct StreamAudioConfig {
+    /// CPAL 出力のチャンネル数 (1 か 2 のみ対応)
+    pub output_channel_count: usize,
+    pub min_buffer_size: u32,
+    pub max_likely_buffer_size: u32,
+    pub sample_rate: u32,
+    pub sample_format: SampleFormat,
+}
+
+impl StreamAudioConfig {
+    /// デバイスが対応する中で最良の構成を選ぶ (プラグインは見ない)
+    pub fn find_best(device: &Device) -> Result<Self, Box<dyn Error>> {
+        let configs = list_device_configs_ordered(device)?;
+        let best = configs
+            .first()
+            .ok_or("使えるオーディオ出力構成が見つかりません")?;
+
+        // 44.1kHz 以上で最小のサンプルレートを選ぶ (対応範囲に収める)
+        let sample_rate = best
+            .min_sample_rate()
+            .max(SampleRate(44_100))
+            .min(best.max_sample_rate());
+        let config = best.clone().with_sample_rate(sample_rate);
+        let (min_buffer_size, max_likely_buffer_size) = buffer_size_range(&config);
+
+        Ok(Self {
+            output_channel_count: config.channels() as usize,
+            min_buffer_size,
+            max_likely_buffer_size,
+            sample_rate: sample_rate.0,
+            sample_format: config.sample_format(),
+        })
+    }
+
+    pub fn as_cpal_stream_config(&self) -> StreamConfig {
+        StreamConfig {
+            channels: self.output_channel_count as u16,
+            buffer_size: BufferSize::Fixed(self.max_likely_buffer_size),
+            sample_rate: SampleRate(self.sample_rate),
+        }
+    }
+
+    pub fn as_clack_plugin_config(&self) -> PluginAudioConfiguration {
+        PluginAudioConfiguration {
+            sample_rate: self.sample_rate as f64,
+            min_frames_count: self.min_buffer_size,
+            max_frames_count: self.max_likely_buffer_size,
+        }
+    }
+}
+
+impl Display for StreamAudioConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} channels at {:.1}kHz, buffer {}-{}",
+            self.output_channel_count,
+            self.sample_rate as f64 / 1_000.0,
+            self.min_buffer_size,
+            self.max_likely_buffer_size,
+        )
+    }
+}
+
 impl FullAudioConfig {
+    /// 決まっているストリーム構成に、プラグインのポート構成を組み合わせる。
+    /// 出力チャンネル数が食い違う場合はバッファ側で変換する (モノ↔ステレオ)。
+    pub fn for_plugin(stream: &StreamAudioConfig, instance: &mut PluginInstance<MiniHost>) -> Self {
+        Self {
+            plugin_input_port_config: get_config_from_ports(&mut instance.plugin_handle(), true),
+            plugin_output_port_config: get_config_from_ports(&mut instance.plugin_handle(), false),
+            output_channel_count: stream.output_channel_count,
+            min_buffer_size: stream.min_buffer_size,
+            max_likely_buffer_size: stream.max_likely_buffer_size,
+            sample_rate: stream.sample_rate,
+            sample_format: stream.sample_format,
+        }
+    }
+
     /// CPAL デバイスとプラグインの両方に合う最良の構成を探す
     pub fn find_best_from(
         device: &Device,
@@ -152,6 +235,15 @@ impl Display for AudioPortLayout {
             AudioPortLayout::Stereo => f.write_str("stereo"),
             AudioPortLayout::Unsupported { channel_count } => write!(f, "{channel_count}-channels"),
         }
+    }
+}
+
+/// 構成から使えるバッファ長の範囲を求める。
+/// CPAL は最小バッファサイズ 0 を報告することがあるので補正する。
+fn buffer_size_range(config: &cpal::SupportedStreamConfig) -> (u32, u32) {
+    match config.buffer_size() {
+        SupportedBufferSize::Range { min, max } => ((*min).max(1), 1024.clamp(*min, *max)),
+        SupportedBufferSize::Unknown => (1, 1024),
     }
 }
 

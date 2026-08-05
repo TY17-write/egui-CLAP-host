@@ -115,13 +115,11 @@ impl Transport {
     }
 
     /// GUI からの操作を処理する。
-    /// 鳴りっぱなし防止の NoteChoke が必要な場合は buffer に積む。
-    pub fn handle_msg(
-        &mut self,
-        msg: TransportMsg,
-        buffer: &mut EventBuffer,
-        note_port: Option<(u16, bool)>,
-    ) {
+    /// 戻り値が true なら、鳴りっぱなし防止のため全トラックを消音する必要がある
+    /// (どのトラックへ消音イベントを積むかは呼び出し側が決める)。
+    #[must_use]
+    pub fn handle_msg(&mut self, msg: TransportMsg) -> bool {
+        let mut needs_choke = false;
         match msg {
             TransportMsg::SetSequence {
                 track,
@@ -132,10 +130,8 @@ impl Transport {
                 self.tracks[track].events = events;
                 self.end_sample = end_sample;
                 self.recompute_next_event();
-                if self.playing {
-                    // 差し替え前のノートオフが消えている可能性があるため全消音
-                    push_choke(buffer, note_port, 0);
-                }
+                // 差し替え前のノートオフが消えている可能性があるため全消音
+                needs_choke = self.playing;
             }
             TransportMsg::Play => {
                 if self.pos >= self.end_sample {
@@ -145,15 +141,11 @@ impl Transport {
                 self.playing = true;
             }
             TransportMsg::Stop => {
-                if self.playing {
-                    push_choke(buffer, note_port, 0);
-                }
+                needs_choke = self.playing;
                 self.playing = false;
             }
             TransportMsg::Seek { sample } => {
-                if self.playing {
-                    push_choke(buffer, note_port, 0);
-                }
+                needs_choke = self.playing;
                 self.pos = sample;
                 self.recompute_next_event();
             }
@@ -162,91 +154,156 @@ impl Transport {
             }
         }
         self.publish_state();
+        needs_choke
     }
 
-    /// 1ブロック分 (sample_count フレーム) のイベントを発行し、位置を進める。
-    ///
-    /// `outputs` はトラックごとの (イベントバッファ, ノートポート)。
-    /// 各トラックのイベントは自分のバッファにだけ入るので、そのまま
-    /// 対応するプラグインへ渡せる。
-    pub fn process_block(
-        &mut self,
-        outputs: &mut [(&mut EventBuffer, Option<(u16, bool)>)],
-        sample_count: u64,
-    ) {
+    /// 1ブロックを区切った区間。ループで終端をまたぐと複数になる。
+    /// 位置の前進 (クロック) とイベント発行を分けるための中間データ。
+    pub fn plan_block(&mut self, sample_count: u64) -> BlockPlan {
+        let mut plan = BlockPlan::default();
         if !self.playing {
-            return;
+            return plan;
         }
 
         let mut block_offset = 0u64; // ブロック内の書き込み基準位置
         let mut remaining = sample_count;
 
-        // ループ時はブロックが終端をまたぐことがあるため、区間ごとに処理する
-        while remaining > 0 {
-            let span = if self.looping && self.end_sample > self.pos {
+        while remaining > 0 && plan.count < MAX_SPANS {
+            let length = if self.looping && self.end_sample > self.pos {
                 remaining.min(self.end_sample - self.pos)
             } else {
                 remaining
             };
 
-            let span_end = self.pos + span;
-            for (index, track) in self.tracks.iter_mut().enumerate() {
-                let Some((buffer, note_port)) = outputs.get_mut(index) else {
-                    continue; // 音源の無いトラックは鳴らさない
-                };
-                while let Some(event) = track.events.get(track.next_event) {
-                    if event.sample_time >= span_end {
-                        break;
-                    }
-                    let offset = (block_offset + (event.sample_time - self.pos)) as u32;
-                    push_note_event(buffer, *note_port, offset, event);
-                    track.next_event += 1;
-                }
-            }
+            let span_end = self.pos + length;
+            let mut span = BlockSpan {
+                start: self.pos,
+                end: span_end,
+                block_offset,
+                // 終端ちょうど (sample_time == end_sample) のイベントは「end 未満」の
+                // 条件から漏れるので、停止/ループの前にここでまとめて出す。
+                // これを怠ると小節境界で終わるノートのノートオフが欠落し、
+                // 音が鳴りっぱなしになる。
+                flush_end: false,
+                rewind: false,
+                flush_offset: 0,
+            };
 
             self.pos = span_end;
-            block_offset += span;
-            remaining -= span;
+            block_offset += length;
+            remaining -= length;
 
             if self.end_sample > 0 && self.pos >= self.end_sample {
-                // 終端ちょうど (sample_time == end_sample) のイベントは
-                // 「span_end 未満」の条件から漏れるため、停止/ループ前にここで発行する。
-                // これを怠ると、小節境界で終わるノートのノートオフが
-                // ブロック境界と終端が一致したときに欠落し、音が鳴りっぱなしになる。
-                let flush_offset = block_offset.min(sample_count.saturating_sub(1)) as u32;
-                for (index, track) in self.tracks.iter_mut().enumerate() {
-                    let Some((buffer, note_port)) = outputs.get_mut(index) else {
-                        continue;
-                    };
-                    while let Some(event) = track.events.get(track.next_event) {
-                        if event.sample_time > self.end_sample {
-                            break;
-                        }
-                        push_note_event(buffer, *note_port, flush_offset, event);
-                        track.next_event += 1;
-                    }
-                }
-
+                span.flush_end = true;
+                span.flush_offset = block_offset.min(sample_count.saturating_sub(1)) as u32;
                 if self.looping {
-                    // 先頭に巻き戻して同じブロックの残りを処理する
+                    span.rewind = true;
                     self.pos = 0;
-                    for track in &mut self.tracks {
-                        track.next_event = 0;
-                    }
                 } else {
                     self.playing = false;
                     self.pos = self.end_sample;
+                    plan.push(span);
                     break;
                 }
             }
+            plan.push(span);
         }
 
         self.publish_state();
+        plan
+    }
+
+    /// 1トラック分のイベントを、計画した区間に沿って発行する
+    pub fn emit_track(
+        &mut self,
+        track: usize,
+        plan: &BlockPlan,
+        buffer: &mut EventBuffer,
+        note_port: Option<(u16, bool)>,
+    ) {
+        let end_sample = self.end_sample;
+        let Some(sequence) = self.tracks.get_mut(track) else {
+            return;
+        };
+
+        for span in plan.spans() {
+            while let Some(event) = sequence.events.get(sequence.next_event) {
+                if event.sample_time >= span.end {
+                    break;
+                }
+                let offset = (span.block_offset + (event.sample_time - span.start)) as u32;
+                push_note_event(buffer, note_port, offset, event);
+                sequence.next_event += 1;
+            }
+
+            if span.flush_end {
+                while let Some(event) = sequence.events.get(sequence.next_event) {
+                    if event.sample_time > end_sample {
+                        break;
+                    }
+                    push_note_event(buffer, note_port, span.flush_offset, event);
+                    sequence.next_event += 1;
+                }
+                if span.rewind {
+                    sequence.next_event = 0;
+                }
+            }
+        }
+    }
+}
+
+/// 1ブロックを区切った1区間
+#[derive(Clone, Copy, Default)]
+pub struct BlockSpan {
+    start: u64,
+    end: u64,
+    block_offset: u64,
+    /// この区間の終わりで終端イベントを出すか
+    flush_end: bool,
+    /// 出したあとに先頭へ巻き戻すか (ループ時)
+    rewind: bool,
+    flush_offset: u32,
+}
+
+/// ループでブロック内に収まる区間の上限 (極端に短いループの保険)
+const MAX_SPANS: usize = 8;
+
+/// 1ブロック分の区間の並び。オーディオスレッドで確保しないよう固定長で持つ。
+#[derive(Clone, Copy)]
+pub struct BlockPlan {
+    spans: [BlockSpan; MAX_SPANS],
+    count: usize,
+}
+
+impl Default for BlockPlan {
+    fn default() -> Self {
+        Self {
+            spans: [BlockSpan::default(); MAX_SPANS],
+            count: 0,
+        }
+    }
+}
+
+impl BlockPlan {
+    fn push(&mut self, span: BlockSpan) {
+        if self.count < MAX_SPANS {
+            self.spans[self.count] = span;
+            self.count += 1;
+        }
+    }
+
+    fn spans(&self) -> &[BlockSpan] {
+        &self.spans[..self.count]
+    }
+
+    /// 発行すべきものが何もないか
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
 /// 全ノート消音イベントを積む
-fn push_choke(buffer: &mut EventBuffer, note_port: Option<(u16, bool)>, time: u32) {
+pub fn push_choke(buffer: &mut EventBuffer, note_port: Option<(u16, bool)>, time: u32) {
     let Some((port, prefers_midi)) = note_port else {
         return;
     };
@@ -267,23 +324,18 @@ mod tests {
     fn make_transport(events: Vec<SeqEvent>, end_sample: u64) -> (Transport, TransportShared) {
         let shared = TransportShared::new();
         let mut transport = Transport::new(shared.clone());
-        let mut buffer = EventBuffer::with_capacity(16);
-        transport.handle_msg(
-            TransportMsg::SetSequence {
-                track: 0,
-                events: events.into_boxed_slice(),
-                end_sample,
-            },
-            &mut buffer,
-            PORT,
-        );
+        let _ = transport.handle_msg(TransportMsg::SetSequence {
+            track: 0,
+            events: events.into_boxed_slice(),
+            end_sample,
+        });
         (transport, shared)
     }
 
     /// トラック1本ぶんのブロック処理 (テスト用の短縮形)
     fn process_block(transport: &mut Transport, buffer: &mut EventBuffer, sample_count: u64) {
-        let mut outputs = [(buffer, PORT)];
-        transport.process_block(&mut outputs, sample_count);
+        let plan = transport.plan_block(sample_count);
+        transport.emit_track(0, &plan, buffer, PORT);
     }
 
     fn on(sample_time: u64) -> SeqEvent {
@@ -309,7 +361,7 @@ mod tests {
     fn final_note_off_at_end_boundary_is_emitted() {
         let (mut transport, shared) = make_transport(vec![on(0), off(200)], 200);
         let mut buffer = EventBuffer::with_capacity(16);
-        transport.handle_msg(TransportMsg::Play, &mut buffer, PORT);
+        let _ = transport.handle_msg(TransportMsg::Play);
 
         buffer.clear();
         process_block(&mut transport, &mut buffer, 100); // [0,100)
@@ -342,7 +394,7 @@ mod tests {
         let events = editor.to_events(44100.0);
         let (mut transport, _shared) = make_transport(events, 44100);
         let mut buffer = EventBuffer::with_capacity(16);
-        transport.handle_msg(TransportMsg::Play, &mut buffer, PORT);
+        let _ = transport.handle_msg(TransportMsg::Play);
 
         buffer.clear();
         process_block(&mut transport, &mut buffer, 64);
@@ -370,8 +422,8 @@ mod tests {
     fn loop_wrap_emits_final_note_off() {
         let (mut transport, _shared) = make_transport(vec![on(0), off(200)], 200);
         let mut buffer = EventBuffer::with_capacity(16);
-        transport.handle_msg(TransportMsg::SetLoop { enabled: true }, &mut buffer, PORT);
-        transport.handle_msg(TransportMsg::Play, &mut buffer, PORT);
+        let _ = transport.handle_msg(TransportMsg::SetLoop { enabled: true });
+        let _ = transport.handle_msg(TransportMsg::Play);
 
         buffer.clear();
         process_block(&mut transport, &mut buffer, 100); // [0,100)

@@ -24,46 +24,88 @@ use transport::{Transport, TransportMsg, TransportShared};
 
 /// GUI スレッドからオーディオスレッドへ送るメッセージ
 pub enum GuiMsg {
-    NoteOn { key: u16, velocity: f64 },
-    NoteOff { key: u16 },
-    ParamValue { id: ClapId, value: f64 },
+    NoteOn {
+        track: usize,
+        key: u16,
+        velocity: f64,
+    },
+    NoteOff {
+        track: usize,
+        key: u16,
+    },
+    ParamValue {
+        track: usize,
+        id: ClapId,
+        value: f64,
+    },
     Transport(TransportMsg),
+    /// トラックに音源を載せる (差し替え時は古い方を retired へ返す)
+    SetTrack {
+        track: usize,
+        processor: Box<TrackProcessor>,
+    },
+    /// トラックの音源を外す
+    ClearTrack {
+        track: usize,
+    },
 }
 
-/// プラグインをアクティベートし、CPAL 出力ストリームに接続して再生を開始する。
-/// 戻り値はストリームと確定したサンプルレート。
-pub fn activate_to_stream(
-    instance: &mut PluginInstance<MiniHost>,
+/// オーディオスレッドが持つトラック1本ぶんの処理器一式
+pub struct TrackProcessor {
+    audio_processor: StartedPluginAudioProcessor<MiniHost>,
+    buffers: HostAudioBuffers,
+    events: EventBuffer,
+    /// (ノートポートのインデックス, MIDI ダイアレクト優先か)。ノート入力がなければ None。
+    note_port: Option<(u16, bool)>,
+}
+
+impl TrackProcessor {
+    pub fn new(
+        audio_processor: StartedPluginAudioProcessor<MiniHost>,
+        config: FullAudioConfig,
+        note_port: Option<(u16, bool)>,
+    ) -> Self {
+        Self {
+            audio_processor,
+            buffers: HostAudioBuffers::from_config(config),
+            events: EventBuffer::with_capacity(128),
+            note_port,
+        }
+    }
+
+    /// 停止させてプラグインインスタンスへ返せる形にする
+    pub fn into_stopped(self) -> StoppedPluginAudioProcessor<MiniHost> {
+        self.audio_processor.stop_processing()
+    }
+}
+
+/// 出力ストリームを1本だけ作って再生を開始する。
+///
+/// トラックの音源は後から `GuiMsg::SetTrack` で載せる。ストリームを作り直さずに
+/// 差し替えられるので、トランスポート (再生位置) は1つのまま保たれる。
+/// 外した音源は `retired` 経由でメインスレッドへ返す (オーディオスレッドで
+/// 解放しないため)。
+pub fn start_engine(
     gui_events: Consumer<GuiMsg>,
+    retired: rtrb::Producer<Box<TrackProcessor>>,
     transport_shared: TransportShared,
-) -> Result<(Stream, u32), Box<dyn Error>> {
+) -> Result<(Stream, StreamAudioConfig), Box<dyn Error>> {
     let cpal_host = cpal::default_host();
 
     let output_device = cpal_host
         .default_output_device()
         .ok_or("オーディオ出力デバイスが見つかりません")?;
 
-    let audio_config = FullAudioConfig::find_best_from(&output_device, instance)?;
-    println!("オーディオ構成: {audio_config}");
+    let stream_config = StreamAudioConfig::find_best(&output_device)?;
+    println!("オーディオ構成: {stream_config}");
 
-    let note_port = find_main_note_port(instance);
-    if note_port.is_none() {
-        println!("このプラグインにはノート入力ポートがありません。");
-    }
-
-    let plugin_audio_processor = instance
-        .activate(|_, _| (), audio_config.as_clack_plugin_config())?
-        .start_processing()?;
-
-    let sample_format = audio_config.sample_format;
-    let sample_rate = audio_config.sample_rate;
-    let cpal_config = audio_config.as_cpal_stream_config();
+    let cpal_config = stream_config.as_cpal_stream_config();
+    let sample_format = stream_config.sample_format;
     let audio_processor = StreamAudioProcessor::new(
-        plugin_audio_processor,
         gui_events,
-        note_port,
+        retired,
         transport_shared,
-        audio_config,
+        stream_config.output_channel_count,
     );
 
     let stream = build_output_stream_for_sample_format(
@@ -74,7 +116,30 @@ pub fn activate_to_stream(
     )?;
     stream.play()?;
 
-    Ok((stream, sample_rate))
+    Ok((stream, stream_config))
+}
+
+/// プラグインを指定のストリーム構成でアクティベートし、トラック処理器にする
+pub fn activate_track(
+    instance: &mut PluginInstance<MiniHost>,
+    stream_config: &StreamAudioConfig,
+) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
+    let audio_config = FullAudioConfig::for_plugin(stream_config, instance);
+
+    let note_port = find_main_note_port(instance);
+    if note_port.is_none() {
+        println!("このプラグインにはノート入力ポートがありません。");
+    }
+
+    let processor = instance
+        .activate(|_, _| (), stream_config.as_clack_plugin_config())?
+        .start_processing()?;
+
+    Ok(Box::new(TrackProcessor::new(
+        processor,
+        audio_config,
+        note_port,
+    )))
 }
 
 /// サンプル形式に応じた CPAL 出力ストリームを構築する
@@ -160,80 +225,107 @@ fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<(u16, 
 
 /// オーディオスレッド上で動くデータ一式
 struct StreamAudioProcessor {
-    audio_processor: StartedPluginAudioProcessor<MiniHost>,
-    buffers: HostAudioBuffers,
+    /// トラックごとの音源。None は音源未ロードのトラック。
+    tracks: Vec<Option<Box<TrackProcessor>>>,
+    /// 外した音源をメインスレッドへ返す口 (ここで解放しないため)
+    retired: rtrb::Producer<Box<TrackProcessor>>,
     gui_events: Consumer<GuiMsg>,
-    clap_events_buffer: EventBuffer,
-    /// (ノートポートのインデックス, MIDI ダイアレクト優先か)。ノート入力がなければ None。
-    note_port: Option<(u16, bool)>,
+    /// 全トラックの出力を足し込むバッファ (インターリーブ済み)
+    mix: Vec<f32>,
+    output_channel_count: usize,
     transport: Transport,
     steady_counter: u64,
 }
 
 impl StreamAudioProcessor {
     fn new(
-        plugin_instance: StartedPluginAudioProcessor<MiniHost>,
         gui_events: Consumer<GuiMsg>,
-        note_port: Option<(u16, bool)>,
+        retired: rtrb::Producer<Box<TrackProcessor>>,
         transport_shared: TransportShared,
-        audio_config: FullAudioConfig,
+        output_channel_count: usize,
     ) -> Self {
         Self {
-            audio_processor: plugin_instance,
-            buffers: HostAudioBuffers::from_config(audio_config),
+            tracks: Vec::new(),
+            retired,
             gui_events,
-            clap_events_buffer: EventBuffer::with_capacity(128),
-            note_port,
+            mix: Vec::new(),
+            output_channel_count,
             transport: Transport::new(transport_shared),
             steady_counter: 0,
         }
     }
 
-    /// GUI からのメッセージをすべて取り出し、CLAP イベントバッファに変換する。
+    /// トラック数を確保する (足りなければ空きで埋める)
+    fn ensure_track(&mut self, track: usize) {
+        while self.tracks.len() <= track {
+            self.tracks.push(None);
+        }
+    }
+
+    /// 外した音源をメインスレッドへ返す。返せなければやむなくここで解放する
+    /// (リングバッファが詰まるのは異常時だけ)。
+    fn retire(&mut self, processor: Option<Box<TrackProcessor>>) {
+        if let Some(processor) = processor {
+            let _ = self.retired.push(processor);
+        }
+    }
+
+    /// GUI からのメッセージをすべて取り出し、トラックごとの CLAP イベントに変換する。
     /// その後、再生中ならシーケンスのイベントを sample_count 分発行する。
     fn collect_gui_events(&mut self, sample_count: u64) {
-        self.clap_events_buffer.clear();
+        for track in self.tracks.iter_mut().flatten() {
+            track.events.clear();
+        }
 
         while let Ok(msg) = self.gui_events.pop() {
             match msg {
-                GuiMsg::NoteOn { key, velocity } => {
-                    let Some((port, prefers_midi)) = self.note_port else {
+                GuiMsg::NoteOn {
+                    track,
+                    key,
+                    velocity,
+                } => {
+                    let Some(Some(target)) = self.tracks.get_mut(track) else {
+                        continue;
+                    };
+                    let Some((port, prefers_midi)) = target.note_port else {
                         continue;
                     };
                     if prefers_midi {
-                        self.clap_events_buffer.push(
+                        target.events.push(
                             &MidiEvent::new(0, port, [0x90, key as u8, 100])
                                 .with_flags(EventFlags::IS_LIVE),
                         );
                     } else {
-                        self.clap_events_buffer.push(
-                            &NoteOnEvent::new(
-                                0,
-                                Pckn::new(port, 0u16, key, Match::All),
-                                velocity,
-                            )
-                            .with_flags(EventFlags::IS_LIVE),
+                        target.events.push(
+                            &NoteOnEvent::new(0, Pckn::new(port, 0u16, key, Match::All), velocity)
+                                .with_flags(EventFlags::IS_LIVE),
                         );
                     }
                 }
-                GuiMsg::NoteOff { key } => {
-                    let Some((port, prefers_midi)) = self.note_port else {
+                GuiMsg::NoteOff { track, key } => {
+                    let Some(Some(target)) = self.tracks.get_mut(track) else {
+                        continue;
+                    };
+                    let Some((port, prefers_midi)) = target.note_port else {
                         continue;
                     };
                     if prefers_midi {
-                        self.clap_events_buffer.push(
+                        target.events.push(
                             &MidiEvent::new(0, port, [0x80, key as u8, 0])
                                 .with_flags(EventFlags::IS_LIVE),
                         );
                     } else {
-                        self.clap_events_buffer.push(
+                        target.events.push(
                             &NoteOffEvent::new(0, Pckn::new(port, 0u16, key, Match::All), 0.0)
                                 .with_flags(EventFlags::IS_LIVE),
                         );
                     }
                 }
-                GuiMsg::ParamValue { id, value } => {
-                    self.clap_events_buffer.push(&ParamValueEvent::new(
+                GuiMsg::ParamValue { track, id, value } => {
+                    let Some(Some(target)) = self.tracks.get_mut(track) else {
+                        continue;
+                    };
+                    target.events.push(&ParamValueEvent::new(
                         0,
                         id,
                         Pckn::match_all(),
@@ -242,38 +334,75 @@ impl StreamAudioProcessor {
                     ));
                 }
                 GuiMsg::Transport(msg) => {
-                    self.transport
-                        .handle_msg(msg, &mut self.clap_events_buffer, self.note_port);
+                    // 状態の更新は1回。消音が要るときは全トラックへ配る
+                    if self.transport.handle_msg(msg) {
+                        for track in self.tracks.iter_mut().flatten() {
+                            transport::push_choke(&mut track.events, track.note_port, 0);
+                        }
+                    }
+                }
+                GuiMsg::SetTrack { track, processor } => {
+                    self.ensure_track(track);
+                    let previous = self.tracks[track].replace(processor);
+                    self.retire(previous);
+                }
+                GuiMsg::ClearTrack { track } => {
+                    if let Some(slot) = self.tracks.get_mut(track) {
+                        let previous = slot.take();
+                        self.retire(previous);
+                    }
                 }
             }
         }
 
-        // 再生中のシーケンスイベントを発行 (ブロック内オフセット付き)。
-        // 今はトラック1本ぶんだけ (複数トラックは以降の段階で対応する)。
-        let mut outputs = [(&mut self.clap_events_buffer, self.note_port)];
-        self.transport.process_block(&mut outputs, sample_count);
+        // 再生位置を1回だけ進めてから、トラックごとにイベントを発行する。
+        // (オーディオスレッドで確保しないよう、区間の計画は固定長で持ち回る)
+        let plan = self.transport.plan_block(sample_count);
+        if !plan.is_empty() {
+            for (index, slot) in self.tracks.iter_mut().enumerate() {
+                if let Some(track) = slot {
+                    self.transport
+                        .emit_track(index, &plan, &mut track.events, track.note_port);
+                }
+            }
+        }
     }
 
-    /// CPAL の出力バッファ1回分を処理する
+    /// CPAL の出力バッファ1回分を処理する。
+    /// 各トラックを自分のバッファへ処理してから、まとめて足し合わせる。
     fn process<S: FromSample<f32>>(&mut self, data: &mut [S]) {
-        self.buffers.ensure_buffer_size_matches(data.len());
-        let sample_count = self.buffers.cpal_buf_len_to_frame_count(data.len());
+        let sample_count = data.len() / self.output_channel_count.max(1);
 
         self.collect_gui_events(sample_count as u64);
-        let events = self.clap_events_buffer.as_input();
 
-        let (ins, mut outs) = self.buffers.prepare_plugin_buffers(data.len());
+        // ミックス用バッファを用意して 0 クリア
+        if self.mix.len() < data.len() {
+            self.mix.resize(data.len(), 0.0);
+        }
+        let mix = &mut self.mix[..data.len()];
+        mix.fill(0.0);
 
-        match self.audio_processor.process(
-            &ins,
-            &mut outs,
-            &events,
-            &mut OutputEvents::void(),
-            Some(self.steady_counter),
-            None,
-        ) {
-            Ok(_) => self.buffers.write_to_cpal_buffer(data),
-            Err(e) => eprintln!("{e}"),
+        let steady = self.steady_counter;
+        for track in self.tracks.iter_mut().flatten() {
+            track.buffers.ensure_buffer_size_matches(data.len());
+            let events = track.events.as_input();
+            let (ins, mut outs) = track.buffers.prepare_plugin_buffers(data.len());
+
+            match track.audio_processor.process(
+                &ins,
+                &mut outs,
+                &events,
+                &mut OutputEvents::void(),
+                Some(steady),
+                None,
+            ) {
+                Ok(_) => track.buffers.mix_into(mix),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+
+        for (out, mixed) in data.iter_mut().zip(self.mix.iter()) {
+            *out = FromSample::from_sample_(*mixed);
         }
 
         self.steady_counter += sample_count as u64;
