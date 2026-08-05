@@ -2,6 +2,7 @@
 
 use clap_host_test::{audio, discovery, editor_ui, gui, host, midi, params, theme};
 
+use audio::config::StreamAudioConfig;
 use audio::transport::{TransportMsg, TransportShared};
 use audio::GuiMsg;
 use clack_host::prelude::*;
@@ -96,33 +97,38 @@ struct Candidates {
     path: PathBuf,
     entry: PluginEntry,
     plugins: Vec<discovery::FoundPlugin>,
+    /// この候補から選んだプラグインを載せるトラック
+    target_track: usize,
 }
 
-/// インスタンス化済みで再生中のプラグイン
-struct Loaded {
-    name: String,
-    // フィールドは宣言順にドロップされるため、ストリーム (オーディオスレッド) を
-    // インスタンスより先に停止させる
+/// オーディオエンジン (出力ストリーム1本と、それを操作する口)。
+/// トラックより長生きし、音源はメッセージで出し入れする。
+struct Engine {
     _stream: cpal::Stream,
-    instance: PluginInstance<MiniHost>,
-    receiver: Receiver<MainThreadMessage>,
-    sender: Sender<MainThreadMessage>,
     producer: rtrb::Producer<GuiMsg>,
     /// オーディオスレッドから返ってきた音源 (メインスレッドで deactivate する)
     retired: rtrb::Consumer<Box<audio::TrackProcessor>>,
+    /// 再生位置・再生中フラグの共有
+    transport_shared: TransportShared,
+    /// 全プラグイン共通のストリーム構成
+    config: StreamAudioConfig,
+}
+
+/// トラック1本にロードされた音源
+struct TrackAudio {
+    name: String,
+    instance: PluginInstance<MiniHost>,
+    receiver: Receiver<MainThreadMessage>,
+    sender: Sender<MainThreadMessage>,
     #[allow(dead_code)] // パラメータ UI 無効化中
     params: Vec<ParamUi>,
     #[allow(dead_code)] // 鍵盤 UI 無効化中
     pressed_keys: HashSet<u16>,
     /// プラグイン独自 GUI の管理 (gui 拡張がない場合は None)
     gui: Option<PluginGuiManager>,
-    /// オーディオストリームの実サンプルレート
-    sample_rate: u32,
-    /// 再生位置・再生中フラグの共有
-    transport_shared: TransportShared,
 }
 
-impl Drop for Loaded {
+impl Drop for TrackAudio {
     fn drop(&mut self) {
         // インスタンス破棄前にプラグイン GUI を確実に閉じる
         if let Some(gui) = &mut self.gui {
@@ -148,7 +154,10 @@ fn file_label(path: &std::path::Path) -> String {
 #[derive(Default)]
 struct App {
     candidates: Option<Candidates>,
-    loaded: Option<Loaded>,
+    // 宣言順にドロップされるため、ストリームをインスタンスより先に止める
+    engine: Option<Engine>,
+    /// トラックごとの音源 (エディタのトラック数に合わせて伸ばす)
+    tracks: Vec<Option<TrackAudio>>,
     error: Option<String>,
     /// 起動時に自動ロードする .clap ファイル (パス, GUI も開くか)
     autoload: Option<(PathBuf, bool)>,
@@ -168,7 +177,7 @@ struct App {
 }
 
 impl App {
-    fn open_file_dialog(&mut self) {
+    fn open_file_dialog(&mut self, target_track: usize) {
         let picked = rfd::FileDialog::new()
             .add_filter("CLAP プラグイン", &["clap"])
             .pick_file();
@@ -178,11 +187,11 @@ impl App {
         match discovery::load_clap_file(&path) {
             Ok((entry, plugins)) => {
                 self.error = None;
-                self.loaded = None;
                 self.candidates = Some(Candidates {
                     path,
                     entry,
                     plugins,
+                    target_track,
                 });
             }
             Err(e) => self.error = Some(format!("ロード失敗: {e}")),
@@ -279,26 +288,51 @@ impl App {
             .or_else(|| self.last_directory.clone())
     }
 
-    fn instantiate(&mut self, plugin_index: usize) {
+    /// トラック数をエディタに合わせる (足りなければ空きで埋める)
+    fn ensure_track_slots(&mut self, track: usize) {
+        let needed = (track + 1).max(self.editor.editor.track_count());
+        while self.tracks.len() < needed {
+            self.tracks.push(None);
+        }
+    }
+
+    /// 選んだプラグインを指定トラックに載せる
+    fn instantiate(&mut self, plugin_index: usize, track: usize) {
+        // 最初のロード時にストリームを用意する
+        if self.engine.is_none() {
+            match start_engine() {
+                Ok(engine) => self.engine = Some(engine),
+                Err(e) => {
+                    self.error = Some(format!("オーディオを開始できません: {e}"));
+                    return;
+                }
+            }
+        }
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
         let Some(candidates) = &self.candidates else {
             return;
         };
         let plugin = &candidates.plugins[plugin_index];
 
-        match instantiate_and_start(&candidates.entry, &plugin.id, &plugin.name) {
-            Ok(mut loaded) => {
+        match instantiate_plugin(&candidates.entry, &plugin.id, &plugin.name, &engine.config) {
+            Ok((audio_track, processor)) => {
                 self.error = None;
+                let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
+
                 // 未ロード中に動かした再生ヘッドの位置を引き継ぐ
                 let spq = self
                     .editor
                     .editor
-                    .samples_per_quarter(loaded.sample_rate as f64);
+                    .samples_per_quarter(engine.config.sample_rate as f64);
                 let sample = (self.pos_quarters * spq).max(0.0) as u64;
-                let _ = loaded
+                let _ = engine
                     .producer
                     .push(GuiMsg::Transport(TransportMsg::Seek { sample }));
 
-                self.loaded = Some(loaded);
+                self.ensure_track_slots(track);
+                self.tracks[track] = Some(audio_track);
                 // 新しいプラグインにシーケンスを送り直す
                 self.editor.dirty = true;
             }
@@ -307,12 +341,33 @@ impl App {
     }
 }
 
-/// プラグインをインスタンス化し、オーディオストリームを開始する
-fn instantiate_and_start(
+/// 出力ストリームを1本だけ作る (最初に音源をロードするときに一度だけ呼ぶ)
+fn start_engine() -> Result<Engine, Box<dyn Error>> {
+    let (producer, consumer) = rtrb::RingBuffer::new(256);
+    // 外した音源をメインスレッドへ返す口 (オーディオスレッドで解放しないため)
+    let (retired_producer, retired) = rtrb::RingBuffer::new(8);
+    let transport_shared = TransportShared::new();
+
+    let (stream, config) =
+        audio::start_engine(consumer, retired_producer, transport_shared.clone())?;
+
+    Ok(Engine {
+        _stream: stream,
+        producer,
+        retired,
+        transport_shared,
+        config,
+    })
+}
+
+/// プラグインをインスタンス化して、指定のストリーム構成で鳴らせる状態にする。
+/// 戻り値の処理器は呼び出し側がエンジンへ送る。
+fn instantiate_plugin(
     entry: &PluginEntry,
     plugin_id: &str,
     plugin_name: &str,
-) -> Result<Loaded, Box<dyn Error>> {
+    stream_config: &StreamAudioConfig,
+) -> Result<(TrackAudio, Box<audio::TrackProcessor>), Box<dyn Error>> {
     let host_info = HostInfo::new(
         "CLAP Mini Host",
         "clap-host-test",
@@ -330,41 +385,25 @@ fn instantiate_and_start(
         &host_info,
     )?;
 
-    let (mut producer, consumer) = rtrb::RingBuffer::new(256);
-    // 外した音源をメインスレッドへ返す口 (オーディオスレッドで解放しないため)
-    let (retired_producer, retired) = rtrb::RingBuffer::new(8);
-    let transport_shared = TransportShared::new();
-
-    // ストリームは1本だけ作り、音源はメッセージで載せる
-    let (stream, stream_config) =
-        audio::start_engine(consumer, retired_producer, transport_shared.clone())?;
-    let processor = audio::activate_track(&mut instance, &stream_config)?;
-    let _ = producer.push(GuiMsg::SetTrack {
-        track: 0,
-        processor,
-    });
-
-    let sample_rate = stream_config.sample_rate;
+    let processor = audio::activate_track(&mut instance, stream_config)?;
     let params = params::read_params(&mut instance);
 
     // gui 拡張があれば GUI マネージャを用意する
     let gui_ext = instance.access_handler(|mt| mt.gui);
     let gui = gui_ext.map(|ext| PluginGuiManager::new(ext, &mut instance.plugin_handle()));
 
-    Ok(Loaded {
-        name: plugin_name.to_string(),
-        _stream: stream,
-        instance,
-        receiver,
-        sender,
-        producer,
-        retired,
-        params,
-        pressed_keys: HashSet::new(),
-        gui,
-        sample_rate,
-        transport_shared,
-    })
+    Ok((
+        TrackAudio {
+            name: plugin_name.to_string(),
+            instance,
+            receiver,
+            sender,
+            params,
+            pressed_keys: HashSet::new(),
+            gui,
+        },
+        processor,
+    ))
 }
 
 impl eframe::App for App {
@@ -377,15 +416,16 @@ impl eframe::App for App {
                         path,
                         entry,
                         plugins,
+                        target_track: 0,
                     });
-                    self.instantiate(0);
+                    self.instantiate(0, 0);
                     if open_gui {
-                        if let Some(loaded) = &mut self.loaded {
-                            if let Some(gui) = &mut loaded.gui {
+                        if let Some(Some(track)) = self.tracks.get_mut(0) {
+                            if let Some(gui) = &mut track.gui {
                                 if let Err(e) = gui.open(
-                                    &mut loaded.instance.plugin_handle(),
-                                    &loaded.name,
-                                    loaded.sender.clone(),
+                                    &mut track.instance.plugin_handle(),
+                                    &track.name,
+                                    track.sender.clone(),
                                 ) {
                                     self.error = Some(format!("GUI を開けません: {e}"));
                                 }
@@ -398,48 +438,47 @@ impl eframe::App for App {
         }
 
         // オーディオスレッドから返ってきた音源をここで停止・解放する
-        // (オーディオスレッドで解放してはいけないため)
-        if let Some(loaded) = &mut self.loaded {
-            while let Ok(processor) = loaded.retired.pop() {
-                loaded.instance.deactivate(processor.into_stopped());
+        // (オーディオスレッドで解放してはいけないため)。
+        // どのトラックのものか分からないので、載っているインスタンスへ順に返す。
+        if let Some(engine) = &mut self.engine {
+            while let Ok(processor) = engine.retired.pop() {
+                if let Some(track) = self.tracks.iter_mut().flatten().next() {
+                    track.instance.deactivate(processor.into_stopped());
+                }
             }
         }
 
         // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理
-        if let Some(loaded) = &mut self.loaded {
-            while let Ok(msg) = loaded.receiver.try_recv() {
+        for track in self.tracks.iter_mut().flatten() {
+            while let Ok(msg) = track.receiver.try_recv() {
                 match msg {
                     MainThreadMessage::RunOnMainThread => {
-                        loaded.instance.call_on_main_thread_callback()
+                        track.instance.call_on_main_thread_callback()
                     }
                     MainThreadMessage::GuiRequestResized { new_size } => {
-                        if let Some(gui) = &mut loaded.gui {
+                        if let Some(gui) = &mut track.gui {
                             gui.on_plugin_request_resize(new_size);
                         }
                     }
                     MainThreadMessage::GuiClosed | MainThreadMessage::PluginWindowClosed => {
-                        if let Some(gui) = &mut loaded.gui {
-                            gui.close(&mut loaded.instance.plugin_handle());
+                        if let Some(gui) = &mut track.gui {
+                            gui.close(&mut track.instance.plugin_handle());
                         }
                     }
                     MainThreadMessage::PluginWindowResized { width, height } => {
-                        if let Some(gui) = &mut loaded.gui {
-                            gui.on_user_resized(
-                                &mut loaded.instance.plugin_handle(),
-                                width,
-                                height,
-                            );
+                        if let Some(gui) = &mut track.gui {
+                            gui.on_user_resized(&mut track.instance.plugin_handle(), width, height);
                         }
                     }
                 }
             }
 
             // プラグインが登録したタイマーを駆動する (GUI 描画などに必要)
-            let timer = loaded
+            let timer = track
                 .instance
                 .access_handler(|mt| mt.timer_support.map(|ext| (mt.timers.clone(), ext)));
             if let Some((timers, timer_ext)) = timer {
-                timers.tick_timers(&timer_ext, &mut loaded.instance.plugin_handle());
+                timers.tick_timers(&timer_ext, &mut track.instance.plugin_handle());
             }
         }
 
@@ -449,7 +488,8 @@ impl eframe::App for App {
                 ui.heading("CLAP ミニホスト");
                 ui.separator();
                 if ui.button(".clap ファイルを開く…").clicked() {
-                    self.open_file_dialog();
+                    // ヘッダーからのロードはトラック1へ
+                    self.open_file_dialog(0);
                 }
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::RED, error);
@@ -475,16 +515,19 @@ impl eframe::App for App {
                 });
             }
             if let Some(i) = instantiate_index {
-                self.instantiate(i);
+                let track = self.candidates.as_ref().map_or(0, |c| c.target_track);
+                self.instantiate(i, track);
             }
 
-            // ロード済みプラグインの操作 UI
-            if let Some(loaded) = &mut self.loaded {
+            // ロード済みプラグインの操作 UI (トラックごと)
+            let mut gui_error = None;
+            for (index, track) in self.tracks.iter_mut().enumerate() {
+                let Some(track) = track else { continue };
                 ui.horizontal(|ui| {
-                    ui.label(format!("再生中: {}", loaded.name));
+                    ui.label(format!("トラック {}: {}", index + 1, track.name));
 
                     // プラグイン独自 GUI の開閉ボタン
-                    if let Some(gui) = &mut loaded.gui {
+                    if let Some(gui) = &mut track.gui {
                         if gui.supports_gui() {
                             if !gui.is_open {
                                 let label = if gui.is_floating() {
@@ -494,20 +537,27 @@ impl eframe::App for App {
                                 };
                                 if ui.button(label).clicked() {
                                     if let Err(e) = gui.open(
-                                        &mut loaded.instance.plugin_handle(),
-                                        &loaded.name,
-                                        loaded.sender.clone(),
+                                        &mut track.instance.plugin_handle(),
+                                        &track.name,
+                                        track.sender.clone(),
                                     ) {
-                                        self.error = Some(format!("GUI を開けません: {e}"));
+                                        gui_error = Some(format!("GUI を開けません: {e}"));
                                     }
                                 }
                             } else if ui.button("エディタを閉じる").clicked() {
-                                gui.close(&mut loaded.instance.plugin_handle());
+                                gui.close(&mut track.instance.plugin_handle());
                             }
                         }
                     }
                 });
+            }
+            if gui_error.is_some() {
+                self.error = gui_error;
+            }
+            if !self.tracks.iter().flatten().count() == 0 {
                 ui.add_space(8.0);
+            }
+            {
 
                 // パラメータ汎用エディタ (一時的に無効化中)
                 /*
@@ -579,8 +629,9 @@ impl eframe::App for App {
                     }
                 });
                 */
+            }
 
-            } else {
+            if self.tracks.iter().flatten().count() == 0 {
                 ui.label("音色となるプラグインが未ロードです (「.clap ファイルを開く…」から選択)。ロードしなくてもシーケンスの編集はできます。");
                 ui.add_space(8.0);
             }
@@ -589,17 +640,17 @@ impl eframe::App for App {
             // プラグインは音色として使うだけなので、未ロードでも編集できるようにする。
             ui.separator();
             let sample_rate = self
-                .loaded
+                .engine
                 .as_ref()
-                .map_or(48_000.0, |loaded| loaded.sample_rate as f64);
+                .map_or(48_000.0, |engine| engine.config.sample_rate as f64);
             let spq = self.editor.editor.samples_per_quarter(sample_rate);
-            // ロード中はトランスポートの位置が本体。未ロードのときは
+            // エンジンがあればトランスポートの位置が本体。無いときは
             // 自前で覚えている位置を使う (シークだけは効くようにする)。
-            let playing = match &self.loaded {
-                Some(loaded) => {
+            let playing = match &self.engine {
+                Some(engine) => {
                     self.pos_quarters =
-                        loaded.transport_shared.pos.load(Ordering::Relaxed) as f64 / spq;
-                    loaded.transport_shared.playing.load(Ordering::Relaxed)
+                        engine.transport_shared.pos.load(Ordering::Relaxed) as f64 / spq;
+                    engine.transport_shared.playing.load(Ordering::Relaxed)
                 }
                 None => false,
             };
@@ -615,32 +666,36 @@ impl eframe::App for App {
                     EditorCommand::ImportMidi => file_action = Some(FileAction::Import),
                     EditorCommand::ExportMidi => file_action = Some(FileAction::Export),
                     EditorCommand::SaveMidi => file_action = Some(FileAction::Save),
-                    // 未ロード時は送り先がないので、再生ヘッドの移動だけ自前で処理する。
-                    // ロード時に instantiate() がシーケンスと位置を送り直す。
-                    EditorCommand::Seek { quarters } if self.loaded.is_none() => {
+                    // エンジンが無いときは送り先がないので、再生ヘッドの移動だけ
+                    // 自前で処理する。ロード時に位置とシーケンスを送り直す。
+                    EditorCommand::Seek { quarters } if self.engine.is_none() => {
                         self.pos_quarters = quarters.max(0.0);
                     }
                     command => {
-                        let Some(loaded) = &mut self.loaded else {
+                        let Some(engine) = &mut self.engine else {
                             continue;
                         };
                         let msg = match command {
                             EditorCommand::Commit => {
-                                // 今は音源が1つなので全トラック分をまとめて送る。
-                                // トラックごとの音源に対応する段階で分割する。
-                                let events = self
-                                    .editor
-                                    .editor
-                                    .to_events(sample_rate)
-                                    .into_boxed_slice();
+                                // トラックごとに分けて送る (音源が別々のため)
                                 let end_sample =
                                     (self.editor.editor.length_quarters_bar_aligned() as f64 * spq)
                                         as u64;
-                                GuiMsg::Transport(TransportMsg::SetSequence {
-                                    track: 0,
-                                    events,
-                                    end_sample,
-                                })
+                                for track in 0..self.editor.editor.track_count() {
+                                    let events = self
+                                        .editor
+                                        .editor
+                                        .to_events_for_track(track, sample_rate)
+                                        .into_boxed_slice();
+                                    let _ = engine.producer.push(GuiMsg::Transport(
+                                        TransportMsg::SetSequence {
+                                            track,
+                                            events,
+                                            end_sample,
+                                        },
+                                    ));
+                                }
+                                continue;
                             }
                             EditorCommand::Play => GuiMsg::Transport(TransportMsg::Play),
                             EditorCommand::Stop => GuiMsg::Transport(TransportMsg::Stop),
@@ -657,7 +712,7 @@ impl eframe::App for App {
                             | EditorCommand::ExportMidi
                             | EditorCommand::SaveMidi => continue,
                         };
-                        let _ = loaded.producer.push(msg);
+                        let _ = engine.producer.push(msg);
                     }
                 }
             }

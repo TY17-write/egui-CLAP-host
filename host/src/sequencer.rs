@@ -246,10 +246,22 @@ impl MidiEditor {
     /// ノート列をサンプル時刻付きイベント列に変換する。
     /// 同時刻ではノートオフがノートオンより先に来るようソートされる。
     pub fn to_events(&self, sample_rate: f64) -> Vec<SeqEvent> {
+        self.collect_events(None, sample_rate)
+    }
+
+    /// 指定トラックのノートだけをイベント列にする (トラックごとの音源へ送る用)
+    pub fn to_events_for_track(&self, track: usize, sample_rate: f64) -> Vec<SeqEvent> {
+        self.collect_events(Some(track), sample_rate)
+    }
+
+    fn collect_events(&self, only_track: Option<usize>, sample_rate: f64) -> Vec<SeqEvent> {
         let spq = self.samples_per_quarter(sample_rate);
         let mut events = Vec::with_capacity(self.notes.len() * 2);
 
         for note in &self.notes {
+            if only_track.is_some_and(|track| note.track != track) {
+                continue;
+            }
             let Some(key) = note.key(self.scale) else {
                 continue;
             };
