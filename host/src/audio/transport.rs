@@ -278,6 +278,7 @@ mod tests {
             semitone: 0,
             octave: 4,
             velocity: 40, // 40/127 ≒ 0.315
+            track: 0,
             lane: 0,
         }];
 

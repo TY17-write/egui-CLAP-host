@@ -48,7 +48,9 @@ pub struct Note {
     pub octave: i32,
     /// ベロシティ 0..=127
     pub velocity: u8,
-    /// 表示上の段 (0 始まり)。音高とは独立で、どの段に置くかだけを表す。
+    /// 所属するトラック (0 始まり)。トラックごとに音源を持つ。
+    pub track: usize,
+    /// トラック内の段 (0 始まり)。音高とは独立で、どの段に置くかだけを表す。
     pub lane: usize,
 }
 
@@ -74,9 +76,31 @@ impl Note {
 
 }
 
+/// 新しいトラックが最初に持つ段数
+pub const DEFAULT_LANES: usize = 8;
+
+/// トラック1本ぶんの情報。音源 (プラグイン) はホスト側が別に持つ。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackInfo {
+    pub name: String,
+    /// このトラックが持つ段数 (1 以上)
+    pub lanes: usize,
+}
+
+impl TrackInfo {
+    pub fn new(index: usize) -> Self {
+        Self {
+            name: format!("トラック {}", index + 1),
+            lanes: DEFAULT_LANES,
+        }
+    }
+}
+
 /// シーケンス全体 (エディタが編集する対象)
 pub struct MidiEditor {
     pub notes: Vec<Note>,
+    /// トラック (上から順に並ぶ)。必ず1本以上ある。
+    pub tracks: Vec<TrackInfo>,
     /// BPM (四分音符の数/分)
     pub tempo: u32,
     /// 拍子の分子
@@ -91,6 +115,7 @@ impl Default for MidiEditor {
     fn default() -> Self {
         Self {
             notes: Vec::new(),
+            tracks: vec![TrackInfo::new(0)],
             tempo: 120,
             beats: 4,
             beat_type: 4,
@@ -100,6 +125,90 @@ impl Default for MidiEditor {
 }
 
 impl MidiEditor {
+    /// トラック数 (必ず1以上)
+    pub fn track_count(&self) -> usize {
+        self.tracks.len().max(1)
+    }
+
+    /// 指定トラックの段数 (範囲外なら既定値)
+    pub fn lanes(&self, track: usize) -> usize {
+        self.tracks
+            .get(track)
+            .map_or(DEFAULT_LANES, |info| info.lanes.max(1))
+    }
+
+    /// 全トラックの段を上から並べたときの行数
+    pub fn total_rows(&self) -> usize {
+        self.tracks.iter().map(|info| info.lanes.max(1)).sum()
+    }
+
+    /// トラックを末尾に追加する
+    pub fn add_track(&mut self) {
+        self.tracks.push(TrackInfo::new(self.tracks.len()));
+    }
+
+    /// 末尾のトラックを削除する。
+    /// ノートが残っているトラックと最後の1本は消さない (事故防止)。
+    /// 削除したら true。
+    pub fn remove_last_track(&mut self) -> bool {
+        if self.tracks.len() <= 1 {
+            return false;
+        }
+        let last = self.tracks.len() - 1;
+        if self.notes.iter().any(|note| note.track == last) {
+            return false;
+        }
+        self.tracks.pop().is_some()
+    }
+
+    /// 指定トラックの段を1つ増やす
+    pub fn add_lane(&mut self, track: usize) -> bool {
+        match self.tracks.get_mut(track) {
+            Some(info) => {
+                info.lanes += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 指定トラックの最後の段を削除する。
+    /// その段にノートがあるときと、段が1つしかないときは削除しない。
+    pub fn remove_last_lane(&mut self, track: usize) -> bool {
+        let Some(info) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        if info.lanes <= 1 {
+            return false;
+        }
+        let last = info.lanes - 1;
+        if self
+            .notes
+            .iter()
+            .any(|note| note.track == track && note.lane == last)
+        {
+            return false;
+        }
+        info.lanes -= 1;
+        true
+    }
+
+    /// 今あるノートが全部収まるようにトラック数と段数を広げる。
+    /// 読み込みや貼り付けの直後に呼ぶ (画面外にノートが隠れるのを防ぐ)。
+    pub fn ensure_capacity_for_notes(&mut self) {
+        for index in 0..self.notes.len() {
+            let (track, lane) = (self.notes[index].track, self.notes[index].lane);
+            while self.tracks.len() <= track {
+                self.add_track();
+            }
+            let info = &mut self.tracks[track];
+            info.lanes = info.lanes.max(lane + 1);
+        }
+        if self.tracks.is_empty() {
+            self.tracks.push(TrackInfo::new(0));
+        }
+    }
+
     /// 1拍の長さ (四分音符単位)。例: 拍子分母4なら1.0、8なら0.5
     pub fn quarters_per_beat(&self) -> f32 {
         4.0 / self.beat_type as f32
@@ -192,8 +301,60 @@ mod tests {
             semitone,
             octave,
             velocity: 100,
+            track: 0,
             lane: 0,
         }
+    }
+
+    /// トラックと段の増減は、ノートを消してしまわないこと
+    #[test]
+    fn tracks_and_lanes_protect_existing_notes() {
+        let mut editor = MidiEditor::default();
+        assert_eq!(editor.track_count(), 1);
+        assert_eq!(editor.total_rows(), DEFAULT_LANES);
+
+        editor.add_track();
+        assert_eq!(editor.track_count(), 2);
+        assert_eq!(editor.total_rows(), DEFAULT_LANES * 2);
+
+        // 空のトラックは消せる
+        assert!(editor.remove_last_track());
+        assert_eq!(editor.track_count(), 1);
+
+        // 最後の1本は消せない
+        assert!(!editor.remove_last_track());
+
+        // ノートのある段は消せない
+        editor.add_track();
+        let last_lane = editor.lanes(1) - 1;
+        editor.notes.push(Note {
+            track: 1,
+            lane: last_lane,
+            ..note(0.0, 1.0, 0, 4)
+        });
+        assert!(!editor.remove_last_lane(1), "ノートのある段は残ること");
+        assert!(!editor.remove_last_track(), "ノートのあるトラックは残ること");
+
+        // 空の段は消せる
+        editor.add_lane(1);
+        assert!(editor.remove_last_lane(1));
+        assert_eq!(editor.lanes(1), last_lane + 1);
+    }
+
+    /// 読み込んだノートが画面外に隠れないよう、トラックと段が広がること
+    #[test]
+    fn capacity_grows_for_imported_notes() {
+        let mut editor = MidiEditor::default();
+        editor.notes = vec![Note {
+            track: 2,
+            lane: 11,
+            ..note(0.0, 1.0, 0, 4)
+        }];
+
+        editor.ensure_capacity_for_notes();
+        assert_eq!(editor.track_count(), 3);
+        assert_eq!(editor.lanes(2), 12);
+        assert_eq!(editor.lanes(0), DEFAULT_LANES, "他のトラックは既定のまま");
     }
 
     /// 再生用イベントの生成が、設定した音階モードを実際に反映していること。

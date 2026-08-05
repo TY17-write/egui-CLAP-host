@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             semitone: 0,
             octave: 4,
             velocity: VEL_FULL,
+            track: 0,
             lane: 0,
         },
         Note {
@@ -66,6 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             semitone: 4,
             octave: 4,
             velocity: VEL_HALF,
+            track: 0,
             lane: 1,
         },
     ];

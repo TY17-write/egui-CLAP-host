@@ -3,7 +3,7 @@
 //! 各ノートは "(半音,オクターブ)" ラベルを表示し、縦ドラッグで段の移動、
 //! 右端ドラッグで音価を変更する。ピッチは選択して数値で編集する。
 
-use crate::sequencer::{MidiEditor, Note, ScaleMode};
+use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
 use crate::theme::palette;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, vec2,
@@ -17,8 +17,6 @@ const ROW_H: f32 = 24.0;
 const RULER_H: f32 = 22.0;
 /// ノート右端のリサイズ判定幅
 const EDGE_W: f32 = 10.0;
-/// デフォルトの段数
-const DEFAULT_LANES: usize = 16;
 
 /// Alt+ホイール1ノッチあたりのベロシティ変化量
 const VELOCITY_WHEEL_STEP: i32 = 4;
@@ -244,6 +242,9 @@ impl EditorState {
     ) {
         self.history.record(EditGroup::Once);
         self.editor.notes = notes;
+        // 読み込んだノートが全部見えるようにトラックと段を用意する
+        self.editor.tracks.truncate(1);
+        self.editor.ensure_capacity_for_notes();
         if let Some(tempo) = tempo {
             self.editor.tempo = tempo.clamp(20, 300);
         }
@@ -394,6 +395,8 @@ impl EditorState {
             note.semitone = note.semitone.clamp(0, max_semitone);
             self.editor.notes.push(note);
         }
+        // 貼り付け先のトラック・段が足りなければ広げる
+        self.editor.ensure_capacity_for_notes();
         self.select_many((first..self.editor.notes.len()).collect());
         true
     }
@@ -403,14 +406,14 @@ impl EditorState {
 const CLIPBOARD_HEADER: &str = "clap-host-test notes v1";
 
 /// ノート列をクリップボード用テキストにする。
-/// 1行1ノートで "開始,音価,半音,オクターブ,ベロシティ,段"。
+/// 1行1ノートで "開始,音価,半音,オクターブ,ベロシティ,段,トラック"。
 fn notes_to_text(notes: &[Note]) -> String {
     let mut text = String::from(CLIPBOARD_HEADER);
     for n in notes {
         text.push('\n');
         text.push_str(&format!(
-            "{},{},{},{},{},{}",
-            n.start_tick, n.duration, n.semitone, n.octave, n.velocity, n.lane
+            "{},{},{},{},{},{},{}",
+            n.start_tick, n.duration, n.semitone, n.octave, n.velocity, n.lane, n.track
         ));
     }
     text
@@ -430,7 +433,8 @@ fn notes_from_text(text: &str) -> Option<Vec<Note>> {
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
-        if f.len() != 6 {
+        // 7列が現行。トラックの無い6列 (古い形式) はトラック0として読む
+        if f.len() != 6 && f.len() != 7 {
             return None;
         }
         notes.push(Note {
@@ -440,6 +444,10 @@ fn notes_from_text(text: &str) -> Option<Vec<Note>> {
             octave: f[3].parse().ok()?,
             velocity: f[4].parse().ok()?,
             lane: f[5].parse().ok()?,
+            track: match f.get(6) {
+                Some(track) => track.parse().ok()?,
+                None => 0,
+            },
         });
     }
     (!notes.is_empty()).then_some(notes)
@@ -447,9 +455,11 @@ fn notes_from_text(text: &str) -> Option<Vec<Note>> {
 
 /// アンドゥ1ステップ分の状態。
 /// 音階モードは半音の値を書き換えるので一緒に戻す必要がある。
+/// トラック構成 (段数の増減) も元に戻せるように含める。
 #[derive(Clone, PartialEq)]
 struct Snapshot {
     notes: Vec<Note>,
+    tracks: Vec<TrackInfo>,
     scale: ScaleMode,
 }
 
@@ -457,11 +467,13 @@ impl Snapshot {
     fn capture(editor: &MidiEditor) -> Self {
         Self {
             notes: editor.notes.clone(),
+            tracks: editor.tracks.clone(),
             scale: editor.scale,
         }
     }
 
     fn restore(&self, editor: &mut MidiEditor) {
+        editor.tracks = self.tracks.clone();
         editor.notes = self.notes.clone();
         editor.scale = self.scale;
     }
@@ -561,7 +573,10 @@ impl History {
 
     /// フレームの終わりに、次フレームの「変更前」を控える
     fn end_frame(&mut self, editor: &MidiEditor) {
-        if self.baseline.notes != editor.notes || self.baseline.scale != editor.scale {
+        if self.baseline.notes != editor.notes
+            || self.baseline.tracks != editor.tracks
+            || self.baseline.scale != editor.scale
+        {
             self.baseline = Snapshot::capture(editor);
         }
     }
@@ -1278,15 +1293,11 @@ fn grid(
         }
     }
 
-    // 段数: デフォルト16。それ以上の段にノートがあれば広げる
-    let display_rows = state
-        .editor
-        .notes
-        .iter()
-        .map(|n| n.lane + 1)
-        .max()
-        .unwrap_or(0)
-        .max(DEFAULT_LANES);
+    // 表示する行数 = 全トラックの段の合計。
+    // (フェーズ1ではトラックは1本なので、そのトラックの段数と同じ)
+    let display_rows = state.editor.total_rows().max(1);
+    // 各トラックが何行目から始まるか (ノートの y 位置に使う)
+    let row_offsets = track_row_offsets(&state.editor);
 
     let qpb = state.editor.quarters_per_bar();
     // 表示範囲: ノートの終端を小節に切り上げ + 余白2小節 (最低8小節)
@@ -1375,7 +1386,7 @@ fn grid(
 
     // ---- ノート ----
     for (idx, note) in state.editor.notes.iter().enumerate() {
-        let rect = note_rect(origin, note);
+        let rect = note_rect(origin, note_row(&row_offsets, note), note);
         let fill = note_fill(note, state.editor.scale);
         // ベロシティは「下からの塗りの高さ」で表す。明度やアルファを直接下げると
         // ダークな背景で弱いノートが見えなくなるため、色相はそのままに
@@ -1490,7 +1501,7 @@ fn grid(
     // カーソル形状のフィードバック
     if state.drag.is_none() && !state.middle_panning {
         if let Some(hover) = response.hover_pos() {
-            match hit_note(&state.editor.notes, origin, hover, left_resize) {
+            match hit_note(&state.editor.notes, &row_offsets, origin, hover, left_resize) {
                 Some((_, Hit::ResizeRight | Hit::ResizeLeft)) => {
                     ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal)
                 }
@@ -1515,7 +1526,9 @@ fn grid(
                     base_selection: Vec::new(),
                     origin: to_content_pos(origin, pos),
                 });
-            } else if let Some((idx, hit)) = hit_note(&state.editor.notes, origin, pos, left_resize) {
+            } else if let Some((idx, hit)) =
+                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize)
+            {
                 // 複数選択中のノートを掴んだら選択全体を操作する (選択は変えない)
                 let bulk = state.selection.len() > 1 && state.is_selected(idx);
                 let targets = if bulk {
@@ -1576,8 +1589,11 @@ fn grid(
                     });
                 }
                 DragKind::Move => {
-                    let (dx, d_lane) = move_delta(
+                    // 縦移動は「画面の行」で扱う。行はトラックをまたいで通しなので、
+                    // 動かした先のトラックと段に変換して書き戻す。
+                    let (dx, d_row) = move_delta(
                         &drag.targets,
+                        &row_offsets,
                         content.x - drag.origin.x,
                         (content.y - drag.origin.y).round() as i32,
                         snap,
@@ -1587,10 +1603,13 @@ fn grid(
                     for (idx, orig) in &drag.targets {
                         let mut note = *orig;
                         note.start_tick = (orig.start_tick + dx).max(0.0);
-                        note.lane = (orig.lane as i32 + d_lane) as usize;
+                        let row = (note_row(&row_offsets, orig) as i32 + d_row).max(0) as usize;
+                        let (track, lane) = row_to_track_lane(&row_offsets, &state.editor, row);
+                        note.track = track;
+                        note.lane = lane;
                         state.editor.notes[*idx] = note;
                     }
-                    if dx != 0.0 || d_lane != 0 {
+                    if dx != 0.0 || d_row != 0 {
                         state.history.record(EditGroup::Move);
                     }
                 }
@@ -1624,7 +1643,9 @@ fn grid(
                     let rect = Rect::from_two_pos(to_screen_pos(origin, drag.origin), pos);
                     let mut selection = drag.base_selection.clone();
                     for (idx, note) in state.editor.notes.iter().enumerate() {
-                        if rect.intersects(note_rect(origin, note)) && !selection.contains(&idx) {
+                        if rect.intersects(note_rect(origin, note_row(&row_offsets, note), note))
+                            && !selection.contains(&idx)
+                        {
                             selection.push(idx);
                         }
                     }
@@ -1682,7 +1703,7 @@ fn grid(
                     quarters: seek_quarters(pos.x),
                 });
             } else {
-                match hit_note(&state.editor.notes, origin, pos, left_resize) {
+                match hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize) {
                     // Shift+クリックは選択に追加 / 解除
                     Some((idx, _)) if ui.input(|i| i.modifiers.shift) => {
                         let mut selection = state.selection_sorted();
@@ -1705,13 +1726,14 @@ fn grid(
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if pos.y >= origin.y + RULER_H
-                && hit_note(&state.editor.notes, origin, pos, left_resize).is_none()
+                && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize).is_none()
             {
                 // 最後に選択・編集したノートの設定を引き継ぐ。
                 // (ダブルクリックの1打目で選択が解除されるため state.selected は使えない)
                 let defaults = state.last_note;
-                let lane = (((pos.y - origin.y - RULER_H) / ROW_H).floor() as i32)
+                let row = (((pos.y - origin.y - RULER_H) / ROW_H).floor() as i32)
                     .clamp(0, display_rows as i32 - 1) as usize;
+                let (track, lane) = row_to_track_lane(&row_offsets, &state.editor, row);
                 let start = snap_floor((pos.x - origin.x) / PPQ).max(0.0);
                 state.history.record(EditGroup::Once);
                 // 連符モード中は連符1音分で置く (直前のノートの音価は引き継がない)
@@ -1726,6 +1748,7 @@ fn grid(
                     semitone: defaults.semitone,
                     octave: defaults.octave,
                     velocity: defaults.velocity,
+                    track,
                     lane,
                 });
                 state.select_single(state.editor.notes.len() - 1);
@@ -1737,7 +1760,9 @@ fn grid(
     // 右クリックで削除 (選択中のノートを指したら選択ごと消す)
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some((idx, _)) = hit_note(&state.editor.notes, origin, pos, left_resize) {
+            if let Some((idx, _)) =
+                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize)
+            {
                 state.history.record(EditGroup::Once);
                 if state.is_selected(idx) {
                     state.delete_selection();
@@ -1803,8 +1828,9 @@ fn edge_scroll_delta(visible: Rect, pointer: Pos2, vertical: bool) -> egui::Vec2
 /// 選択全体が範囲 (開始位置 >= 0、段 0..rows) に収まるよう移動量を抑える。
 fn move_delta(
     targets: &[(usize, Note)],
+    row_offsets: &[usize],
     dx_raw: f32,
-    d_lane_raw: i32,
+    d_row_raw: i32,
     snap: f32,
     rows: usize,
 ) -> (f32, i32) {
@@ -1818,12 +1844,20 @@ fn move_delta(
         .iter()
         .map(|(_, n)| n.start_tick)
         .fold(f32::INFINITY, f32::min);
-    let min_lane = targets.iter().map(|(_, n)| n.lane).min().unwrap_or(0) as i32;
-    let max_lane = targets.iter().map(|(_, n)| n.lane).max().unwrap_or(0) as i32;
+    let min_row = targets
+        .iter()
+        .map(|(_, n)| note_row(row_offsets, n))
+        .min()
+        .unwrap_or(0) as i32;
+    let max_row = targets
+        .iter()
+        .map(|(_, n)| note_row(row_offsets, n))
+        .max()
+        .unwrap_or(0) as i32;
 
     (
         dx.max(-min_start),
-        d_lane_raw.clamp(-min_lane, rows as i32 - 1 - max_lane),
+        d_row_raw.clamp(-min_row, rows as i32 - 1 - max_row),
     )
 }
 
@@ -1880,6 +1914,34 @@ fn resize_delta(targets: &[(usize, Note)], dx_raw: f32, snap: f32, from_left: bo
     }
 }
 
+/// 各トラックの段が画面の何行目から始まるかを求める。
+/// 画面の行は「トラック0の段0..n, トラック1の段0..m, ...」と上から並ぶ。
+fn track_row_offsets(editor: &MidiEditor) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(editor.tracks.len());
+    let mut row = 0;
+    for info in &editor.tracks {
+        offsets.push(row);
+        row += info.lanes.max(1);
+    }
+    offsets
+}
+
+/// ノートが画面の何行目に描かれるか
+fn note_row(offsets: &[usize], note: &Note) -> usize {
+    offsets.get(note.track).copied().unwrap_or(0) + note.lane
+}
+
+/// 画面の行番号を (トラック, 段) に戻す
+fn row_to_track_lane(offsets: &[usize], editor: &MidiEditor, row: usize) -> (usize, usize) {
+    for track in (0..offsets.len()).rev() {
+        if row >= offsets[track] {
+            let lane = (row - offsets[track]).min(editor.lanes(track).saturating_sub(1));
+            return (track, lane);
+        }
+    }
+    (0, 0)
+}
+
 /// ノート矩形のうち、ベロシティ分を実塗りする部分 (下側) を求める。
 /// ベロシティ127で矩形全体、小さいほど下に薄く残る。
 fn velocity_fill_rect(rect: Rect, velocity: u8) -> Rect {
@@ -1891,12 +1953,12 @@ fn velocity_fill_rect(rect: Rect, velocity: u8) -> Rect {
     )
 }
 
-/// ノートの表示矩形を計算する (段 = note.lane)
-fn note_rect(origin: Pos2, note: &Note) -> Rect {
+/// ノートの表示矩形を計算する。`row` は画面の行番号 (トラックの段を通しで数えた値)。
+fn note_rect(origin: Pos2, row: usize, note: &Note) -> Rect {
     Rect::from_min_size(
         Pos2::new(
             origin.x + note.start_tick * PPQ,
-            origin.y + RULER_H + note.lane as f32 * ROW_H + 2.0,
+            origin.y + RULER_H + row as f32 * ROW_H + 2.0,
         ),
         vec2((note.duration * PPQ - 1.0).max(4.0), ROW_H - 4.0),
     )
@@ -1918,9 +1980,15 @@ enum Hit {
 /// 右端は常にリサイズ領域。`left_resize` が true のときは左端も加わる。
 /// 短いノートでは左右の判定領域が重なってしまうため、両方有効なときは
 /// ノートの中央で分け合う (右端を優先して左端が掴めなくなるのを防ぐ)。
-fn hit_note(notes: &[Note], origin: Pos2, pos: Pos2, left_resize: bool) -> Option<(usize, Hit)> {
+fn hit_note(
+    notes: &[Note],
+    offsets: &[usize],
+    origin: Pos2,
+    pos: Pos2,
+    left_resize: bool,
+) -> Option<(usize, Hit)> {
     for (idx, note) in notes.iter().enumerate().rev() {
-        let rect = note_rect(origin, note);
+        let rect = note_rect(origin, note_row(offsets, note), note);
         let split = rect.center().x;
 
         let right_from = if left_resize {
@@ -1968,8 +2036,14 @@ mod tests {
             semitone,
             octave,
             velocity: 100,
+            track: 0,
             lane: 0,
         }
+    }
+
+    /// テスト用: トラック1本 (段は十分にある) の行オフセット
+    fn single_track_rows() -> Vec<usize> {
+        vec![0]
     }
 
     /// 半音0はそのオクターブの色そのもの、半音が上がるほど次のオクターブの色に寄る
@@ -2003,6 +2077,7 @@ mod tests {
             semitone: 0,
             octave: 4,
             velocity: 100,
+            track: 0,
             lane,
         }
     }
@@ -2012,7 +2087,7 @@ mod tests {
     fn bulk_move_keeps_relative_positions() {
         // 0.1 だけずれた位置にあるノートも、掴んだノートと同じ移動量で動く
         let targets = vec![(0, placed(1.0, 2)), (1, placed(1.1, 3))];
-        let (dx, d_lane) = move_delta(&targets, 0.6, 1, 0.25, 16);
+        let (dx, d_lane) = move_delta(&targets, &single_track_rows(), 0.6, 1, 0.25, 16);
         assert_eq!(dx, 0.5, "掴んだノートが 1.5 に来るようスナップされること");
         assert_eq!(d_lane, 1);
     }
@@ -2022,13 +2097,13 @@ mod tests {
     fn bulk_move_clamps_to_bounds() {
         let targets = vec![(0, placed(1.0, 1)), (1, placed(0.5, 15))];
         // 左へ大きく動かしても、先頭のノートが 0 未満にならない分しか動かない
-        let (dx, _) = move_delta(&targets, -5.0, 0, 0.25, 16);
+        let (dx, _) = move_delta(&targets, &single_track_rows(), -5.0, 0, 0.25, 16);
         assert_eq!(dx, -0.5);
         // 下へ動かしても、最下段のノートが 15 段目に留まる
-        let (_, d_lane) = move_delta(&targets, 0.0, 5, 0.25, 16);
+        let (_, d_lane) = move_delta(&targets, &single_track_rows(), 0.0, 5, 0.25, 16);
         assert_eq!(d_lane, 0);
         // 上へ動かすときは最上段のノートが 0 段目で止まる
-        let (_, d_lane) = move_delta(&targets, 0.0, -5, 0.25, 16);
+        let (_, d_lane) = move_delta(&targets, &single_track_rows(), 0.0, -5, 0.25, 16);
         assert_eq!(d_lane, -1);
     }
 
@@ -2112,19 +2187,19 @@ mod tests {
         let right_pos = Pos2::new(17.0, y);
 
         // OFF: 左端は本体扱い (移動)、右端はリサイズ
-        assert_eq!(hit_note(&notes, origin, left_pos, false), Some((0, Hit::Body)));
+        assert_eq!(hit_note(&notes, &single_track_rows(), origin, left_pos, false), Some((0, Hit::Body)));
         assert_eq!(
-            hit_note(&notes, origin, right_pos, false),
+            hit_note(&notes, &single_track_rows(), origin, right_pos, false),
             Some((0, Hit::ResizeRight))
         );
 
         // ON: 左端が左リサイズになり、右端は引き続き右リサイズ
         assert_eq!(
-            hit_note(&notes, origin, left_pos, true),
+            hit_note(&notes, &single_track_rows(), origin, left_pos, true),
             Some((0, Hit::ResizeLeft))
         );
         assert_eq!(
-            hit_note(&notes, origin, right_pos, true),
+            hit_note(&notes, &single_track_rows(), origin, right_pos, true),
             Some((0, Hit::ResizeRight))
         );
     }
@@ -2413,6 +2488,7 @@ mod tests {
                 semitone: 11,
                 octave: -2,
                 velocity: 1,
+                track: 0,
                 lane: 0,
             },
             Note {
@@ -2421,6 +2497,7 @@ mod tests {
                 semitone: 3,
                 octave: 8,
                 velocity: 127,
+                track: 2,
                 lane: 17,
             },
         ];
