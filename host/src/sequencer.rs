@@ -76,8 +76,9 @@ impl Note {
 
 }
 
-/// 新しいトラックが最初に持つ段数
-pub const DEFAULT_LANES: usize = 8;
+/// 新しいトラックが最初に持つ段数。
+/// 必要な分だけ [+] で足していく運用にしている。
+pub const DEFAULT_LANES: usize = 1;
 
 /// トラック1本ぶんの情報。音源 (プラグイン) はホスト側が別に持つ。
 #[derive(Clone, Debug, PartialEq)]

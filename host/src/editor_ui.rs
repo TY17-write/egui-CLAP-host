@@ -18,6 +18,9 @@ const RULER_H: f32 = 22.0;
 /// ノート右端のリサイズ判定幅
 const EDGE_W: f32 = 10.0;
 
+/// 左のトラック欄の幅
+const GUTTER_W: f32 = 132.0;
+
 /// Alt+ホイール1ノッチあたりのベロシティ変化量
 const VELOCITY_WHEEL_STEP: i32 = 4;
 
@@ -120,6 +123,8 @@ pub struct EditorState {
     history: History,
     /// 操作ガイドのウィンドウを開いているか
     show_help: bool,
+    /// グリッドの縦スクロール位置 (左のトラック欄を追従させるために持つ)
+    grid_scroll_y: f32,
     /// MIDI の保存先 (表示用。実際のパス管理は main 側)
     pub midi_path: Option<String>,
     /// 再生を始めたときの再生ヘッド位置。停止・終端到達でここへ戻す。
@@ -150,6 +155,7 @@ impl Default for EditorState {
             last_note: NoteDefaults::default(),
             dirty: true, // 初回コミットのため
             show_help: false,
+            grid_scroll_y: 0.0,
             midi_path: None,
             play_return: None,
             was_playing: false,
@@ -664,12 +670,38 @@ pub fn editor_panel(
     // 左下のヘルプボタン用に1行分を残してグリッドを描く
     const HELP_ROW_H: f32 = 26.0;
     let grid_height = (ui.available_height() - HELP_ROW_H).max(80.0);
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .max_height(grid_height)
-        .show(ui, |ui| {
-            grid(ui, state, pos_quarters, playing, &mut commands);
+
+    ui.horizontal_top(|ui| {
+        // 左のトラック欄。グリッドとは別のスクロール領域にして、
+        // 横スクロールしても隠れないようにする (縦だけグリッドに追従させる)。
+        ui.vertical(|ui| {
+            // 見出しはスクロールの外に出す。中に入れるとトラックが増えたときに
+            // 追加・削除ボタンまでスクロールできなくなる。
+            // 高さをルーラーと同じにして、下の一覧がグリッドの段と揃うようにする。
+            track_gutter_header(ui, state);
+
+            egui::ScrollArea::vertical()
+                .id_salt("track_gutter")
+                .auto_shrink([false, false])
+                .max_height((grid_height - RULER_H).max(ROW_H))
+                .max_width(GUTTER_W)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .vertical_scroll_offset(state.grid_scroll_y)
+                .show(ui, |ui| {
+                    track_gutter(ui, state);
+                });
         });
+
+        let grid_scroll = egui::ScrollArea::both()
+            .id_salt("grid")
+            .auto_shrink([false, false])
+            .max_height(grid_height)
+            .show(ui, |ui| {
+                grid(ui, state, pos_quarters, playing, &mut commands);
+            });
+        // 次フレームで左欄を同じ位置に合わせる
+        state.grid_scroll_y = grid_scroll.state.offset.y;
+    });
 
     ui.horizontal(|ui| {
         if ui
@@ -1324,6 +1356,20 @@ fn grid(
         palette::BG_DARK,
     );
 
+    // ---- トラックの地色 ----
+    // 1つおきに薄く敷いて、どこからどこまでが1トラックか分かるようにする
+    for (track, offset) in row_offsets.iter().enumerate() {
+        if track % 2 == 1 {
+            let top = origin.y + RULER_H + *offset as f32 * ROW_H;
+            let height = state.editor.lanes(track) as f32 * ROW_H;
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(origin.x, top), vec2(size.x, height)),
+                CornerRadius::ZERO,
+                palette::BG.gamma_multiply(0.5),
+            );
+        }
+    }
+
     // ---- 段の区切り線 ----
     let lane_stroke = Stroke::new(0.5, palette::BG_SELECT.gamma_multiply(0.7));
     for row in 0..=display_rows {
@@ -1331,6 +1377,16 @@ fn grid(
         painter.line_segment(
             [Pos2::new(origin.x, y), Pos2::new(origin.x + size.x, y)],
             lane_stroke,
+        );
+    }
+
+    // ---- トラックの区切り線 (段の線より目立たせる) ----
+    let track_stroke = Stroke::new(1.5, palette::FG_DIM);
+    for offset in row_offsets.iter().skip(1) {
+        let y = origin.y + RULER_H + *offset as f32 * ROW_H;
+        painter.line_segment(
+            [Pos2::new(origin.x, y), Pos2::new(origin.x + size.x, y)],
+            track_stroke,
         );
     }
 
@@ -1911,6 +1967,112 @@ fn resize_delta(targets: &[(usize, Note)], dx_raw: f32, snap: f32, from_left: bo
         let end = grabbed.end_tick();
         let dx = snap_round(end + dx_raw) - end;
         dx.max(snap - min_duration)
+    }
+}
+
+/// 左のトラック欄。トラックごとに名前と段の増減ボタンを、
+/// グリッドの段と同じ高さで並べる (行の位置が揃うようにするため)。
+/// トラック欄の見出し (常に見える位置に置く)。高さはルーラーと同じにして、
+/// 下のトラック一覧の1行目がグリッドの1段目と揃うようにする。
+fn track_gutter_header(ui: &mut egui::Ui, state: &mut EditorState) {
+    let (rect, _) = ui.allocate_exact_size(vec2(GUTTER_W, RULER_H), Sense::hover());
+    ui.painter_at(rect)
+        .rect_filled(rect, CornerRadius::ZERO, palette::BG_LIGHT);
+
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(vec2(6.0, 2.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    content.set_clip_rect(rect);
+    content.label(egui::RichText::new("トラック").size(11.0).color(palette::FG_DIM));
+
+    if content
+        .small_button("+")
+        .on_hover_text("トラックを追加")
+        .clicked()
+    {
+        state.history.record(EditGroup::Once);
+        state.editor.add_track();
+    }
+
+    // ノートの入った最後のトラックと、最後の1本は消せない
+    let last = state.editor.track_count() - 1;
+    let removable =
+        state.editor.track_count() > 1 && !state.editor.notes.iter().any(|n| n.track == last);
+    let response = content.add_enabled(removable, egui::Button::new("−").small());
+    if response.clicked() {
+        state.history.record(EditGroup::Once);
+        state.editor.remove_last_track();
+    }
+    if !removable {
+        response.on_hover_text("最後のトラックにノートがある (またはトラックが1つ) ので消せません");
+    }
+}
+
+/// 左のトラック欄。トラックごとに名前と段の増減ボタンを、
+/// グリッドの段と同じ高さで並べる (行の位置が揃うようにするため)。
+fn track_gutter(ui: &mut egui::Ui, state: &mut EditorState) {
+    // ScrollArea の中身は親のレイアウトを引き継ぐ (ここは横並びの中なので)。
+    // 縦並びを明示しないとトラックが横に並んでしまう。
+    ui.vertical(|ui| track_gutter_content(ui, state));
+}
+
+fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
+    for track in 0..state.editor.track_count() {
+        let lanes = state.editor.lanes(track);
+        let height = lanes as f32 * ROW_H;
+        let (rect, _) = ui.allocate_exact_size(vec2(GUTTER_W, height), Sense::hover());
+
+        // トラックの区切りが分かるように枠と背景を敷く
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, palette::BG_LIGHT);
+        painter.line_segment(
+            [rect.left_top(), rect.right_top()],
+            Stroke::new(1.5, palette::FG_DIM),
+        );
+
+        // 段が1つ (高さ ROW_H) でも収まるよう、名前とボタンは1行に並べる
+        let mut content = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect.shrink2(vec2(6.0, 2.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+        );
+        content.set_clip_rect(rect);
+
+        let name = state.editor.tracks[track].name.clone();
+        content.allocate_ui(vec2(58.0, ROW_H - 4.0), |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(name).size(11.0).color(palette::FG))
+                    .truncate(),
+            );
+        });
+
+        if content
+            .small_button("+")
+            .on_hover_text("このトラックに段を追加")
+            .clicked()
+        {
+            state.history.record(EditGroup::Once);
+            state.editor.add_lane(track);
+        }
+
+        // ノートのある段と、最後の1段は消せない
+        let last_lane = lanes.saturating_sub(1);
+        let removable = lanes > 1
+            && !state
+                .editor
+                .notes
+                .iter()
+                .any(|note| note.track == track && note.lane == last_lane);
+        let response = content.add_enabled(removable, egui::Button::new("−").small());
+        if response.clicked() {
+            state.history.record(EditGroup::Once);
+            state.editor.remove_last_lane(track);
+        }
+        if !removable {
+            response.on_hover_text("最後の段にノートがある (または段が1つ) ので消せません");
+        }
     }
 }
 
