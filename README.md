@@ -42,16 +42,6 @@ CLAP の C API を安全な Rust API で包み、**main-thread / audio-thread �
 Windows で開発・確認しています (他プラットフォームは未検証)。
 
 ```powershell
-# ビルドしてテストプラグインごと起動する
-run.bat
-
-# 別のプラグインで起動する
-run.bat "C:\Program Files\Common Files\CLAP\Surge Synth Team\Surge XT.clap"
-```
-
-手で実行する場合:
-
-```powershell
 cargo build --workspace
 
 # .clap は DLL のリネーム
@@ -59,6 +49,9 @@ Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap -Force
 
 # GUI ホストを起動 (--bin の指定が必要。smoke 系のバイナリも同居しているため)
 cargo run -p clap-host-test --bin clap-host-test -- target\debug\test_plugin.clap
+
+# 実プラグインで起動する
+cargo run -p clap-host-test --bin clap-host-test -- "C:\Program Files\Common Files\CLAP\Surge Synth Team\Surge XT.clap"
 
 # オフライン検証 (オーディオデバイス不要)
 cargo run -p clap-host-test --bin smoke -- target\debug\test_plugin.clap      # ロード→発音→波形確認
