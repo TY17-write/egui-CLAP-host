@@ -11,12 +11,22 @@ use eframe::egui::{
 
 /// 1四分音符の横幅 (ピクセル)
 const PPQ: f32 = 80.0;
-/// 段の高さ
+/// 段の高さの既定値。実際の高さは `EditorState::row_h` (縦ズームで変わる)
 const ROW_H: f32 = 24.0;
+/// 段の高さの下限。左のトラック欄のボタンが潰れるので、これ以上は縮めない
+const MIN_ROW_H: f32 = 12.0;
+/// 段の高さの上限
+const MAX_ROW_H: f32 = 96.0;
+/// Ctrl+ホイール1ノッチあたりの倍率 (段の高さ)
+const ROW_ZOOM_STEP: f32 = 1.15;
 /// ルーラーの高さ
 const RULER_H: f32 = 22.0;
 /// ノート右端のリサイズ判定幅
 const EDGE_W: f32 = 10.0;
+
+/// ノートに載せる音名ラベルの文字サイズ。
+/// これが入らない高さまで縮めたらラベルを省く
+const NOTE_LABEL_SIZE: f32 = 11.0;
 
 /// 左のトラック欄の幅
 const GUTTER_W: f32 = 200.0;
@@ -125,6 +135,9 @@ pub struct EditorState {
     show_help: bool,
     /// グリッドの縦スクロール位置 (左のトラック欄を追従させるために持つ)
     grid_scroll_y: f32,
+    /// 段1つの高さ (縦ズーム)。段が少ないときに広げて操作しやすくするためのもの。
+    /// MIN_ROW_H..=MAX_ROW_H に収める (set_row_h を通すこと)。
+    row_h: f32,
     /// MIDI の保存先 (表示用。実際のパス管理は main 側)
     pub midi_path: Option<String>,
     /// トラックごとに載っている音源の名前 (表示用。main 側が毎フレーム更新する)
@@ -158,6 +171,7 @@ impl Default for EditorState {
             dirty: true, // 初回コミットのため
             show_help: false,
             grid_scroll_y: 0.0,
+            row_h: ROW_H,
             midi_path: None,
             track_plugins: Vec::new(),
             play_return: None,
@@ -180,6 +194,16 @@ impl EditorState {
             return self.snap;
         }
         self.snap * 2.0 / n as f32
+    }
+
+    /// 段の高さを変える。範囲外は丸める。実際に変わった量 (新 - 旧) を返す。
+    ///
+    /// 戻り値はズーム後もカーソル下の段を動かさないためのスクロール補正に使う。
+    fn set_row_h(&mut self, row_h: f32) -> f32 {
+        let clamped = row_h.clamp(MIN_ROW_H, MAX_ROW_H);
+        let delta = clamped - self.row_h;
+        self.row_h = clamped;
+        delta
     }
 
     fn is_selected(&self, idx: usize) -> bool {
@@ -618,19 +642,20 @@ struct DragState {
     origin: Pos2,
 }
 
-/// 画面座標を楽譜座標 (x = 四分音符単位, y = 段) に変換する
-fn to_content_pos(grid_origin: Pos2, screen: Pos2) -> Pos2 {
+/// 画面座標を楽譜座標 (x = 四分音符単位, y = 段) に変換する。
+/// `row_h` は縦ズームで変わるので呼び出し側から渡す。
+fn to_content_pos(grid_origin: Pos2, screen: Pos2, row_h: f32) -> Pos2 {
     Pos2::new(
         (screen.x - grid_origin.x) / PPQ,
-        (screen.y - grid_origin.y - RULER_H) / ROW_H,
+        (screen.y - grid_origin.y - RULER_H) / row_h,
     )
 }
 
 /// 楽譜座標を画面座標に戻す (to_content_pos の逆変換)
-fn to_screen_pos(grid_origin: Pos2, content: Pos2) -> Pos2 {
+fn to_screen_pos(grid_origin: Pos2, content: Pos2, row_h: f32) -> Pos2 {
     Pos2::new(
         grid_origin.x + content.x * PPQ,
-        grid_origin.y + RULER_H + content.y * ROW_H,
+        grid_origin.y + RULER_H + content.y * row_h,
     )
 }
 
@@ -692,7 +717,7 @@ pub fn editor_panel(
             egui::ScrollArea::vertical()
                 .id_salt("track_gutter")
                 .auto_shrink([false, false])
-                .max_height((grid_height - RULER_H).max(ROW_H))
+                .max_height((grid_height - RULER_H).max(state.row_h))
                 .max_width(GUTTER_W)
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .vertical_scroll_offset(state.grid_scroll_y)
@@ -807,6 +832,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("右クリック", "削除 (選択中のノートなら選択ごと)"),
                     ("中ドラッグ", "スクロール"),
                     ("Alt+ホイール", "選択中ノートのベロシティを増減"),
+                    ("Ctrl+ホイール", "段の縦幅を拡大 / 縮小 (カーソルの下の段は動きません)"),
                     ("ルーラーをクリック", "再生ヘッドを移動 (拍にスナップ / Alt で自由)"),
                 ],
             );
@@ -873,6 +899,10 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                 &[
                     ("ノートの色", "音高 (オクターブごとの色 + 半音でのグラデーション)"),
                     ("塗りの高さ", "ベロシティ (薄い部分は最大値までの残り)"),
+                    (
+                        "段幅",
+                        "段の縦幅を変える (Ctrl+ホイールも同じ。段が少ないときに広げると掴みやすくなります)",
+                    ),
                     ("連符", "スナップ幅2つ分を N 等分する (1/8 の5連符なら四分音符に5音)"),
                 ],
             );
@@ -1227,6 +1257,32 @@ fn toolbar(
 
         ui.separator();
 
+        // 段の縦幅 (縦ズーム)。段が少ないときに広げて掴みやすくするためのもの
+        ui.label("段幅");
+        let mut row_h = state.row_h;
+        if ui
+            .add(
+                egui::DragValue::new(&mut row_h)
+                    .range(MIN_ROW_H..=MAX_ROW_H)
+                    .speed(0.5)
+                    .fixed_decimals(0)
+                    .suffix("px"),
+            )
+            .on_hover_text("段の縦幅 (グリッドの上で Ctrl+ホイールでも変えられます)")
+            .changed()
+        {
+            state.set_row_h(row_h);
+        }
+        if ui
+            .small_button("既定")
+            .on_hover_text(format!("段幅を {ROW_H:.0}px に戻す"))
+            .clicked()
+        {
+            state.set_row_h(ROW_H);
+        }
+
+        ui.separator();
+
         // アンドゥ / リドゥ (Ctrl+Z / Ctrl+Y)
         if ui
             .add_enabled(state.history.can_undo(), egui::Button::new("↶"))
@@ -1347,19 +1403,13 @@ fn snap_label(snap: f32) -> &'static str {
     }
 }
 
-/// グリッド本体 (ルーラー + ノートレーン)
-fn grid(
-    ui: &mut egui::Ui,
-    state: &mut EditorState,
-    pos_quarters: f64,
-    playing: bool,
-    commands: &mut Vec<EditorCommand>,
-) {
-    // ---- Alt+ホイールで選択ノートのベロシティを変更 ----
-    // ScrollArea は内容を描き終えたあとに smooth_scroll_delta を読むので、
-    // ここでイベントごと消しておけばベロシティ変更とスクロールが同時に起きない。
-    let notches = ui.input_mut(|i| {
-        if !i.modifiers.alt {
+/// ホイールの回転量 (ノッチ数) を取り出す。`wanted` が真のときだけ横取りする。
+///
+/// ScrollArea は内容を描き終えたあとに smooth_scroll_delta を読むので、
+/// ここでイベントごと消しておけば、割り当てた操作とスクロールが同時に起きない。
+fn take_wheel_notches(ui: &mut egui::Ui, wanted: impl Fn(&egui::Modifiers) -> bool) -> f32 {
+    ui.input_mut(|i| {
+        if !wanted(&i.modifiers) {
             return 0.0;
         }
         let mut notches = 0.0;
@@ -1377,7 +1427,19 @@ fn grid(
         i.smooth_scroll_delta = egui::Vec2::ZERO;
         i.raw_scroll_delta = egui::Vec2::ZERO;
         notches
-    });
+    })
+}
+
+/// グリッド本体 (ルーラー + ノートレーン)
+fn grid(
+    ui: &mut egui::Ui,
+    state: &mut EditorState,
+    pos_quarters: f64,
+    playing: bool,
+    commands: &mut Vec<EditorCommand>,
+) {
+    // ---- Alt+ホイールで選択ノートのベロシティを変更 ----
+    let notches = take_wheel_notches(ui, |m| m.alt);
     if notches != 0.0 {
         let delta = (notches * VELOCITY_WHEEL_STEP as f32).round() as i32;
         if delta != 0 && state.change_selection_velocity(delta) {
@@ -1385,6 +1447,22 @@ fn grid(
             state.dirty = true;
         }
     }
+
+    // ---- Ctrl+ホイールで段の縦幅をズーム ----
+    // ホイールは画面のどこで回しても届くので、グリッドの見えている範囲
+    // (ScrollArea のビューポート = クリップ矩形) にカーソルがあるときだけ拾う。
+    let pointer_in_grid = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|pos| ui.clip_rect().contains(pos));
+    // Alt が優先 (上で消費済み)。両方押されていてもズームはしない
+    let zoom_notches = if pointer_in_grid {
+        take_wheel_notches(ui, |m| m.command && !m.alt)
+    } else {
+        0.0
+    };
+
+    // 段の高さはこのフレームの間ずっと同じ値を使う (ズームの反映は次のフレーム)
+    let row_h = state.row_h;
 
     // 表示する行数 = 全トラックの段の合計。
     // (フェーズ1ではトラックは1本なので、そのトラックの段数と同じ)
@@ -1398,7 +1476,7 @@ fn grid(
 
     let size = vec2(
         total_quarters * PPQ,
-        RULER_H + display_rows as f32 * ROW_H,
+        RULER_H + display_rows as f32 * row_h,
     );
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     let origin = response.rect.min;
@@ -1421,8 +1499,8 @@ fn grid(
     // 1つおきに薄く敷いて、どこからどこまでが1トラックか分かるようにする
     for (track, offset) in row_offsets.iter().enumerate() {
         if track % 2 == 1 {
-            let top = origin.y + RULER_H + *offset as f32 * ROW_H;
-            let height = state.editor.lanes(track) as f32 * ROW_H;
+            let top = origin.y + RULER_H + *offset as f32 * row_h;
+            let height = state.editor.lanes(track) as f32 * row_h;
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(origin.x, top), vec2(size.x, height)),
                 CornerRadius::ZERO,
@@ -1434,7 +1512,7 @@ fn grid(
     // ---- 段の区切り線 ----
     let lane_stroke = Stroke::new(0.5, palette::BG_SELECT.gamma_multiply(0.7));
     for row in 0..=display_rows {
-        let y = origin.y + RULER_H + row as f32 * ROW_H;
+        let y = origin.y + RULER_H + row as f32 * row_h;
         painter.line_segment(
             [Pos2::new(origin.x, y), Pos2::new(origin.x + size.x, y)],
             lane_stroke,
@@ -1444,7 +1522,7 @@ fn grid(
     // ---- トラックの区切り線 (段の線より目立たせる) ----
     let track_stroke = Stroke::new(1.5, palette::FG_DIM);
     for offset in row_offsets.iter().skip(1) {
-        let y = origin.y + RULER_H + *offset as f32 * ROW_H;
+        let y = origin.y + RULER_H + *offset as f32 * row_h;
         painter.line_segment(
             [Pos2::new(origin.x, y), Pos2::new(origin.x + size.x, y)],
             track_stroke,
@@ -1503,7 +1581,7 @@ fn grid(
 
     // ---- ノート ----
     for (idx, note) in state.editor.notes.iter().enumerate() {
-        let rect = note_rect(origin, note_row(&row_offsets, note), note);
+        let rect = note_rect(origin, note_row(&row_offsets, note), note, row_h);
         let fill = note_fill(note, state.editor.scale);
         // ベロシティは「下からの塗りの高さ」で表す。明度やアルファを直接下げると
         // ダークな背景で弱いノートが見えなくなるため、色相はそのままに
@@ -1539,7 +1617,8 @@ fn grid(
             );
         }
 
-        if rect.width() > 26.0 {
+        // 縮めたときは文字がはみ出して読めないので、入る高さのときだけ書く
+        if rect.width() > 26.0 && rect.height() >= NOTE_LABEL_SIZE + 2.0 {
             // 文字の位置まで実塗りが来ていれば背景色で抜き、
             // ゴーストの上に載るときは前景色にして読めるようにする
             let color = if level.top() <= rect.center().y {
@@ -1551,7 +1630,7 @@ fn grid(
                 rect.left_center() + vec2(4.0, 0.0),
                 Align2::LEFT_CENTER,
                 note.name(),
-                FontId::proportional(11.0),
+                FontId::proportional(NOTE_LABEL_SIZE),
                 color,
             );
         }
@@ -1618,7 +1697,7 @@ fn grid(
     // カーソル形状のフィードバック
     if state.drag.is_none() && !state.middle_panning {
         if let Some(hover) = response.hover_pos() {
-            match hit_note(&state.editor.notes, &row_offsets, origin, hover, left_resize) {
+            match hit_note(&state.editor.notes, &row_offsets, origin, hover, left_resize, row_h) {
                 Some((_, Hit::ResizeRight | Hit::ResizeLeft)) => {
                     ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal)
                 }
@@ -1641,10 +1720,10 @@ fn grid(
                     kind: DragKind::Seek,
                     targets: Vec::new(),
                     base_selection: Vec::new(),
-                    origin: to_content_pos(origin, pos),
+                    origin: to_content_pos(origin, pos, row_h),
                 });
             } else if let Some((idx, hit)) =
-                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize)
+                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h)
             {
                 // 複数選択中のノートを掴んだら選択全体を操作する (選択は変えない)
                 let bulk = state.selection.len() > 1 && state.is_selected(idx);
@@ -1671,7 +1750,7 @@ fn grid(
                     },
                     targets,
                     base_selection: Vec::new(),
-                    origin: to_content_pos(origin, pos),
+                    origin: to_content_pos(origin, pos, row_h),
                 });
             } else {
                 // 空白からのドラッグは範囲選択。Shift 押下なら既存の選択に足す。
@@ -1684,7 +1763,7 @@ fn grid(
                     kind: DragKind::Marquee,
                     targets: Vec::new(),
                     base_selection,
-                    origin: to_content_pos(origin, pos),
+                    origin: to_content_pos(origin, pos, row_h),
                 });
             }
         }
@@ -1697,7 +1776,7 @@ fn grid(
 
         if let (Some(drag), Some(pos)) = (&state.drag, response.interact_pointer_pos()) {
             // 掴んだ位置も現在位置も楽譜座標で扱う (自動スクロール中の追従のため)
-            let content = to_content_pos(origin, pos);
+            let content = to_content_pos(origin, pos, row_h);
 
             match drag.kind {
                 DragKind::Seek => {
@@ -1757,10 +1836,10 @@ fn grid(
                     }
                 }
                 DragKind::Marquee => {
-                    let rect = Rect::from_two_pos(to_screen_pos(origin, drag.origin), pos);
+                    let rect = Rect::from_two_pos(to_screen_pos(origin, drag.origin, row_h), pos);
                     let mut selection = drag.base_selection.clone();
                     for (idx, note) in state.editor.notes.iter().enumerate() {
-                        if rect.intersects(note_rect(origin, note_row(&row_offsets, note), note))
+                        if rect.intersects(note_rect(origin, note_row(&row_offsets, note), note, row_h))
                             && !selection.contains(&idx)
                         {
                             selection.push(idx);
@@ -1820,7 +1899,7 @@ fn grid(
                     quarters: seek_quarters(pos.x),
                 });
             } else {
-                match hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize) {
+                match hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h) {
                     // Shift+クリックは選択に追加 / 解除
                     Some((idx, _)) if ui.input(|i| i.modifiers.shift) => {
                         let mut selection = state.selection_sorted();
@@ -1843,12 +1922,12 @@ fn grid(
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if pos.y >= origin.y + RULER_H
-                && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize).is_none()
+                && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h).is_none()
             {
                 // 最後に選択・編集したノートの設定を引き継ぐ。
                 // (ダブルクリックの1打目で選択が解除されるため state.selected は使えない)
                 let defaults = state.last_note;
-                let row = (((pos.y - origin.y - RULER_H) / ROW_H).floor() as i32)
+                let row = (((pos.y - origin.y - RULER_H) / row_h).floor() as i32)
                     .clamp(0, display_rows as i32 - 1) as usize;
                 let (track, lane) = row_to_track_lane(&row_offsets, &state.editor, row);
                 let start = snap_floor((pos.x - origin.x) / PPQ).max(0.0);
@@ -1878,7 +1957,7 @@ fn grid(
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some((idx, _)) =
-                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize)
+                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h)
             {
                 state.history.record(EditGroup::Once);
                 if state.is_selected(idx) {
@@ -1899,6 +1978,26 @@ fn grid(
     if state.track_last_note {
         if let Some(note) = state.selected.and_then(|i| state.editor.notes.get(i)) {
             state.last_note = NoteDefaults::from(note);
+        }
+    }
+
+    // ---- 縦ズームの反映 ----
+    // 描画・当たり判定を1フレーム分の row_h で通したあとに変える。
+    // ホイール中は毎フレーム描き直されるので、1フレームの遅れは見えない。
+    if zoom_notches != 0.0 {
+        // カーソルの下にある段。ズームしてもここが動かないようスクロールを合わせる
+        let anchor_row = ui
+            .input(|i| i.pointer.hover_pos())
+            .map_or(0.0, |pos| to_content_pos(origin, pos, row_h).y);
+        let grew = state.set_row_h(row_h * ROW_ZOOM_STEP.powf(zoom_notches));
+
+        // ScrollArea は offset -= delta で動くので、伸びた分だけ負の値を渡す。
+        // ルーラーの上 (anchor_row が負) で回したときは先頭を見ているので補正しない。
+        if grew != 0.0 && anchor_row > 0.0 {
+            ui.scroll_with_delta_animation(
+                vec2(0.0, -anchor_row * grew),
+                egui::style::ScrollAnimation::none(),
+            );
         }
     }
 }
@@ -2086,7 +2185,8 @@ fn track_gutter_content(
 ) {
     for track in 0..state.editor.track_count() {
         let lanes = state.editor.lanes(track);
-        let height = lanes as f32 * ROW_H;
+        // グリッドの段と行の位置が揃うよう、縦ズームに追従させる
+        let height = lanes as f32 * state.row_h;
         let (rect, _) = ui.allocate_exact_size(vec2(GUTTER_W, height), Sense::hover());
 
         // トラックの区切りが分かるように枠と背景を敷く
@@ -2097,10 +2197,12 @@ fn track_gutter_content(
             Stroke::new(1.5, palette::FG_DIM),
         );
 
-        // 段が1つ (高さ ROW_H) でも収まるよう、名前とボタンは1行に並べる
+        // 段が1つ (高さ = 段1つ分) でも収まるよう、名前とボタンは1行に並べる。
+        // 縦に縮めたときは余白から先に削る (ボタンの高さは変えられないため)
+        let pad_y = (rect.height() * 0.1).min(2.0);
         let mut content = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(rect.shrink2(vec2(6.0, 2.0)))
+                .max_rect(rect.shrink2(vec2(6.0, pad_y)))
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         content.set_clip_rect(rect);
@@ -2235,13 +2337,17 @@ fn velocity_fill_rect(rect: Rect, velocity: u8) -> Rect {
 }
 
 /// ノートの表示矩形を計算する。`row` は画面の行番号 (トラックの段を通しで数えた値)。
-fn note_rect(origin: Pos2, row: usize, note: &Note) -> Rect {
+///
+/// 段の上下に空ける余白は高さの 1/12 (既定の 24px で従来どおり上下2px)。
+/// 固定値にすると、縮めたときに矩形が潰れ、広げたときに隙間が目立たなくなる。
+fn note_rect(origin: Pos2, row: usize, note: &Note, row_h: f32) -> Rect {
+    let margin = row_h / 12.0;
     Rect::from_min_size(
         Pos2::new(
             origin.x + note.start_tick * PPQ,
-            origin.y + RULER_H + row as f32 * ROW_H + 2.0,
+            origin.y + RULER_H + row as f32 * row_h + margin,
         ),
-        vec2((note.duration * PPQ - 1.0).max(4.0), ROW_H - 4.0),
+        vec2((note.duration * PPQ - 1.0).max(4.0), row_h - margin * 2.0),
     )
 }
 
@@ -2267,9 +2373,10 @@ fn hit_note(
     origin: Pos2,
     pos: Pos2,
     left_resize: bool,
+    row_h: f32,
 ) -> Option<(usize, Hit)> {
     for (idx, note) in notes.iter().enumerate().rev() {
-        let rect = note_rect(origin, note_row(offsets, note), note);
+        let rect = note_rect(origin, note_row(offsets, note), note, row_h);
         let split = rect.center().x;
 
         let right_from = if left_resize {
@@ -2453,6 +2560,60 @@ mod tests {
         assert!(!state.align_selection_ends());
     }
 
+    /// 縦ズームは上下限で頭打ちになり、実際に変わった量を返すこと
+    #[test]
+    fn row_zoom_is_clamped() {
+        let mut state = EditorState::default();
+        assert_eq!(state.row_h, ROW_H, "既定は従来の段の高さ");
+
+        assert_eq!(state.set_row_h(ROW_H * 2.0), ROW_H, "変わった量を返すこと");
+        assert_eq!(state.row_h, ROW_H * 2.0);
+
+        // 上限・下限を越えたら丸める
+        state.set_row_h(MAX_ROW_H * 10.0);
+        assert_eq!(state.row_h, MAX_ROW_H);
+        state.set_row_h(0.0);
+        assert_eq!(state.row_h, MIN_ROW_H);
+        // 頭打ちのあとは何も変わらない (スクロール補正を打たないため)
+        assert_eq!(state.set_row_h(-100.0), 0.0);
+    }
+
+    /// ノート矩形が段の高さに追従し、上下の余白も一緒に伸び縮みすること
+    #[test]
+    fn note_rect_follows_the_row_height() {
+        let origin = Pos2::new(0.0, 0.0);
+        let note = placed(0.0, 1); // 2段目
+
+        // 既定の 24px では従来どおり上下2px の余白
+        let normal = note_rect(origin, 1, &note, ROW_H);
+        assert_eq!(normal.top(), RULER_H + ROW_H + 2.0);
+        assert_eq!(normal.height(), ROW_H - 4.0);
+
+        // 倍に広げれば位置も高さも倍 (余白も倍なので比率は変わらない)
+        let zoomed = note_rect(origin, 1, &note, ROW_H * 2.0);
+        assert_eq!(zoomed.top(), RULER_H + ROW_H * 2.0 + 4.0);
+        assert_eq!(zoomed.height(), (ROW_H - 4.0) * 2.0);
+        assert_eq!(zoomed.width(), normal.width(), "横幅はズームしないこと");
+
+        // 下限まで縮めても矩形は残ること (固定余白だと潰れてしまう)
+        assert!(note_rect(origin, 0, &note, MIN_ROW_H).height() > 0.0);
+    }
+
+    /// 当たり判定も段の高さに追従すること (広げた段の中央で掴めること)
+    #[test]
+    fn hit_note_follows_the_row_height() {
+        let origin = Pos2::new(0.0, 0.0);
+        let notes = vec![placed(0.0, 1)]; // 2段目
+        let rows = single_track_rows();
+        let tall = ROW_H * 3.0;
+
+        // 広げた2段目の中央
+        let inside = Pos2::new(4.0, RULER_H + tall * 1.5);
+        assert_eq!(hit_note(&notes, &rows, origin, inside, false, tall), Some((0, Hit::Body)));
+        // 同じ点も、既定の高さでは2段目の外なので当たらない
+        assert_eq!(hit_note(&notes, &rows, origin, inside, false, ROW_H), None);
+    }
+
     /// 左端音価が ON でも、右端は従来どおりリサイズ領域であること。
     /// 短いノートで左右が食い合わないよう、中央で分かれること。
     #[test]
@@ -2468,19 +2629,19 @@ mod tests {
         let right_pos = Pos2::new(17.0, y);
 
         // OFF: 左端は本体扱い (移動)、右端はリサイズ
-        assert_eq!(hit_note(&notes, &single_track_rows(), origin, left_pos, false), Some((0, Hit::Body)));
+        assert_eq!(hit_note(&notes, &single_track_rows(), origin, left_pos, false, ROW_H), Some((0, Hit::Body)));
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, right_pos, false),
+            hit_note(&notes, &single_track_rows(), origin, right_pos, false, ROW_H),
             Some((0, Hit::ResizeRight))
         );
 
         // ON: 左端が左リサイズになり、右端は引き続き右リサイズ
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, left_pos, true),
+            hit_note(&notes, &single_track_rows(), origin, left_pos, true, ROW_H),
             Some((0, Hit::ResizeLeft))
         );
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, right_pos, true),
+            hit_note(&notes, &single_track_rows(), origin, right_pos, true, ROW_H),
             Some((0, Hit::ResizeRight))
         );
     }
