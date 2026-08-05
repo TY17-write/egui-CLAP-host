@@ -16,6 +16,7 @@ use std::error::Error;
 
 pub mod buffers;
 pub mod config;
+pub mod offline;
 pub mod transport;
 
 use buffers::*;

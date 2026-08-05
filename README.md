@@ -61,6 +61,7 @@ cargo run -p clap-host-test --bin clap-host-test -- target\debug\test_plugin.cla
 # オフライン検証 (オーディオデバイス不要)
 cargo run -p clap-host-test --bin smoke -- target\debug\test_plugin.clap      # ロード→発音→波形確認
 cargo run -p clap-host-test --bin seq_smoke -- target\debug\test_plugin.clap  # 再生エンジンの検証
+cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap  # WAV 書き出しの検証
 
 # ユニットテスト
 cargo test -p clap-host-test --lib
@@ -130,6 +131,18 @@ cargo test -p clap-host-test --lib
   和音は重ならない段へ機械的に散らす
 - **インポート時は保存先を記録しません** (Ctrl+S で読み込み元を上書きしないため)
 
+### 音声の書き出し
+
+画面下の **「出力 > WAV ファイルとして出力」** で、シーケンス全体を音声ファイルにできる。
+
+- オーディオスレッドから音源を一時的に引き上げ、実時間を待たずに最後まで回す。
+  **音作りしたパラメータがそのまま乗る** (別インスタンスを立てる方式だと state 拡張が
+  未対応なぶんパラメータが初期値に戻ってしまうため、この形にしている)
+- 形式は 16bit PCM。サンプルレートとチャンネル数は出力デバイスの構成に従う
+- 終端のあと3秒ぶん回してから末尾の無音を切り落とす (残響やリリースを拾うため)
+- ピークが 0dBFS を超えたときだけ全体を定数倍で縮める (足りない音量を勝手には上げない)
+- ミュート/ソロの判定は再生と同じ
+
 ## アーキテクチャ
 
 ```
@@ -171,6 +184,10 @@ cargo test -p clap-host-test --lib
 - **state 拡張 (プリセット保存/復元) 未対応**: プラグインの設定は保存されない
 - **プロジェクトの保存は MIDI のみ**: トラック構成やテンポは MIDI に入るが、
   どの音源を使っていたかは保存されない
+- **音声の書き出し中は画面が固まる**: メインスレッドで処理するため。進捗表示もない
+- 書き出せる形式は 16bit PCM の WAV だけ。Opus など圧縮形式は libopus (C) の
+  ビルド環境 (CMake) が要るので見送っている
+- **clap.tail 拡張が未対応**: 書き出しの残響は終端から3秒で打ち切られる
 - 音源の取り外し UI なし (差し替えのみ)
 - 出力はモノラル/ステレオのみ。ミックスは単純加算 (クリップ対策なし)
 - 途中のテンポ変化に未対応 (MIDI 読み込み時は最初のテンポだけ使う)

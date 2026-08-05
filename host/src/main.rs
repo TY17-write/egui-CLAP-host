@@ -1,8 +1,9 @@
 //! CLAP ミニホスト: .clap ファイルをロードして egui から鳴らすテスト用ホスト。
 
-use clap_host_test::{audio, discovery, editor_ui, gui, host, midi, params, theme};
+use clap_host_test::{audio, discovery, editor_ui, gui, host, midi, params, sequencer, theme, wav};
 
 use audio::config::StreamAudioConfig;
+use audio::offline::{RenderSetup, TAIL_SECONDS};
 use audio::transport::{TransportMsg, TransportShared};
 use audio::GuiMsg;
 use clack_host::prelude::*;
@@ -12,12 +13,13 @@ use editor_ui::{EditorCommand, EditorState};
 use gui::PluginGuiManager;
 use host::{MainThreadMessage, MiniHost, MiniHostMainThread, MiniHostShared};
 use params::ParamUi;
+use sequencer::SeqEvent;
 use std::sync::atomic::Ordering;
 use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 鍵盤に表示する1オクターブ+1音 (C4〜C5) ※鍵盤 UI 無効化中のため未使用
 #[allow(dead_code)]
@@ -143,6 +145,72 @@ enum FileAction {
     Import,
     Export,
     Save,
+    ExportWav,
+}
+
+/// 処理結果の通知。
+///
+/// ヘッダーの小さな文字だと、押したボタンから遠いうえに消えないので見落とす。
+/// 閉じるまで画面中央に残す。
+struct Notice {
+    title: String,
+    body: String,
+    is_error: bool,
+}
+
+impl Notice {
+    fn ok(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            is_error: false,
+        }
+    }
+
+    fn error(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            is_error: true,
+        }
+    }
+}
+
+/// 結果通知のウィンドウ。OK / Enter / Esc で閉じる。
+fn notice_window(ctx: &egui::Context, notice: &mut Option<Notice>) {
+    let Some(current) = notice.as_ref() else {
+        return;
+    };
+
+    let mut dismiss = false;
+    egui::Window::new(&current.title)
+        // タイトルが変わっても位置がリセットされないよう ID は固定する
+        .id(egui::Id::new("notice"))
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            if current.is_error {
+                ui.colored_label(theme::palette::RED, &current.body);
+            } else {
+                ui.label(&current.body);
+            }
+            ui.add_space(10.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    dismiss = true;
+                }
+                ui.weak("(Enter / Esc でも閉じます)");
+            });
+        });
+
+    if dismiss || ctx.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape))
+    {
+        *notice = None;
+    }
 }
 
 /// 表示用のファイル名 (取れなければパス全体)
@@ -178,6 +246,8 @@ struct App {
     last_directory: Option<PathBuf>,
     /// 保存・読み込みの結果メッセージ
     status: Option<String>,
+    /// 画面中央に出す結果通知 (閉じるまで残る)
+    notice: Option<Notice>,
 }
 
 impl App {
@@ -284,6 +354,191 @@ impl App {
         }
     }
 
+    /// シーケンス全体を鳴らして WAV ファイルに書き出す。
+    ///
+    /// オーディオスレッドから処理器を一旦引き上げ、その場で最後まで回してから戻す。
+    /// ユーザーが音作りしたパラメータをそのまま使うためで、別インスタンスを立てると
+    /// state 拡張が未対応なぶん初期値に戻ってしまう。
+    /// 処理の間はメインスレッドが止まるので、画面も一時的に固まる。
+    fn export_wav(&mut self) {
+        // 差し替え待ちの音源が残っていると、引き上げた処理器がどちらのものか
+        // 見分けられなくなる。片付いてから始める。
+        self.drain_retired();
+        if !self.retiring.is_empty() {
+            self.fail_export("音源の切り替え中です。少し待ってからもう一度実行してください");
+            return;
+        }
+
+        let Some(config) = self.engine.as_ref().map(|engine| engine.config) else {
+            self.fail_export(
+                "音源が未ロードです。\n左のトラック欄の「♪」から .clap を読み込んでください。",
+            );
+            return;
+        };
+        if self.editor.editor.notes.is_empty() {
+            self.fail_export("ノートが1つもありません。");
+            return;
+        }
+
+        let loaded: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(track, slot)| slot.as_ref().map(|_| track))
+            .collect();
+        if loaded.is_empty() {
+            self.fail_export("音源が載っているトラックがありません。");
+            return;
+        }
+
+        // 時間のかかる処理に入る前に保存先を聞く
+        let Some(path) = self.ask_wav_path() else { return };
+
+        let sample_rate = config.sample_rate as f64;
+        let spq = self.editor.editor.samples_per_quarter(sample_rate);
+        let setup = RenderSetup {
+            // ミュート/ソロで鳴らさないトラックは空にする (再生時と同じ判定)
+            sequences: (0..self.editor.editor.track_count())
+                .map(|track| {
+                    if self.editor.editor.is_audible(track) {
+                        self.editor
+                            .editor
+                            .to_events_for_track(track, sample_rate)
+                            .into_boxed_slice()
+                    } else {
+                        Vec::<SeqEvent>::new().into_boxed_slice()
+                    }
+                })
+                .collect(),
+            end_sample: (self.editor.editor.length_quarters_bar_aligned() as f64 * spq) as u64,
+            tail_samples: (TAIL_SECONDS * sample_rate) as u64,
+            // activate 時に宣言した上限。これを超えるブロックは渡せない。
+            block_frames: config.max_likely_buffer_size as usize,
+            channels: config.output_channel_count,
+            sample_rate: config.sample_rate,
+        };
+
+        let rendered = {
+            let Some(engine) = self.engine.as_mut() else {
+                return;
+            };
+            let _ = engine.producer.push(GuiMsg::Transport(TransportMsg::Stop));
+            for track in &loaded {
+                let _ = engine.producer.push(GuiMsg::ClearTrack { track: *track });
+            }
+
+            let mut processors = collect_processors(engine, loaded.len());
+            let rendered = if processors.len() == loaded.len() {
+                Some(audio::offline::render(&mut processors, setup))
+            } else {
+                None
+            };
+
+            // 借りたものは必ず返す (返さないと音が出なくなる)
+            for (track, processor) in processors {
+                let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
+            }
+            rendered
+        };
+
+        let Some(rendered) = rendered else {
+            self.fail_export("音源を取り出せませんでした。もう一度実行してください。");
+            return;
+        };
+
+        let bytes = match wav::to_bytes_16bit(
+            &rendered.samples,
+            rendered.channels as u16,
+            rendered.sample_rate,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.fail_export(e);
+                return;
+            }
+        };
+
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                self.last_directory = path.parent().map(PathBuf::from);
+                self.error = None;
+
+                let channels = if rendered.channels == 1 {
+                    "モノラル"
+                } else {
+                    "ステレオ"
+                };
+                let mut body = format!(
+                    "{}\n\n{:.1} 秒 / {} Hz / {} / 16bit PCM",
+                    path.display(),
+                    rendered.seconds(),
+                    rendered.sample_rate,
+                    channels,
+                );
+                // 勝手に音量を変えた事実は伏せない
+                if rendered.peak > 1.0 {
+                    body.push_str(&format!(
+                        "\n\n※ ピークが {:.2} (0dBFS 超) だったため、歪まないよう全体の音量を下げました。",
+                        rendered.peak
+                    ));
+                }
+                self.status = Some(format!("書き出しました: {}", file_label(&path)));
+                self.notice = Some(Notice::ok("WAV を書き出しました", body));
+            }
+            Err(e) => self.fail_export(format!("保存できません:\n{e}")),
+        }
+    }
+
+    /// 書き出しの失敗を通知する
+    fn fail_export(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice::error("WAV を書き出せません", message));
+    }
+
+    /// WAV の保存先を選ばせる
+    fn ask_wav_path(&mut self) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("WAV ファイル", &["wav"])
+            .set_file_name("mix.wav");
+        if let Some(directory) = self.dialog_directory() {
+            dialog = dialog.set_directory(directory);
+        }
+        let path = dialog.save_file()?;
+        // 拡張子を省略されたときは .wav を補う
+        Some(if path.extension().is_none() {
+            path.with_extension("wav")
+        } else {
+            path
+        })
+    }
+
+    /// オーディオスレッドから返ってきた音源をここで停止・解放する
+    /// (オーディオスレッドで解放してはいけないため)。
+    /// 差し替えで外したインスタンスが待っていればそちらへ、
+    /// 無ければ今そのトラックに載っているインスタンスへ返す。
+    fn drain_retired(&mut self) {
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        while let Ok((track, processor)) = engine.retired.pop() {
+            let stopped = processor.into_stopped();
+            let waiting = self.retiring.iter().position(|(index, _)| *index == track);
+
+            match waiting {
+                Some(at) => {
+                    if let Some((_, mut old)) = self.retiring.remove(at) {
+                        old.instance.deactivate(stopped);
+                        // old はここで破棄される (GUI も閉じられる)
+                    }
+                }
+                None => {
+                    if let Some(Some(current)) = self.tracks.get_mut(track) {
+                        current.instance.deactivate(stopped);
+                    }
+                }
+            }
+        }
+    }
+
     /// 保存先を覚える (エディタ側には表示用のファイル名だけ渡す)
     fn set_midi_path(&mut self, path: PathBuf) {
         self.last_directory = path.parent().map(PathBuf::from);
@@ -355,6 +610,26 @@ impl App {
             Err(e) => self.error = Some(format!("インスタンス化失敗: {e}")),
         }
     }
+}
+
+/// `ClearTrack` で外した処理器が返ってくるのを待つ。
+///
+/// オーディオコールバックが回っている前提なので、普通は1〜2ブロック分で揃う。
+/// 揃わないまま時間切れになったら、集まったぶんだけ返す (呼び出し側が戻す)。
+fn collect_processors(
+    engine: &mut Engine,
+    expected: usize,
+) -> Vec<(usize, Box<audio::TrackProcessor>)> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut collected = Vec::with_capacity(expected);
+
+    while collected.len() < expected && Instant::now() < deadline {
+        match engine.retired.pop() {
+            Ok(item) => collected.push(item),
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    collected
 }
 
 /// 出力ストリームを1本だけ作る (最初に音源をロードするときに一度だけ呼ぶ)
@@ -453,33 +728,8 @@ impl eframe::App for App {
             }
         }
 
-        // オーディオスレッドから返ってきた音源をここで停止・解放する
-        // (オーディオスレッドで解放してはいけないため)。
-        // 差し替えで外したインスタンスが待っていればそちらへ、
-        // 無ければ今そのトラックに載っているインスタンスへ返す。
-        if let Some(engine) = &mut self.engine {
-            while let Ok((track, processor)) = engine.retired.pop() {
-                let stopped = processor.into_stopped();
-                let waiting = self
-                    .retiring
-                    .iter()
-                    .position(|(index, _)| *index == track);
-
-                match waiting {
-                    Some(at) => {
-                        if let Some((_, mut old)) = self.retiring.remove(at) {
-                            old.instance.deactivate(stopped);
-                            // old はここで破棄される (GUI も閉じられる)
-                        }
-                    }
-                    None => {
-                        if let Some(Some(current)) = self.tracks.get_mut(track) {
-                            current.instance.deactivate(stopped);
-                        }
-                    }
-                }
-            }
-        }
+        // 差し替えで外した音源をここで停止・解放する
+        self.drain_retired();
 
         // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理
         for track in self.tracks.iter_mut().flatten() {
@@ -724,6 +974,7 @@ impl eframe::App for App {
                     EditorCommand::ImportMidi => file_action = Some(FileAction::Import),
                     EditorCommand::ExportMidi => file_action = Some(FileAction::Export),
                     EditorCommand::SaveMidi => file_action = Some(FileAction::Save),
+                    EditorCommand::ExportWav => file_action = Some(FileAction::ExportWav),
                     EditorCommand::LoadPlugin { track } => load_plugin_track = Some(track),
                     // エンジンが無いときは送り先がないので、再生ヘッドの移動だけ
                     // 自前で処理する。ロード時に位置とシーケンスを送り直す。
@@ -775,6 +1026,7 @@ impl eframe::App for App {
                             EditorCommand::ImportMidi
                             | EditorCommand::ExportMidi
                             | EditorCommand::SaveMidi
+                            | EditorCommand::ExportWav
                             | EditorCommand::LoadPlugin { .. } => continue,
                         };
                         let _ = engine.producer.push(msg);
@@ -786,6 +1038,7 @@ impl eframe::App for App {
                 Some(FileAction::Import) => self.import_midi(),
                 Some(FileAction::Export) => self.export_midi(true),
                 Some(FileAction::Save) => self.export_midi(false),
+                Some(FileAction::ExportWav) => self.export_wav(),
                 None => {}
             }
 
@@ -804,6 +1057,9 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // 結果通知は最前面に出したいので、パネルを描いたあとに重ねる
+        notice_window(ctx, &mut self.notice);
 
         // 鍵盤の離鍵検出などのために定期的に再描画する
         ctx.request_repaint_after(Duration::from_millis(16));

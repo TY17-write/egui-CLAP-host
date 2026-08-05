@@ -12,3 +12,4 @@ pub mod plugin_window;
 pub mod sequencer;
 pub mod theme;
 pub mod timers;
+pub mod wav;

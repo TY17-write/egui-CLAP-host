@@ -648,6 +648,8 @@ pub enum EditorCommand {
     ExportMidi,
     /// MIDI として保存する (保存先が未設定なら選ばせる)
     SaveMidi,
+    /// シーケンス全体を音声ファイル (WAV) に書き出す
+    ExportWav,
     /// 指定トラックに音源 (.clap) を読み込む
     LoadPlugin { track: usize },
 }
@@ -733,6 +735,21 @@ pub fn editor_panel(
         {
             commands.push(EditorCommand::ExportMidi);
         }
+
+        ui.separator();
+
+        // 書き出し形式は増える見込みなのでメニューにしておく
+        ui.menu_button("出力", |ui| {
+            if ui
+                .button("WAV ファイルとして出力")
+                .on_hover_text("シーケンス全体を音声ファイルに書き出す (16bit PCM)")
+                .clicked()
+            {
+                commands.push(EditorCommand::ExportWav);
+                ui.close_menu();
+            }
+        });
+
         if let Some(path) = &state.midi_path {
             ui.weak(format!("保存先: {path}"));
         }
@@ -820,6 +837,19 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("♪", "音源 (.clap) を読み込む / 差し替える"),
                     ("+ / −", "そのトラックの段を増減する (ノートのある段は消せません)"),
                     ("上の + / −", "トラックを増減する"),
+                ],
+            );
+
+            help_section(
+                ui,
+                "ファイル (下のボタン)",
+                &[
+                    ("MIDI インポート", "MIDI ファイルを読み込む (今のノートは置き換わります)"),
+                    ("MIDI エクスポート", "保存先を選んで MIDI ファイルに書き出す"),
+                    (
+                        "出力 > WAV",
+                        "音源を鳴らして音声ファイルに書き出す (音源のロードが必要。書き出し中は画面が固まります)",
+                    ),
                 ],
             );
 
