@@ -719,6 +719,9 @@ pub fn editor_panel(
                 .auto_shrink([false, false])
                 .max_height((grid_height - RULER_H).max(state.row_h))
                 .max_width(GUTTER_W)
+                // 縦位置はグリッドから毎フレーム上書きされるので、
+                // ここでドラッグしても一瞬ずれて戻るだけになる
+                .drag_to_scroll(false)
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .vertical_scroll_offset(state.grid_scroll_y)
                 .show(ui, |ui| {
@@ -729,6 +732,9 @@ pub fn editor_panel(
         let grid_scroll = egui::ScrollArea::both()
             .id_salt("grid")
             .auto_shrink([false, false])
+            // 左ドラッグは範囲選択に使うので、スクロールには割り当てない。
+            // スクロールは中ドラッグ・ホイール・スクロールバーで行う。
+            .drag_to_scroll(false)
             .max_height(grid_height)
             .show(ui, |ui| {
                 grid(ui, state, pos_quarters, playing, &mut commands);
@@ -827,7 +833,10 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("ドラッグ", "移動 (縦に動かすと段が変わる)"),
                     ("右端ドラッグ", "音価を変更 (頭は固定)"),
                     ("左端ドラッグ", "音価を変更 (終端を固定。「左端音価」ON のとき)"),
-                    ("空白をドラッグ", "範囲選択 (Shift で選択に追加)"),
+                    (
+                        "空白をドラッグ",
+                        "範囲選択 (いちばん下の段より下から始めても可。Shift で選択に追加)",
+                    ),
                     ("Shift+クリック", "選択に追加 / 選択から外す"),
                     ("右クリック", "削除 (選択中のノートなら選択ごと)"),
                     ("中ドラッグ", "スクロール"),
@@ -1474,10 +1483,15 @@ fn grid(
     // 表示範囲: ノートの終端を小節に切り上げ + 余白2小節 (最低8小節)
     let total_quarters = (state.editor.length_quarters_bar_aligned() + qpb * 2.0).max(qpb * 8.0);
 
-    let size = vec2(
-        total_quarters * PPQ,
-        RULER_H + display_rows as f32 * row_h,
-    );
+    // 中身を描く高さ (ルーラー + 全段)
+    let content_h = RULER_H + display_rows as f32 * row_h;
+    // 確保する高さは見えている範囲まで広げる。
+    //
+    // 段の下に隙間を残すと、そこは ScrollArea のものになってドラッグが
+    // スクロールに化けてしまい、段の外から範囲選択を始められない。
+    // 広げるのは当たり判定だけで、描画はすべて content_h までに留める
+    // (空白に段があるように見せないため)。
+    let size = vec2(total_quarters * PPQ, content_h.max(ui.clip_rect().height()));
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     let origin = response.rect.min;
 
@@ -1490,7 +1504,7 @@ fn grid(
         palette::BG_LIGHT,
     );
     painter.rect_filled(
-        Rect::from_min_size(origin + vec2(0.0, RULER_H), vec2(size.x, size.y - RULER_H)),
+        Rect::from_min_size(origin + vec2(0.0, RULER_H), vec2(size.x, content_h - RULER_H)),
         CornerRadius::ZERO,
         palette::BG_DARK,
     );
@@ -1540,7 +1554,7 @@ fn grid(
             painter.line_segment(
                 [
                     Pos2::new(x, origin.y + RULER_H),
-                    Pos2::new(x, origin.y + size.y),
+                    Pos2::new(x, origin.y + content_h),
                 ],
                 tuplet_stroke,
             );
@@ -1562,7 +1576,7 @@ fn grid(
         let stroke = if is_bar { bar_stroke } else { beat_stroke };
         let top = if is_bar { origin.y } else { origin.y + RULER_H };
         painter.line_segment(
-            [Pos2::new(x, top), Pos2::new(x, origin.y + size.y)],
+            [Pos2::new(x, top), Pos2::new(x, origin.y + content_h)],
             stroke,
         );
         if is_bar {
@@ -1641,7 +1655,7 @@ fn grid(
     painter.line_segment(
         [
             Pos2::new(playhead_x, origin.y),
-            Pos2::new(playhead_x, origin.y + size.y),
+            Pos2::new(playhead_x, origin.y + content_h),
         ],
         Stroke::new(2.0, palette::RED),
     );
@@ -1921,7 +1935,7 @@ fn grid(
     // ダブルクリックで新規ノート (クリックした段に置く)
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if pos.y >= origin.y + RULER_H
+            if is_inside_lanes(origin, pos, content_h)
                 && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h).is_none()
             {
                 // 最後に選択・編集したノートの設定を引き継ぐ。
@@ -2000,6 +2014,16 @@ fn grid(
             );
         }
     }
+}
+
+/// その位置が段の並んでいる範囲に入っているか。
+///
+/// ルーラーの上と、段の下に広げた当たり判定の余白を除く。
+/// 余白は範囲選択を始めるためだけの場所なので、ここにノートを作らせない
+/// (行番号は最終段に丸められるため、放っておくと離れた場所の操作で
+/// 最終段にノートができてしまう)。
+fn is_inside_lanes(origin: Pos2, pos: Pos2, content_h: f32) -> bool {
+    pos.y >= origin.y + RULER_H && pos.y < origin.y + content_h
 }
 
 /// 画面端の自動スクロール量を求める。
@@ -2558,6 +2582,33 @@ mod tests {
         // 1個だけの選択でも何も起きない
         state.select_many(vec![1]);
         assert!(!state.align_selection_ends());
+    }
+
+    /// ノートを作れるのは段の中だけで、範囲選択用に広げた余白では作らないこと。
+    /// (行番号は最終段に丸められるので、余白を許すと最終段にノートが湧く)
+    #[test]
+    fn notes_are_created_only_inside_the_lanes() {
+        let origin = Pos2::ZERO;
+        let content_h = RULER_H + ROW_H * 2.0; // 2段
+
+        assert!(
+            !is_inside_lanes(origin, Pos2::new(0.0, RULER_H - 1.0), content_h),
+            "ルーラーの上では作らないこと"
+        );
+        assert!(is_inside_lanes(origin, Pos2::new(0.0, RULER_H + 1.0), content_h));
+        assert!(
+            is_inside_lanes(origin, Pos2::new(0.0, content_h - 1.0), content_h),
+            "最終段の下端までは作れること"
+        );
+        assert!(
+            !is_inside_lanes(origin, Pos2::new(0.0, content_h + 1.0), content_h),
+            "段の下の余白では作らないこと"
+        );
+
+        // 原点がずれても同じ判定になること (スクロール中でも成り立つ)
+        let moved = Pos2::new(30.0, 100.0);
+        assert!(is_inside_lanes(moved, moved + vec2(0.0, RULER_H + 1.0), content_h));
+        assert!(!is_inside_lanes(moved, moved + vec2(0.0, content_h + 1.0), content_h));
     }
 
     /// 縦ズームは上下限で頭打ちになり、実際に変わった量を返すこと
