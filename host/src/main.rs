@@ -7,7 +7,7 @@
 //#![windows_subsystem = "windows"]
 
 use clap_host_test::{
-    audio, ccs, discovery, editor_ui, gui, host, midi, params, sequencer, theme, wav,
+    audio, ccs, discovery, editor_ui, gui, host, midi, params, project, sequencer, theme, wav,
 };
 
 use audio::config::StreamAudioConfig;
@@ -150,9 +150,11 @@ impl Drop for TrackAudio {
 
 /// 描画ループの中でファイルダイアログを開けないので、種類だけ持ち帰る
 enum FileAction {
-    Import,
-    Export,
-    Save,
+    ImportMidi,
+    ExportMidi,
+    OpenProject,
+    SaveProject,
+    SaveProjectAs,
     ExportWav,
     ExportCcs,
 }
@@ -248,9 +250,9 @@ struct App {
     /// プラグイン未ロード時はここが本体で、ロード中はトランスポートの位置を写す。
     /// 再生できない状態でも、貼り付け位置などの編集操作に再生ヘッドを使うため。
     pos_quarters: f64,
-    /// MIDI の保存先。Ctrl+S はここへ上書きする。
-    /// インポートでは設定しない (読み込んだファイルを上書きしないため)
-    midi_path: Option<PathBuf>,
+    /// プロジェクトの保存先。Ctrl+S はここへ上書きする。
+    /// MIDI のインポートでは設定しない (読み込んだファイルを上書きしないため)
+    project_path: Option<PathBuf>,
     /// 最後に読み書きしたフォルダ (ダイアログの初期位置)
     last_directory: Option<PathBuf>,
     /// 保存・読み込みの結果メッセージ
@@ -301,7 +303,10 @@ impl App {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.error = Some(format!("読み込めません: {e}"));
+                self.notice = Some(Notice::error(
+                    "MIDI を読み込めません",
+                    format!("読み込めません:\n{e}"),
+                ));
                 return;
             }
         };
@@ -312,55 +317,134 @@ impl App {
                 let name = file_label(&path);
                 self.editor
                     .replace_sequence(imported.notes, imported.tempo, imported.time_signature);
-                // 読み込み元を保存先にはしない (Ctrl+S で元ファイルを上書きしないため)
-                self.midi_path = None;
-                self.editor.midi_path = None;
+                // MIDI をプロジェクトの保存先にはしない
+                // (Ctrl+S が .ron を書くので、読み込み元とは無関係にする)
+                self.project_path = None;
+                self.editor.project_path = None;
                 self.error = None;
                 self.status = Some(format!("{name} から {count} 個のノートを読み込みました"));
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                self.notice = Some(Notice::error(
+                    "MIDI を読み込めません",
+                    format!("{}\n\n{e}", file_label(&path)),
+                ));
+            }
         }
     }
 
-    /// MIDI ファイルへ書き出す。
-    /// `ask` が false なら、保存先が決まっていれば黙って上書きする (Ctrl+S)。
-    fn export_midi(&mut self, ask: bool) {
-        let path = if ask || self.midi_path.is_none() {
-            let mut dialog = rfd::FileDialog::new()
-                .add_filter("MIDI ファイル", &["mid"])
-                .set_file_name("sequence.mid");
-            if let Some(directory) = self.dialog_directory() {
-                dialog = dialog.set_directory(directory);
-            }
-            let Some(path) = dialog.save_file() else { return };
-            path
-        } else {
-            self.midi_path.clone().unwrap_or_default()
-        };
-        // 拡張子を省略されたときは .mid を補う
-        let path = if path.extension().is_none() {
-            path.with_extension("mid")
-        } else {
-            path
+    /// MIDI ファイルへ書き出す。スウィングが乗るので、編集の保存には使わない
+    /// (それはプロジェクト形式の役目)。
+    fn export_midi(&mut self) {
+        let Some(path) = self.ask_save_path("MIDI ファイル", "mid", "sequence.mid") else {
+            return;
         };
 
         let bytes = match midi::to_bytes(&self.editor.editor) {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.error = Some(e);
+                self.notice = Some(Notice::error("MIDI を書き出せません", e));
                 return;
             }
         };
 
         match std::fs::write(&path, bytes) {
             Ok(()) => {
-                let name = file_label(&path);
-                self.set_midi_path(path);
+                self.last_directory = path.parent().map(PathBuf::from);
                 self.error = None;
-                self.status = Some(format!("保存しました: {name}"));
+                self.status = Some(format!("書き出しました: {}", file_label(&path)));
             }
-            Err(e) => self.error = Some(format!("保存できません: {e}")),
+            Err(e) => {
+                self.notice = Some(Notice::error(
+                    "MIDI を書き出せません",
+                    format!("保存できません:\n{e}"),
+                ));
+            }
         }
+    }
+
+    /// プロジェクトを保存する。
+    /// `ask` が false なら、保存先が決まっていれば黙って上書きする (Ctrl+S)。
+    fn save_project(&mut self, ask: bool) {
+        let path = if ask || self.project_path.is_none() {
+            let Some(path) = self.ask_save_path("プロジェクト", "ron", "song.ron") else {
+                return;
+            };
+            path
+        } else {
+            self.project_path.clone().unwrap_or_default()
+        };
+
+        let text = match project::to_string(&self.editor.editor) {
+            Ok(text) => text,
+            Err(e) => {
+                self.notice = Some(Notice::error("保存できません", e));
+                return;
+            }
+        };
+
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.set_project_path(path.clone());
+                self.error = None;
+                self.status = Some(format!("保存しました: {}", file_label(&path)));
+            }
+            Err(e) => {
+                self.notice = Some(Notice::error(
+                    "保存できません",
+                    format!("書き込めません:\n{e}"),
+                ));
+            }
+        }
+    }
+
+    /// プロジェクトを選んで読み込む。
+    /// 検証に通らなければ**何も変更しない** (壊れたファイルで作業中の内容を失わないため)。
+    fn open_project(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("プロジェクト", &["ron"]);
+        if let Some(directory) = self.dialog_directory() {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(path) = dialog.pick_file() else { return };
+
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                self.notice = Some(Notice::error("開けません", format!("読み込めません:\n{e}")));
+                return;
+            }
+        };
+
+        match project::from_str(&text) {
+            Ok(editor) => {
+                let notes = editor.notes.len();
+                let tracks = editor.tracks.len();
+                self.editor.replace_project(editor);
+                self.set_project_path(path.clone());
+                self.error = None;
+                self.status = Some(format!("開きました: {}", file_label(&path)));
+                self.notice = Some(Notice::ok(
+                    "プロジェクトを開きました",
+                    format!(
+                        "{}\n\n{tracks} トラック / {notes} ノート",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(e) => {
+                self.notice = Some(Notice::error(
+                    "開けません",
+                    format!("{}\n\n{e}", file_label(&path)),
+                ));
+            }
+        }
+    }
+
+    /// 保存先を覚える (エディタ側には表示用のファイル名だけ渡す)
+    fn set_project_path(&mut self, path: PathBuf) {
+        self.last_directory = path.parent().map(PathBuf::from);
+        self.editor.project_path = Some(file_label(&path));
+        self.project_path = Some(path);
     }
 
     /// シーケンス全体を鳴らして WAV ファイルに書き出す。
@@ -614,16 +698,9 @@ impl App {
         }
     }
 
-    /// 保存先を覚える (エディタ側には表示用のファイル名だけ渡す)
-    fn set_midi_path(&mut self, path: PathBuf) {
-        self.last_directory = path.parent().map(PathBuf::from);
-        self.editor.midi_path = Some(file_label(&path));
-        self.midi_path = Some(path);
-    }
-
     /// ファイルダイアログを開くフォルダ
     fn dialog_directory(&self) -> Option<PathBuf> {
-        self.midi_path
+        self.project_path
             .as_ref()
             .and_then(|path| path.parent())
             .map(PathBuf::from)
@@ -1046,9 +1123,13 @@ impl eframe::App for App {
 
             for command in commands {
                 match command {
-                    EditorCommand::ImportMidi => file_action = Some(FileAction::Import),
-                    EditorCommand::ExportMidi => file_action = Some(FileAction::Export),
-                    EditorCommand::SaveMidi => file_action = Some(FileAction::Save),
+                    EditorCommand::ImportMidi => file_action = Some(FileAction::ImportMidi),
+                    EditorCommand::ExportMidi => file_action = Some(FileAction::ExportMidi),
+                    EditorCommand::OpenProject => file_action = Some(FileAction::OpenProject),
+                    EditorCommand::SaveProject => file_action = Some(FileAction::SaveProject),
+                    EditorCommand::SaveProjectAs => {
+                        file_action = Some(FileAction::SaveProjectAs)
+                    }
                     EditorCommand::ExportWav => file_action = Some(FileAction::ExportWav),
                     EditorCommand::ExportCcs => file_action = Some(FileAction::ExportCcs),
                     EditorCommand::LoadPlugin { track } => load_plugin_track = Some(track),
@@ -1101,7 +1182,9 @@ impl eframe::App for App {
                             // ファイル操作はループの外で処理済み
                             EditorCommand::ImportMidi
                             | EditorCommand::ExportMidi
-                            | EditorCommand::SaveMidi
+                            | EditorCommand::OpenProject
+                            | EditorCommand::SaveProject
+                            | EditorCommand::SaveProjectAs
                             | EditorCommand::ExportWav
                             | EditorCommand::ExportCcs
                             | EditorCommand::LoadPlugin { .. } => continue,
@@ -1112,9 +1195,11 @@ impl eframe::App for App {
             }
 
             match file_action {
-                Some(FileAction::Import) => self.import_midi(),
-                Some(FileAction::Export) => self.export_midi(true),
-                Some(FileAction::Save) => self.export_midi(false),
+                Some(FileAction::ImportMidi) => self.import_midi(),
+                Some(FileAction::ExportMidi) => self.export_midi(),
+                Some(FileAction::OpenProject) => self.open_project(),
+                Some(FileAction::SaveProject) => self.save_project(false),
+                Some(FileAction::SaveProjectAs) => self.save_project(true),
                 Some(FileAction::ExportWav) => self.export_wav(),
                 Some(FileAction::ExportCcs) => self.export_ccs(),
                 None => {}

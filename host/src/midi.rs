@@ -84,13 +84,16 @@ pub fn to_bytes(editor: &MidiEditor) -> Result<Vec<u8>, String> {
     let mut tracks: Vec<Track> = Vec::with_capacity(cells.len() + 1);
     tracks.push(conductor);
 
+    // スウィングを乗せた位置で書き出す (記譜のまま残すのはプロジェクト保存の役目)。
+    // 段の割り当ては変わらないので、上の cells は記譜のノートから作ってよい。
+    let performed = editor.performed_notes();
+
     for (&(track_index, lane), name) in cells.iter().zip(names.iter()) {
         // (絶対ティック, ノートオフを先に並べるための順序, イベント)
         let mut events: Vec<(u32, u8, TrackEventKind)> = Vec::new();
         let channel = u4::from((lane % 16) as u8);
 
-        for note in editor
-            .notes
+        for note in performed
             .iter()
             .filter(|note| note.track == track_index && note.lane == lane)
         {
@@ -354,6 +357,27 @@ mod tests {
         note
     }
 
+    /// MIDI エクスポートにもスウィングが乗ること。
+    ///
+    /// 記譜のまま残す役目はプロジェクト保存 (.ron) が担うので、
+    /// こちらは「鳴るとおりに書き出す」側に倒している。
+    /// そのぶん書き出した MIDI を読み戻すと跳ねが二重に掛かる。
+    #[test]
+    fn export_applies_swing() {
+        let mut editor = MidiEditor::default(); // 120BPM / 4/4
+        editor.notes = vec![note(0.0, 0.5, 0, 4, 100), note(0.5, 0.5, 0, 4, 100)];
+
+        // OFF なら記譜位置がそのまま出る
+        let straight = from_bytes(&to_bytes(&editor).unwrap(), ScaleMode::Equal12).unwrap();
+        assert!(straight.notes[0].start_tick.abs() < 1e-3);
+        assert!((straight.notes[1].start_tick - 0.5).abs() < 1e-3);
+
+        editor.tracks[0].swing = true;
+        let swung = from_bytes(&to_bytes(&editor).unwrap(), ScaleMode::Equal12).unwrap();
+        assert!(swung.notes[0].start_tick > 0.0, "拍頭が遅れること");
+        assert!(swung.notes[1].start_tick > 0.5, "裏拍が跳ねること");
+    }
+
     fn on_track(mut note: Note, track: usize, lane: usize) -> Note {
         note.track = track;
         note.lane = lane;
@@ -381,6 +405,7 @@ mod tests {
         assert_eq!(imported.notes.len(), 3);
 
         for (restored, original) in imported.notes.iter().zip(editor.notes.iter()) {
+            // このエディタはスウィング OFF なので記譜位置がそのまま出る
             assert!((restored.start_tick - original.start_tick).abs() < 1e-3);
             assert!((restored.duration - original.duration).abs() < 1e-3);
             assert_eq!(restored.semitone, original.semitone);

@@ -1,11 +1,13 @@
 //! シーケンサーのデータモデル。
 //! 時間の単位はすべて「四分音符 = 1.0」の実数 (tick と呼ぶ)。
 
+use crate::swing;
+
 /// 音階モード。1オクターブを何ステップに分けるかを決める。
 ///
 /// ホストが変えるのは MIDI ノート番号だけで、実際の音高は
 /// プラグイン側の音律設定 (Scala の .scl ファイルなど) が決める。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ScaleMode {
     /// 12平均律。半音 0..=11。
     Equal12,
@@ -129,6 +131,10 @@ pub struct TrackInfo {
     pub muted: bool,
     /// ソロ指定中か (どれか1つでもソロなら、ソロ以外は鳴らさない)
     pub soloed: bool,
+    /// スウィングを掛けるか。
+    /// 伴奏は正確な拍のまま、ソロだけ跳ねさせる、という使い方をするので
+    /// トラックごとに持つ。
+    pub swing: bool,
 }
 
 impl TrackInfo {
@@ -138,11 +144,13 @@ impl TrackInfo {
             lanes: DEFAULT_LANES,
             muted: false,
             soloed: false,
+            swing: false,
         }
     }
 }
 
 /// シーケンス全体 (エディタが編集する対象)
+#[derive(Debug)]
 pub struct MidiEditor {
     pub notes: Vec<Note>,
     /// トラック (上から順に並ぶ)。必ず1本以上ある。
@@ -155,6 +163,9 @@ pub struct MidiEditor {
     pub beat_type: u32,
     /// 音階モード (ノート番号の算出方法)
     pub scale: ScaleMode,
+    /// スウィングの強さ (200BPM 時の裏拍の比)。1.0 で直線。
+    /// 掛けるかどうかはトラックごと ([`TrackInfo::swing`])。
+    pub swing_peak_ratio: f32,
 }
 
 impl Default for MidiEditor {
@@ -166,6 +177,7 @@ impl Default for MidiEditor {
             beats: 4,
             beat_type: 4,
             scale: ScaleMode::Equal12,
+            swing_peak_ratio: crate::swing::DEFAULT_PEAK_RATIO,
         }
     }
 }
@@ -306,6 +318,53 @@ impl MidiEditor {
         sample_rate * 60.0 / self.tempo.max(1) as f64
     }
 
+    /// そのトラックにスウィングを掛けるか
+    pub fn track_swings(&self, track: usize) -> bool {
+        self.tracks.get(track).is_some_and(|info| info.swing)
+    }
+
+    /// 出力用に、スウィングを適用したノート列を返す。記譜 (`self.notes`) は変えない。
+    ///
+    /// 再生・WAV・CCS・MIDI エクスポートはすべてこれを通す。記譜位置は8分の
+    /// 等分のまま保ち、跳ねは出力の直前に乗せる、という分担にしている。
+    ///
+    /// 開始と終端の**両方**に同じオフセットを掛けるので、前のノートの終端と
+    /// 次のノートの開始には必ず同じ値が乗り、重なりも隙間も生まれない。
+    pub fn performed_notes(&self) -> Vec<Note> {
+        if !swing::applies_to(self.beat_type) {
+            return self.notes.clone();
+        }
+
+        // 演奏位置が記譜上の終端を超えると、トランスポートの終端フラッシュ
+        // (sample_time > end_sample で打ち切る) から漏れて鳴りっぱなしになる。
+        // 小節線ちょうどで終わるノートは普通にあるので、ここで頭打ちにする。
+        let limit = self.length_quarters_bar_aligned();
+
+        self.notes
+            .iter()
+            .map(|note| {
+                // 音価0以下のノートは各出力が弾く。ここで下限を掛けてしまうと
+                // スウィングの有無で弾かれ方が変わるので、触らずに返す。
+                if note.duration <= 0.0 || !self.track_swings(note.track) {
+                    return *note;
+                }
+                let shift = |tick: f32| {
+                    tick + swing::offset(tick, self.tempo, self.swing_peak_ratio)
+                };
+                let start = shift(note.start_tick);
+                // 極端に短いノートは終端が開始を追い越すので下限を設ける
+                let end = shift(note.end_tick())
+                    .min(limit)
+                    .max(start + swing::MIN_PERFORMED_DURATION);
+                Note {
+                    start_tick: start,
+                    duration: end - start,
+                    ..*note
+                }
+            })
+            .collect()
+    }
+
     /// ノート列をサンプル時刻付きイベント列に変換する。
     /// 同時刻ではノートオフがノートオンより先に来るようソートされる。
     pub fn to_events(&self, sample_rate: f64) -> Vec<SeqEvent> {
@@ -319,9 +378,11 @@ impl MidiEditor {
 
     fn collect_events(&self, only_track: Option<usize>, sample_rate: f64) -> Vec<SeqEvent> {
         let spq = self.samples_per_quarter(sample_rate);
-        let mut events = Vec::with_capacity(self.notes.len() * 2);
+        // 鳴らすのは記譜位置ではなく演奏位置 (スウィングを乗せたもの)
+        let performed = self.performed_notes();
+        let mut events = Vec::with_capacity(performed.len() * 2);
 
-        for note in &self.notes {
+        for note in &performed {
             if only_track.is_some_and(|track| note.track != track) {
                 continue;
             }
@@ -481,6 +542,301 @@ mod tests {
         editor.scale = ScaleMode::BohlenPierce13;
         let keys: Vec<u8> = editor.to_events(44100.0).iter().map(|e| e.key).collect();
         assert_eq!(keys, vec![73, 73], "B-P で (0,5) は 73 になること");
+    }
+
+    /// スウィングを掛けた4/4のエディタ (トラック0 のみ ON)
+    fn swung() -> MidiEditor {
+        let mut editor = MidiEditor::default(); // 120BPM / 4/4
+        editor.tracks[0].swing = true;
+        editor
+    }
+
+    fn close(actual: f32, expected: f32) -> bool {
+        (actual - expected).abs() < 1e-4
+    }
+
+    /// スウィングで前後のノートが繋がったままであること。
+    ///
+    /// これがこの実装の核心。開始と終端に同じオフセットを掛けているので、
+    /// 前のノートの終端と次のノートの開始は一致し続ける。ずれると CeVIO の
+    /// 単旋律パートで重なりや隙間になる。
+    #[test]
+    fn swing_keeps_notes_contiguous() {
+        let mut editor = swung();
+        // 拍頭→裏拍→次の拍頭→その裏拍 と繋がる8分音符4つ
+        editor.notes = vec![
+            note(0.0, 0.5, 0, 4),
+            note(0.5, 0.5, 0, 4),
+            note(1.0, 0.5, 0, 4),
+            note(1.5, 0.5, 0, 4),
+        ];
+
+        let played = editor.performed_notes();
+        for pair in played.windows(2) {
+            assert!(
+                close(pair[0].end_tick(), pair[1].start_tick),
+                "{} で終わり {} で始まっている",
+                pair[0].end_tick(),
+                pair[1].start_tick
+            );
+        }
+        // 拍頭は遅れ、裏拍は比の位置へ
+        assert!(close(played[0].start_tick, 94.0 / 960.0), "表拍の遅れ");
+        assert!(close(played[1].start_tick, 0.566_724), "裏拍の位置");
+    }
+
+    /// 表拍が遅れることで、跳ねた8分の音価が前後で変わること
+    #[test]
+    fn swing_makes_the_first_eighth_longer() {
+        let mut editor = swung();
+        editor.notes = vec![note(0.0, 0.5, 0, 4), note(0.5, 0.5, 0, 4)];
+
+        let played = editor.performed_notes();
+        assert!(
+            played[0].duration < played[1].duration,
+            "表拍が遅れるぶん、前の8分は短くなる: {} / {}",
+            played[0].duration,
+            played[1].duration
+        );
+    }
+
+    /// 極端に短いノートでも音価が負にならないこと。
+    /// (表拍の遅れが音価を追い越すため)
+    #[test]
+    fn swing_never_produces_negative_duration() {
+        let mut editor = swung();
+        editor.notes = vec![note(0.0, 1.0 / 16.0, 0, 4)]; // 64分音符
+
+        let played = editor.performed_notes();
+        assert!(played[0].duration > 0.0, "実際 {}", played[0].duration);
+    }
+
+    /// 小節線ちょうどで終わるノートが、記譜上の終端を超えないこと。
+    ///
+    /// 超えるとノートオフがトランスポートの終端フラッシュから漏れ、
+    /// 音が鳴りっぱなしになる。
+    #[test]
+    fn swing_keeps_the_last_note_inside_the_bar() {
+        let mut editor = swung();
+        editor.notes = vec![note(3.0, 1.0, 0, 4)]; // 4/4 の4拍目、小節線で終わる
+
+        let limit = editor.length_quarters_bar_aligned();
+        assert_eq!(limit, 4.0);
+        let played = editor.performed_notes();
+        assert!(
+            played[0].end_tick() <= limit,
+            "終端 {} が {} を超えている",
+            played[0].end_tick(),
+            limit
+        );
+    }
+
+    /// 三連符の刻みが均等のまま保たれること (2音目・3音目は動かない)。
+    ///
+    /// 音価は均等にならない。3音目の終端は次の拍頭にあたるので、
+    /// 表拍の遅れぶんだけ伸びる。刻みが揃っていることが要件。
+    #[test]
+    fn swing_leaves_triplets_even() {
+        let mut editor = swung();
+        let third = 1.0 / 3.0;
+        editor.notes = vec![
+            note(third, third, 0, 4),
+            note(third * 2.0, third, 0, 4),
+        ];
+
+        let played = editor.performed_notes();
+        assert!(close(played[0].start_tick, third), "2音目は動かないこと");
+        assert!(close(played[1].start_tick, third * 2.0), "3音目も動かないこと");
+        assert!(
+            close(played[1].start_tick - played[0].start_tick, third),
+            "刻みが均等のままであること"
+        );
+        assert!(
+            close(played[1].end_tick(), 1.0 + swing::downbeat_delay(editor.tempo)),
+            "3音目は遅れた次の拍頭まで伸びること: {}",
+            played[1].end_tick()
+        );
+    }
+
+    /// 音価0のノートはスウィングを掛けても音価0のままであること。
+    ///
+    /// 最小音価の下限を掛けてしまうと、各出力の「音価0は書き出さない」判定を
+    /// すり抜けて、スウィングの有無で結果が変わってしまう。
+    #[test]
+    fn swing_leaves_empty_notes_empty() {
+        let mut editor = swung();
+        editor.notes = vec![note(0.0, 0.0, 0, 4)];
+
+        let played = editor.performed_notes();
+        assert_eq!(played[0], editor.notes[0], "何も変えないこと");
+        assert!(editor.to_events(48_000.0).is_empty(), "イベントも出ないこと");
+    }
+
+    /// 再生用のイベントにスウィングが乗ること
+    #[test]
+    fn events_carry_swing() {
+        let mut editor = swung();
+        editor.notes = vec![note(0.0, 0.5, 0, 4)];
+
+        let rate = 48_000.0;
+        let spq = editor.samples_per_quarter(rate);
+        let events = editor.to_events(rate);
+
+        let expected = (swing::downbeat_delay(editor.tempo) as f64 * spq) as u64;
+        assert!(expected > 0, "拍頭が遅れる設定であること");
+        assert_eq!(events[0].sample_time, expected, "ノートオンが遅れること");
+    }
+
+    /// スウィングを掛けても、イベントが記譜上の終端を超えないこと。
+    ///
+    /// 超えるとトランスポートの終端フラッシュ (`sample_time > end_sample` で
+    /// 打ち切り) から漏れ、ノートオフが出ずに音が鳴りっぱなしになる。
+    /// 「最後のノートが小節線ちょうどで終わる」のは最も普通の書き方なので、
+    /// 塞いでおかないと高確率で踏む。
+    #[test]
+    fn swung_events_stay_within_the_sequence_end() {
+        let mut editor = swung();
+        editor.notes = vec![note(0.0, 1.0, 0, 4), note(3.0, 1.0, 4, 4)];
+
+        let rate = 48_000.0;
+        let spq = editor.samples_per_quarter(rate);
+        let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
+
+        for event in editor.to_events(rate) {
+            assert!(
+                event.sample_time <= end_sample,
+                "{} が終端 {} を超えている",
+                event.sample_time,
+                end_sample
+            );
+        }
+    }
+
+    /// 三連符の真ん中を削って隙間が空いた場合。
+    ///
+    /// 3音目 (2/3) は表拍でも裏拍でもないので動かず、拍頭だけが遅れる。
+    /// 隙間の長さは変わらず、重なりも生じない。
+    #[test]
+    fn swing_handles_a_triplet_with_its_middle_removed() {
+        let mut editor = swung();
+        let third = 1.0 / 3.0;
+        editor.notes = vec![note(0.0, third, 0, 4), note(third * 2.0, third, 0, 4)];
+
+        let played = editor.performed_notes();
+        let delay = swing::downbeat_delay(editor.tempo);
+
+        assert!(close(played[0].start_tick, delay), "拍頭は遅れる");
+        assert!(close(played[0].end_tick(), third), "終端は動かない");
+        assert!(close(played[1].start_tick, third * 2.0), "3音目は動かない");
+
+        assert!(played[0].duration > 0.0 && played[1].duration > 0.0);
+        assert!(
+            played[0].end_tick() <= played[1].start_tick,
+            "重ならないこと"
+        );
+        assert!(
+            close(played[1].start_tick - played[0].end_tick(), third),
+            "隙間の長さが変わらないこと"
+        );
+    }
+
+    /// 三連符の真ん中を消して1音目を伸ばした場合 (跳ねた8分を手書きした形)。
+    ///
+    /// 拍頭だけが遅れ、3音目は動かないので、前後は繋がったまま。
+    #[test]
+    fn swing_handles_a_triplet_written_as_a_swung_pair() {
+        let mut editor = swung();
+        let third = 1.0 / 3.0;
+        editor.notes = vec![
+            note(0.0, third * 2.0, 0, 4), // 真ん中まで伸ばした1音目
+            note(third * 2.0, third, 0, 4),
+        ];
+
+        let played = editor.performed_notes();
+        assert!(
+            close(played[0].end_tick(), played[1].start_tick),
+            "繋がったままであること"
+        );
+        assert!(played[0].duration > 0.0 && played[1].duration > 0.0);
+    }
+
+    /// 同じ「跳ねた8分」でも、書き方によって実際に鳴る比が変わること。
+    ///
+    /// - **8分の等分 + スウィング**: 拍頭が遅れ、裏拍も比のぶん遅れる
+    /// - **三連符の真ん中抜き**: 3音目は動かず、拍頭だけが遅れる
+    ///
+    /// 拍頭の遅れは共通だが、裏拍にあたる音を動かすかどうかで結果が分かれる。
+    /// 前者は「短→長」、後者は「長→短」になる。どちらが望ましいかは
+    /// 音楽的な判断なので、ここでは現状を数値で固定するに留める。
+    #[test]
+    fn swing_result_depends_on_how_the_figure_is_written() {
+        let third = 1.0 / 3.0;
+
+        // 鳴っている間隔の比 (前の音の始まり→次の音の始まり : 次の音→その次の拍頭)
+        let sounding_ratio = |notes: Vec<Note>| {
+            let mut editor = swung();
+            editor.notes = notes;
+            let played = editor.performed_notes();
+            let front = played[1].start_tick - played[0].start_tick;
+            let back = played[1].end_tick() - played[1].start_tick;
+            front / back
+        };
+
+        let even_eighths = sounding_ratio(vec![note(0.0, 0.5, 0, 4), note(0.5, 0.5, 0, 4)]);
+        let written_triplet = sounding_ratio(vec![
+            note(0.0, third * 2.0, 0, 4),
+            note(third * 2.0, third, 0, 4),
+        ]);
+
+        assert!(
+            close(even_eighths, 0.8826),
+            "8分の等分 + スウィング: {even_eighths}"
+        );
+        assert!(
+            close(written_triplet, 1.3188),
+            "三連符の真ん中抜き: {written_triplet}"
+        );
+    }
+
+    /// スウィングが OFF のトラックは1 tick も動かないこと。
+    /// (伴奏とソロを同時に鳴らして検証するための要)
+    #[test]
+    fn swing_only_touches_enabled_tracks() {
+        let mut editor = swung();
+        editor.add_track(); // トラック1 は OFF のまま
+        editor.notes = vec![
+            note(0.0, 0.5, 0, 4),
+            Note {
+                track: 1,
+                ..note(0.0, 0.5, 0, 4)
+            },
+        ];
+
+        let played = editor.performed_notes();
+        assert!(played[0].start_tick > 0.0, "ソロは遅れること");
+        assert_eq!(played[1].start_tick, 0.0, "伴奏は動かないこと");
+        assert_eq!(played[1].duration, 0.5);
+    }
+
+    /// N/4 以外の拍子では何も起きないこと
+    #[test]
+    fn swing_is_limited_to_quarter_note_beats() {
+        let mut editor = swung();
+        editor.beats = 6;
+        editor.beat_type = 8;
+        editor.notes = vec![note(0.0, 0.5, 0, 4), note(0.5, 0.5, 0, 4)];
+
+        assert_eq!(editor.performed_notes(), editor.notes);
+    }
+
+    /// 強さ 1.0 では裏拍が動かないこと (表拍の遅れは残る)
+    #[test]
+    fn lowest_strength_keeps_offbeats_straight() {
+        let mut editor = swung();
+        editor.swing_peak_ratio = 1.0;
+        editor.notes = vec![note(0.5, 0.5, 0, 4)];
+
+        assert!(close(editor.performed_notes()[0].start_tick, 0.5));
     }
 
     /// 周波数が基準の音高と一致すること。

@@ -85,10 +85,12 @@ pub fn export(editor: &MidiEditor) -> Result<Exported, String> {
 fn collect_parts(editor: &MidiEditor) -> (Vec<Part>, usize) {
     let mut parts = Vec::new();
     let mut skipped = 0;
+    // 歌わせるのは記譜位置ではなく演奏位置 (スウィングを乗せたもの)
+    let performed = editor.performed_notes();
 
     for lane in 0..editor.lanes(TARGET_TRACK) {
         let mut notes: Vec<Note> = Vec::new();
-        for note in &editor.notes {
+        for note in &performed {
             if note.track != TARGET_TRACK || note.lane != lane {
                 continue;
             }
@@ -493,6 +495,28 @@ mod tests {
         assert!(cents.abs() <= 50.0, "ズレは ±50 セント以内 (実際 {cents})");
         // ズレていること自体が、LogF0 が要る理由
         assert!(cents.abs() > 1.0, "格子から外れていること");
+    }
+
+    /// CCS にもスウィングが乗ること (CeVIO は跳ねた状態で歌う)
+    #[test]
+    fn swing_is_applied_to_the_score() {
+        let mut editor = MidiEditor::default(); // 120BPM / 4/4
+        editor.notes = vec![note(0.0, 0.5, 0, 4, 0), note(0.5, 0.5, 0, 4, 0)];
+
+        // OFF なら空白1小節ぶん (4拍 * 960) ちょうど
+        let straight = xml(&editor);
+        assert_eq!(note_attr(&straight, "Clock", 0), "3840");
+
+        editor.tracks[0].swing = true;
+        let swung = xml(&editor);
+        let downbeat: u64 = note_attr(&swung, "Clock", 0).parse().unwrap();
+        let offbeat: u64 = note_attr(&swung, "Clock", 1).parse().unwrap();
+
+        assert!(downbeat > 3840, "拍頭が遅れること: {downbeat}");
+        assert!(
+            offbeat > 3840 + 480,
+            "裏拍が跳ねること (直線なら 4320): {offbeat}"
+        );
     }
 
     /// CeVIO は1小節目が空白なので、拍子に応じてノートが後ろへずれること

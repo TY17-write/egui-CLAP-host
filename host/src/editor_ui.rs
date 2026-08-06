@@ -4,6 +4,7 @@
 //! 右端ドラッグで音価を変更する。ピッチは選択して数値で編集する。
 
 use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
+use crate::swing;
 use crate::theme::palette;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, vec2,
@@ -138,8 +139,8 @@ pub struct EditorState {
     /// 段1つの高さ (縦ズーム)。段が少ないときに広げて操作しやすくするためのもの。
     /// MIN_ROW_H..=MAX_ROW_H に収める (set_row_h を通すこと)。
     row_h: f32,
-    /// MIDI の保存先 (表示用。実際のパス管理は main 側)
-    pub midi_path: Option<String>,
+    /// プロジェクトの保存先 (表示用。実際のパス管理は main 側)
+    pub project_path: Option<String>,
     /// トラックごとに載っている音源の名前 (表示用。main 側が毎フレーム更新する)
     pub track_plugins: Vec<Option<String>>,
     /// 再生を始めたときの再生ヘッド位置。停止・終端到達でここへ戻す。
@@ -172,7 +173,7 @@ impl Default for EditorState {
             show_help: false,
             grid_scroll_y: 0.0,
             row_h: ROW_H,
-            midi_path: None,
+            project_path: None,
             track_plugins: Vec::new(),
             play_return: None,
             was_playing: false,
@@ -263,6 +264,18 @@ impl EditorState {
             }
         }
         changed
+    }
+
+    /// 読み込んだプロジェクトで丸ごと置き換える (アンドゥで戻せる)。
+    ///
+    /// 中身は `project::from_str` が検証済みなので、ここでは丸めない。
+    pub fn replace_project(&mut self, editor: MidiEditor) {
+        self.history.record(EditGroup::Once);
+        self.editor = editor;
+        // 保存されたノートが全部見えるようにトラックと段を確保する
+        self.editor.ensure_capacity_for_notes();
+        self.clear_selection();
+        self.dirty = true;
     }
 
     /// 読み込んだシーケンスで中身を置き換える (アンドゥで戻せる)。
@@ -671,8 +684,12 @@ pub enum EditorCommand {
     ImportMidi,
     /// 保存先を選んで MIDI ファイルに書き出す
     ExportMidi,
-    /// MIDI として保存する (保存先が未設定なら選ばせる)
-    SaveMidi,
+    /// プロジェクトを開く (.ron)
+    OpenProject,
+    /// プロジェクトを保存する (保存先が未設定なら選ばせる)
+    SaveProject,
+    /// 保存先を選んでプロジェクトを保存する
+    SaveProjectAs,
     /// シーケンス全体を音声ファイル (WAV) に書き出す
     ExportWav,
     /// 1トラック目を CeVIO のプロジェクトファイル (CCS) に書き出す
@@ -754,22 +771,55 @@ pub fn editor_panel(
 
         ui.separator();
 
-        if ui
-            .button("MIDI インポート")
-            .on_hover_text("MIDI ファイルを読み込む (今のノートは置き換わります)")
-            .clicked()
-        {
-            commands.push(EditorCommand::ImportMidi);
-        }
-        if ui
-            .button("MIDI エクスポート")
-            .on_hover_text("保存先を選んで MIDI ファイルに書き出す")
-            .clicked()
-        {
-            commands.push(EditorCommand::ExportMidi);
-        }
+        // 保存 (.ron) と MIDI の入出力をまとめる。
+        // 並べるとボタン列が長くなりすぎるため。
+        ui.menu_button("ファイル", |ui| {
+            if ui
+                .button("開く…")
+                .on_hover_text("プロジェクト (.ron) を読み込む (今の内容は置き換わります)")
+                .clicked()
+            {
+                commands.push(EditorCommand::OpenProject);
+                ui.close_menu();
+            }
+            if ui
+                .button("保存 (Ctrl+S)")
+                .on_hover_text("プロジェクトを保存する (保存先が未設定なら選びます)")
+                .clicked()
+            {
+                commands.push(EditorCommand::SaveProject);
+                ui.close_menu();
+            }
+            if ui
+                .button("名前を付けて保存…")
+                .on_hover_text("保存先を選んでプロジェクトを保存する")
+                .clicked()
+            {
+                commands.push(EditorCommand::SaveProjectAs);
+                ui.close_menu();
+            }
 
-        ui.separator();
+            ui.separator();
+
+            if ui
+                .button("MIDI インポート")
+                .on_hover_text("MIDI ファイルを読み込む (今のノートは置き換わります)")
+                .clicked()
+            {
+                commands.push(EditorCommand::ImportMidi);
+                ui.close_menu();
+            }
+            if ui
+                .button("MIDI エクスポート")
+                .on_hover_text(
+                    "MIDI ファイルに書き出す (スウィングが乗ります。編集の保存には使わないこと)",
+                )
+                .clicked()
+            {
+                commands.push(EditorCommand::ExportMidi);
+                ui.close_menu();
+            }
+        });
 
         // 書き出し形式は増える見込みなのでメニューにしておく
         ui.menu_button("出力", |ui| {
@@ -791,7 +841,7 @@ pub fn editor_panel(
             }
         });
 
-        if let Some(path) = &state.midi_path {
+        if let Some(path) = &state.project_path {
             ui.weak(format!("保存先: {path}"));
         }
     });
@@ -859,7 +909,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("→", "選択の尾を、いちばん遅い終端に揃える (音価を伸ばす)"),
                     ("Ctrl+C / X / V", "コピー / カット / 貼り付け (貼り付けは再生ヘッド位置)"),
                     ("Ctrl+Z / Ctrl+Y", "元に戻す / やり直し"),
-                    ("Ctrl+S", "MIDI として保存 (保存先が未設定なら選ぶ)"),
+                    ("Ctrl+S", "プロジェクトを保存 (保存先が未設定なら選ぶ)"),
                 ],
             );
 
@@ -879,6 +929,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                 &[
                     ("M", "ミュート (このトラックを鳴らさない)"),
                     ("S", "ソロ (どれか1つでもソロなら、それ以外は鳴らない)"),
+                    ("W", "スウィング (N/4 拍子のときだけ。深さはツールバーで設定)"),
                     ("♪", "音源 (.clap) を読み込む / 差し替える"),
                     ("+ / −", "そのトラックの段を増減する (ノートのある段は消せません)"),
                     ("上の + / −", "トラックを増減する"),
@@ -889,8 +940,13 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                 ui,
                 "ファイル (下のボタン)",
                 &[
+                    ("ファイル > 開く", "プロジェクト (.ron) を読み込む"),
+                    ("ファイル > 保存", "プロジェクトを保存する。記譜位置と設定をそのまま残します"),
                     ("MIDI インポート", "MIDI ファイルを読み込む (今のノートは置き換わります)"),
-                    ("MIDI エクスポート", "保存先を選んで MIDI ファイルに書き出す"),
+                    (
+                        "MIDI エクスポート",
+                        "MIDI ファイルに書き出す。スウィングが乗るので、編集の保存には使わないこと",
+                    ),
                     (
                         "出力 > WAV",
                         "音源を鳴らして音声ファイルに書き出す (音源のロードが必要。書き出し中は画面が固まります)",
@@ -913,6 +969,10 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                         "段の縦幅を変える (Ctrl+ホイールも同じ。段が少ないときに広げると掴みやすくなります)",
                     ),
                     ("連符", "スナップ幅2つ分を N 等分する (1/8 の5連符なら四分音符に5音)"),
+                    (
+                        "スウィング",
+                        "跳ねの深さ (1.00 = 直線 / 2.00 = 三連)。記譜は8分の等分のままで、跳ねは再生・書き出しにだけ乗ります",
+                    ),
                 ],
             );
         });
@@ -1087,7 +1147,7 @@ fn shortcuts(
     } = keys;
 
     if save {
-        commands.push(EditorCommand::SaveMidi);
+        commands.push(EditorCommand::SaveProject);
     }
 
     // ↑↓: 選択中のノートを移調する (半音の上限を超えるとオクターブへ繰り上がる)
@@ -1152,7 +1212,9 @@ fn toolbar(
     pos_quarters: f64,
     commands: &mut Vec<EditorCommand>,
 ) {
-    ui.horizontal(|ui| {
+    // 項目が増えて 1100px に収まらなくなったので折り返す。
+    // 収まらないぶんが画面外へ消えると、そこだけ操作できなくなるため。
+    ui.horizontal_wrapped(|ui| {
         if playing {
             if ui
                 .button("⏹ 停止")
@@ -1309,6 +1371,47 @@ fn toolbar(
             && state.history.redo(&mut state.editor)
         {
             state.clear_selection();
+            state.dirty = true;
+        }
+
+        ui.separator();
+
+        // スウィングの深さ (200BPM 時の裏拍の比)。掛けるトラックはトラック欄の「W」で選ぶ。
+        // N/4 拍子でしか効かないので、それ以外では触らせない。
+        //
+        // ラベルとスライダーはこの折り返しレイアウトの「直接の子」にしておくこと。
+        // add_enabled_ui や scope で包むと入れ子の Ui になり、折り返しに参加せず
+        // 右端からはみ出して見えなくなる。
+        let usable = swing::applies_to(state.editor.beat_type);
+        let hint = if usable {
+            "跳ねの深さ (1.00 = 直線 / 2.00 = 三連)。掛けるトラックは左の欄の「W」で選びます"
+        } else {
+            "スウィングは N/4 拍子のときだけ使えます"
+        };
+        // 折り返しレイアウトなので、そのままだと文字の途中で改行される
+        // (「ス」と「ウィング」に割れる)。1語として次の行へ送る。
+        ui.add_enabled(
+            usable,
+            egui::Label::new("スウィング").wrap_mode(egui::TextWrapMode::Extend),
+        );
+
+        // 既定の 100px はツールバーには広すぎる。元に戻してから抜ける
+        let slider_width = ui.spacing().slider_width;
+        ui.spacing_mut().slider_width = 84.0;
+        let mut peak = state.editor.swing_peak_ratio;
+        let changed = ui
+            .add_enabled(
+                usable,
+                egui::Slider::new(&mut peak, swing::MIN_PEAK_RATIO..=swing::MAX_PEAK_RATIO)
+                    .fixed_decimals(2),
+            )
+            .on_hover_text(hint)
+            .changed();
+        ui.spacing_mut().slider_width = slider_width;
+
+        if changed {
+            state.editor.swing_peak_ratio = peak;
+            // 鳴り方が変わるのでシーケンスを送り直す (編集ではないので履歴には積まない)
             state.dirty = true;
         }
     });
@@ -2230,6 +2333,8 @@ fn track_gutter_content(
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         content.set_clip_rect(rect);
+        // トグル3つ + 名前 + ボタン3つを 200px に収めるため間隔を詰める
+        content.spacing_mut().item_spacing.x = 2.0;
 
         // ミュート / ソロ。編集ではないのでアンドゥ履歴には積まない。
         // 変更したらシーケンスを送り直す (鳴らす/止めるの切り替えのため)。
@@ -2266,8 +2371,33 @@ fn track_gutter_content(
             state.dirty = true;
         }
 
+        // スウィング。伴奏は正確な拍のまま、ソロだけ跳ねさせる使い方をするので
+        // トラックごとに持つ。深さはツールバーの「スウィング」で全体設定。
+        let swinging = state.editor.tracks[track].swing;
+        let swing_enabled = swing::applies_to(state.editor.beat_type);
+        let response = content.add_enabled(
+            swing_enabled,
+            egui::SelectableLabel::new(
+                swinging,
+                egui::RichText::new("W").size(10.0).color(if swinging {
+                    palette::CYAN
+                } else {
+                    palette::FG_DIM
+                }),
+            ),
+        );
+        if response.clicked() {
+            state.editor.tracks[track].swing = !swinging;
+            state.dirty = true;
+        }
+        response.on_hover_text(if swing_enabled {
+            "スウィング (跳ねの深さはツールバーで設定)"
+        } else {
+            "スウィングは N/4 拍子のときだけ使えます"
+        });
+
         let name = state.editor.tracks[track].name.clone();
-        content.allocate_ui(vec2(52.0, ROW_H - 4.0), |ui| {
+        content.allocate_ui(vec2(44.0, ROW_H - 4.0), |ui| {
             ui.add(
                 egui::Label::new(egui::RichText::new(name).size(11.0).color(palette::FG))
                     .truncate(),

@@ -23,3 +23,6 @@ midly = { version = "0.5.3", default-features = false, features = ["std", "alloc
 # CeVIO の .ccs 書き出し用 (どちらも純 Rust。C のビルド環境は不要)
 quick-xml = "0.37"
 uuid = { version = "1", features = ["v4"] }
+# プロジェクトファイル (.ron) の読み書き
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
