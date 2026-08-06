@@ -493,8 +493,30 @@ impl App {
                         rendered.peak
                     ));
                 }
-                self.status = Some(format!("書き出しました: {}", file_label(&path)));
-                self.notice = Some(Notice::ok("WAV を書き出しました", body));
+                // 音源の処理に失敗したトラックは無音のまま混ざっている。
+                // ファイルは残すが、成功として見せると欠けたまま気付けない。
+                if rendered.failures.is_empty() {
+                    self.status = Some(format!("書き出しました: {}", file_label(&path)));
+                    self.notice = Some(Notice::ok("WAV を書き出しました", body));
+                } else {
+                    body.push_str(
+                        "\n\n次のトラックは音源の処理に失敗したため、無音になっています。",
+                    );
+                    for failure in &rendered.failures {
+                        body.push_str(&format!(
+                            "\n・トラック {}: {} ({} ブロック)",
+                            failure.track + 1,
+                            failure.message,
+                            failure.blocks
+                        ));
+                    }
+                    self.status = Some(format!(
+                        "書き出しました (一部失敗): {}",
+                        file_label(&path)
+                    ));
+                    self.notice =
+                        Some(Notice::error("WAV の一部を書き出せませんでした", body));
+                }
             }
             Err(e) => self.fail_export(format!("保存できません:\n{e}")),
         }

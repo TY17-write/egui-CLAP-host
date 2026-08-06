@@ -144,6 +144,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- 判定 ----
     let mut failures = Vec::new();
+    // 音源の処理そのものが失敗していたら、以降のピーク判定は意味を持たない
+    for failure in &rendered.failures {
+        failures.push(format!(
+            "トラック {} の処理が失敗: {} ({} ブロック)",
+            failure.track + 1,
+            failure.message,
+            failure.blocks
+        ));
+    }
     if peaks[0] < AUDIBLE {
         failures.push("トラック1 の C4 区間が無音".to_string());
     }

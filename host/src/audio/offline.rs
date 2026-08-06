@@ -42,6 +42,42 @@ pub struct Rendered {
     pub sample_rate: u32,
     /// 縮小する前のピーク。1.0 を超えていた場合は全体を縮めてある。
     pub peak: f32,
+    /// 処理に失敗したトラック。空でなければ、そのトラックは無音のまま
+    /// 混ざっているので、出来上がりは中身が欠けている。
+    pub failures: Vec<TrackFailure>,
+}
+
+/// 書き出し中に処理が失敗したトラック
+pub struct TrackFailure {
+    /// トラック番号 (0 始まり)
+    pub track: usize,
+    /// 失敗したブロック数
+    pub blocks: usize,
+    /// 最初のエラー内容。以降は同じ内容が延々と続くので1件だけ残す。
+    pub message: String,
+}
+
+/// 失敗の記録。トラックごとに1件へまとめる。
+///
+/// 1ブロックでも失敗する音源はたいてい最後まで失敗し続けるので、
+/// そのまま並べると数千件になって読めない。
+#[derive(Default)]
+struct FailureLog {
+    entries: Vec<TrackFailure>,
+}
+
+impl FailureLog {
+    fn record(&mut self, track: usize, error: impl std::fmt::Display) {
+        match self.entries.iter_mut().find(|entry| entry.track == track) {
+            Some(entry) => entry.blocks += 1,
+            // オフライン処理なので、ここで確保しても問題ない
+            None => self.entries.push(TrackFailure {
+                track,
+                blocks: 1,
+                message: error.to_string(),
+            }),
+        }
+    }
 }
 
 impl Rendered {
@@ -76,6 +112,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
     let mut mix = vec![0.0f32; block_len];
     let mut samples =
         Vec::with_capacity((total_frames as usize + block_frames) * channels);
+    let mut failures = FailureLog::default();
 
     // 直前まで鳴っていた音を消してから録り始める (無音から始めるため)。
     // このブロックの出力は捨てる。
@@ -83,7 +120,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
         processor.events.clear();
         transport::push_choke(&mut processor.events, processor.note_port, 0);
     }
-    process_block(processors, 0, &mut mix);
+    process_block(processors, 0, &mut mix, &mut failures);
 
     // 端数ブロックを作らず、常に同じ長さで回して最後に切る。
     // min_frames_count を下回るブロックをプラグインへ渡さずに済む。
@@ -98,7 +135,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
             }
         }
 
-        process_block(processors, steady, &mut mix);
+        process_block(processors, steady, &mut mix, &mut failures);
         samples.extend_from_slice(&mix);
 
         steady += block_frames as u64;
@@ -113,6 +150,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
         channels,
         sample_rate: setup.sample_rate,
         peak,
+        failures: failures.entries,
     }
 }
 
@@ -123,6 +161,7 @@ fn process_block(
     processors: &mut [(usize, Box<TrackProcessor>)],
     steady: u64,
     mix: &mut [f32],
+    failures: &mut FailureLog,
 ) {
     mix.fill(0.0);
 
@@ -139,8 +178,11 @@ fn process_block(
             Some(steady),
             None,
         ) {
+            // 失敗したトラックはこのブロックが無音のまま混ざる。
+            // 黙って進めると中身の欠けたファイルが「成功」として出てしまうので、
+            // 呼び出し側へ持ち帰って知らせる。
             Ok(_) => processor.buffers.mix_into(mix),
-            Err(e) => eprintln!("トラック {} の書き出しでエラー: {e}", *track + 1),
+            Err(e) => failures.record(*track, e),
         }
     }
 }
@@ -176,6 +218,27 @@ fn finish(samples: &mut Vec<f32>, channels: usize, keep_frames: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 失敗はトラックごとに1件へまとまり、回数だけ増えること。
+    /// (毎ブロック記録すると数千件になって読めなくなる)
+    #[test]
+    fn failures_are_grouped_per_track() {
+        let mut log = FailureLog::default();
+        log.record(1, "処理に失敗");
+        log.record(1, "処理に失敗");
+        log.record(0, "別のエラー");
+        log.record(1, "あとから変わった内容");
+
+        assert_eq!(log.entries.len(), 2, "トラックごとに1件");
+
+        let first = &log.entries[0];
+        assert_eq!(first.track, 1);
+        assert_eq!(first.blocks, 3, "失敗した回数を数えること");
+        assert_eq!(first.message, "処理に失敗", "最初の内容を残すこと");
+
+        assert_eq!(log.entries[1].track, 0);
+        assert_eq!(log.entries[1].blocks, 1);
+    }
 
     /// ピークが 1.0 を超えたら 0dBFS に収まるまで全体が縮むこと。
     /// (クリップしたまま 16bit に落とすと歪みが焼き付いてしまう)
