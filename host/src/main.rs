@@ -4,7 +4,7 @@
 // 引き換えに標準出力・標準エラーの行き先が無くなるため、cargo run で
 // パニックのメッセージを見たいときは一時的に外すこと。
 // smoke 系のバイナリはコンソールで使うものなので、こちらには付けない。
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
 
 use clap_host_test::{
     audio, ccs, discovery, editor_ui, gui, host, midi, params, sequencer, theme, wav,
