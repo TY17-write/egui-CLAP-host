@@ -45,9 +45,8 @@ MIT のまま VST3 対応にできています (`vst3-host` → `vst3` → SDK �
 | `test-plugin` | テスト用のサイン波シンセ CLAP プラグイン (16ボイス、Volume パラメータ、ベロシティ対応) |
 | `spike/vst3` | VST3 に進めるかを確かめた実験用クレート (親のワークスペースからは切り離してある) |
 
-`test-plugin` は **CLAP 専用**です。VST3 側の検証には実物の .vst3 が要ります
-(手元では Surge XT を使っています)。同じ音源の CLAP 版と VST3 版を突き合わせるには
-clap-wrapper でのビルドが要り、そこには CMake が必要です。
+`test-plugin` は **CLAP 専用**です。VST3 側の検証には実物の .vst3 か、下記の
+clap-wrapper で作ったテスト治具が要ります。
 
 ## ビルドと実行
 
@@ -85,6 +84,40 @@ cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap "
 # ユニットテスト
 cargo test -p clap-host-test --lib
 ```
+
+### テスト治具: test-plugin の VST3 版
+
+`test-plugin` は CLAP 専用なので、そのままでは「同じ音源を両方の形式で鳴らして
+突き合わせる」ができません。[clap-wrapper](https://github.com/free-audio/clap-wrapper)
+で VST3 版を作れます。**CMake と C++ ツールチェーン (Windows では VS Build Tools) が要ります。**
+成果物はテスト用で、配布物には含まれません。
+
+```powershell
+# リポジトリの外に置く (本体には何も入れない)
+git clone --depth 1 https://github.com/free-audio/clap-wrapper.git
+cmake -S clap-wrapper -B build `
+      -DCLAP_WRAPPER_DOWNLOAD_DEPENDENCIES=ON `
+      -DCLAP_WRAPPER_OUTPUT_NAME=test_plugin `
+      -DCLAP_WRAPPER_WINDOWS_SINGLE_FILE=FALSE
+cmake --build build --config Release --target test_plugin_as_vst3
+
+# できたバンドルを本体の target/ へ (target は .gitignore 対象)
+Copy-Item build\Release\test_plugin.vst3 <repo>\target\test_plugin.vst3 -Recurse
+```
+
+VST3 版は**同名の .clap を CLAP の探索パスから探して読み込む**作りです。
+システムにインストールせずに済ませるため、`CLAP_PATH` で場所を教えます。
+
+```powershell
+$env:CLAP_PATH = "$PWD\target\debug"
+cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3 --same-plugin
+```
+
+`--same-plugin` を付けると、片方だけ鳴る区間の音量が両形式で一致することまで
+確かめます (ベロシティやゲインの扱いが形式で食い違うと落ちる)。
+
+依存は VST3 SDK 3.8.0 の `base` / `public.sdk` / `pluginterfaces` / `cmake` だけを
+取得します (vstgui は含まれません)。ソースとビルド成果物を合わせて **約 80 MB** でした。
 
 ## 使い方
 

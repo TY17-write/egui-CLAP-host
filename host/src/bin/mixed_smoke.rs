@@ -11,7 +11,16 @@
 //!   `TrackProcessor` しか見ないが、返し方 (`RetiredProcessor`) は形式ごとに違う
 //!
 //! 使い方:
-//!   cargo run -p clap-host-test --bin mixed_smoke -- <path\to\plugin.clap> <path\to\plugin.vst3>
+//!   cargo run -p clap-host-test --bin mixed_smoke -- <path\to\plugin.clap> <path\to\plugin.vst3> [--same-plugin]
+//!
+//! `--same-plugin` は、2つが**同じ DSP の別形式**であるときに付ける
+//! (clap-wrapper で `test-plugin` を VST3 化したものなど。作り方は README を参照)。
+//!
+//! 見ているのは**音の大きさが揃うこと**であって、波形が一致することではない。
+//! 2つの区間は別の音程を鳴らしているので、波形どうしは比べられない。
+//! ベロシティの換算やゲインの取り違えのように「片方の形式だけ音量が変わる」
+//! 壊れ方を捕まえるためのもの。逆に言うと、**たまたま音量が近い別の音源を
+//! 渡しても通ってしまう** (実測: Surge XT と test-plugin は 1.1% しか違わなかった)。
 
 use clack_host::prelude::*;
 use clap_host_test::audio::config::StreamAudioConfig;
@@ -36,6 +45,13 @@ const AUDIBLE: f32 = 0.01;
 /// 区間の境界がぼやけるぶんを避けるための余白 (ブロック単位)
 const MARGIN_BLOCKS: u64 = 3;
 
+/// `--same-plugin` のときに、両形式のピークが一致しているとみなす相対差。
+///
+/// 同じ DSP なら本来ぴったり揃う (実測では小数4桁まで一致した)。
+/// 2% にしてあるのは丸めのためで、ベロシティの換算やゲインの取り違えのような
+/// 実際の壊れ方はこれよりずっと大きくずれる。
+const SAME_PLUGIN_TOLERANCE: f32 = 0.02;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let clap_path = args
@@ -44,6 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let vst3_path = args
         .next()
         .ok_or("使い方: mixed_smoke <path\\to\\plugin.clap> <path\\to\\plugin.vst3>")?;
+    let same_plugin = args.any(|arg| arg == "--same-plugin");
 
     let stream_config = StreamAudioConfig {
         output_channel_count: CHANNELS,
@@ -184,10 +201,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                 peaks[1]
             ));
         }
+
+        // 同じ DSP の別形式なら、片方だけの区間は同じ大きさになるはず
+        if same_plugin {
+            let difference = (peaks[0] - peaks[2]).abs();
+            if difference > louder * SAME_PLUGIN_TOLERANCE {
+                failures.push(format!(
+                    "{label}: 同じ音源のはずなのに CLAP ({:.4}) と VST3 ({:.4}) で音量が違う \
+                     (差 {difference:.4})。どちらかの形式でベロシティかゲインの\
+                     扱いが食い違っている",
+                    peaks[0], peaks[2]
+                ));
+            }
+        }
     }
 
     if failures.is_empty() {
-        println!("✅ CLAP と VST3 の混在テスト成功");
+        if same_plugin {
+            println!("✅ CLAP と VST3 の混在テスト成功 (同じ音源で音量も一致)");
+        } else {
+            println!("✅ CLAP と VST3 の混在テスト成功");
+        }
         Ok(())
     } else {
         Err(format!("❌ 失敗: {}", failures.join(", ")).into())
