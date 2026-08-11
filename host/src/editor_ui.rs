@@ -267,6 +267,19 @@ pub struct EditorState {
     drag: Option<DragState>,
     /// 中クリックドラッグの用途 (押していなければ None)
     middle_drag: Option<MiddleDrag>,
+    /// 次のフレームでグリッドに強制する横スクロール位置。
+    ///
+    /// 横ズームの補正に使う。**差分 (`scroll_with_delta`) では駄目**で、
+    /// 理由は横ズームを反映している箇所に書いてある。
+    pending_scroll_x: Option<f32>,
+    /// 一度だけ画面に入れたい再生ヘッドの位置 (停止したときに使う)
+    scroll_to_quarters: Option<f64>,
+    /// コピー・カットしたノートの控え (先頭を 0 とした相対位置)。
+    ///
+    /// **OS のクリップボードは使わない。** 使うと、ノートをコピーするたびに
+    /// ユーザーが他所でコピーした内容を壊してしまう。別インスタンスとの
+    /// やり取りは要らないと判断したので、ここに持つ。
+    note_clipboard: Vec<Note>,
 }
 
 /// 中ボタンドラッグで何をするか。
@@ -311,6 +324,9 @@ impl Default for EditorState {
             track_last_note: false,
             drag: None,
             middle_drag: None,
+            pending_scroll_x: None,
+            scroll_to_quarters: None,
+            note_clipboard: Vec::new(),
         }
     }
 }
@@ -547,9 +563,9 @@ impl EditorState {
         true
     }
 
-    /// 選択中のノートをクリップボード用テキストにする。
+    /// 選択中のノートを控えの形にする。
     /// 開始位置は先頭ノートを 0 とした相対値にする (貼り付け先で再生ヘッドに合わせるため)。
-    fn copy_selection(&self) -> Option<String> {
+    fn copy_selection(&self) -> Option<Vec<Note>> {
         let mut notes: Vec<Note> = self
             .selection_sorted()
             .iter()
@@ -566,7 +582,7 @@ impl EditorState {
             note.start_tick -= base;
         }
         notes.sort_by(|a, b| a.start_tick.total_cmp(&b.start_tick));
-        Some(notes_to_text(&notes))
+        Some(notes)
     }
 
     /// ノート列を quarters の位置を先頭として貼り付け、貼った分を選択する。
@@ -588,57 +604,6 @@ impl EditorState {
         self.select_many((first..self.editor.notes.len()).collect());
         true
     }
-}
-
-/// クリップボードテキストの1行目に置く目印
-const CLIPBOARD_HEADER: &str = "clap-host-test notes v1";
-
-/// ノート列をクリップボード用テキストにする。
-/// 1行1ノートで "開始,音価,半音,オクターブ,ベロシティ,段,トラック"。
-fn notes_to_text(notes: &[Note]) -> String {
-    let mut text = String::from(CLIPBOARD_HEADER);
-    for n in notes {
-        text.push('\n');
-        text.push_str(&format!(
-            "{},{},{},{},{},{},{}",
-            n.start_tick, n.duration, n.semitone, n.octave, n.velocity, n.lane, n.track
-        ));
-    }
-    text
-}
-
-/// クリップボードテキストを読む。この形式でなければ None (他アプリのテキストは無視)。
-fn notes_from_text(text: &str) -> Option<Vec<Note>> {
-    let mut lines = text.lines();
-    if lines.next()?.trim() != CLIPBOARD_HEADER {
-        return None;
-    }
-
-    let mut notes = Vec::new();
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = line.split(',').collect();
-        // 7列が現行。トラックの無い6列 (古い形式) はトラック0として読む
-        if f.len() != 6 && f.len() != 7 {
-            return None;
-        }
-        notes.push(Note {
-            start_tick: f[0].parse().ok()?,
-            duration: f[1].parse().ok()?,
-            semitone: f[2].parse().ok()?,
-            octave: f[3].parse().ok()?,
-            velocity: f[4].parse().ok()?,
-            lane: f[5].parse().ok()?,
-            track: match f.get(6) {
-                Some(track) => track.parse().ok()?,
-                None => 0,
-            },
-        });
-    }
-    (!notes.is_empty()).then_some(notes)
 }
 
 /// アンドゥ1ステップ分の状態。
@@ -853,6 +818,8 @@ pub fn editor_panel(
     if state.was_playing && !playing {
         if let Some(quarters) = state.play_return.take() {
             commands.push(EditorCommand::Seek { quarters });
+            // 再生中は追従スクロールで画面が流れているので、位置と一緒に画面も戻す
+            state.scroll_to_quarters = Some(quarters);
         }
     }
     state.was_playing = playing;
@@ -888,13 +855,20 @@ pub fn editor_panel(
                 });
         });
 
-        let grid_scroll = egui::ScrollArea::both()
+        let mut grid_area = egui::ScrollArea::both()
             .id_salt("grid")
             .auto_shrink([false, false])
             // 左ドラッグは範囲選択に使うので、スクロールには割り当てない。
             // スクロールは中ドラッグ・ホイール・スクロールバーで行う。
             .drag_to_scroll(false)
-            .max_height(grid_height)
+            .max_height(grid_height);
+        // 横ズームの補正だけは、この場で位置を指定する。**ppq が変わるフレームと
+        // 同じフレームで横位置も決まる**ので、両者がずれて画面が揺れることがない。
+        // 指定するのはズームした次のフレームだけで、普段のスクロールには触らない。
+        if let Some(x) = state.pending_scroll_x.take() {
+            grid_area = grid_area.horizontal_scroll_offset(x);
+        }
+        let grid_scroll = grid_area
             .show(ui, |ui| {
                 grid(ui, state, pos_quarters, playing, &mut commands);
             });
@@ -1054,6 +1028,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("←", "選択の頭を、いちばん早いノートに揃える"),
                     ("→", "選択の尾を、いちばん遅い終端に揃える (音価を伸ばす)"),
                     ("Ctrl+C / X / V", "コピー / カット / 貼り付け (貼り付けは再生ヘッド位置)"),
+                    ("Ctrl+B", "貼り付け (Ctrl+V が効かないときに使う)"),
                     ("Ctrl+Z / Ctrl+Y", "元に戻す / やり直し"),
                     ("Ctrl+S", "プロジェクトを保存 (保存先が未設定なら選ぶ)"),
                 ],
@@ -1166,6 +1141,8 @@ fn stop_playback(state: &mut EditorState, commands: &mut Vec<EditorCommand>) {
     commands.push(EditorCommand::Stop);
     if let Some(quarters) = state.play_return.take() {
         commands.push(EditorCommand::Seek { quarters });
+        // 再生中は追従スクロールで画面が流れているので、位置と一緒に画面も戻す
+        state.scroll_to_quarters = Some(quarters);
     }
 }
 
@@ -1174,8 +1151,8 @@ fn stop_playback(state: &mut EditorState, commands: &mut Vec<EditorCommand>) {
 struct Shortcuts {
     copy: bool,
     cut: bool,
-    /// 貼り付けられたテキスト (自作フォーマットとは限らない)
-    pasted: Option<String>,
+    /// 貼り付けが要求された (中身は控えから取るので、テキストは見ない)
+    paste: bool,
     undo: bool,
     redo: bool,
     delete: bool,
@@ -1232,8 +1209,12 @@ fn shortcuts(
     }
 
     // Ctrl+C / X / V は egui-winit がキーイベントではなく Copy/Cut/Paste イベントに
-    // 変換するため、キーではなくイベントとして拾う (Paste は OS クリップボードに
-    // 文字列があるときだけ飛んでくるので、コピー時に必ずテキストを書き出しておく)。
+    // 変換する (キーとしては届かない) ため、イベントとして拾う。
+    //
+    // **ノートの受け渡しに OS のクリップボードは使わない** (`note_clipboard`)。
+    // Copy と Cut のイベントは無条件で飛ぶので取りこぼしはないが、Paste だけは
+    // クリップボードに文字列があるときにしか作られない。そのため Ctrl+B も
+    // 貼り付けに割り当ててある (下記)。
     let per_octave = state.editor.scale.steps_per_octave();
     let keys = ui.input_mut(|i| {
         let mut keys = Shortcuts::default();
@@ -1246,8 +1227,10 @@ fn shortcuts(
                 keys.cut = true;
                 false
             }
-            egui::Event::Paste(text) => {
-                keys.pasted = Some(text.clone());
+            // 中身は見ない。何が入っていても「貼り付けが押された」合図として扱い、
+            // 実際に貼るのは自前の控え (`note_clipboard`)。
+            egui::Event::Paste(_) => {
+                keys.paste = true;
                 false
             }
             _ => true,
@@ -1273,6 +1256,13 @@ fn shortcuts(
             keys.transpose -= 1;
         }
 
+        // Ctrl+V の保険。egui-winit は Ctrl+V をキーとして通さず、**OS の
+        // クリップボードに文字列があるときだけ** `Event::Paste` を作る
+        // (`egui-winit` の `lib.rs`)。こちらはもうクリップボードへ書かないので、
+        // 起動直後などクリップボードが空のままだと Ctrl+V が無反応になる。
+        // 横取りされないこの組み合わせを、確実に効く口として用意しておく。
+        keys.paste |= i.consume_key(Modifiers::COMMAND, Key::B);
+
         keys.save = i.consume_key(Modifiers::COMMAND, Key::S);
         keys.delete = i.consume_key(Modifiers::NONE, Key::Delete);
         keys.align_head = i.consume_key(Modifiers::NONE, Key::ArrowLeft);
@@ -1282,7 +1272,7 @@ fn shortcuts(
     let Shortcuts {
         copy,
         cut,
-        pasted,
+        paste,
         undo,
         redo,
         delete,
@@ -1314,9 +1304,10 @@ fn shortcuts(
         state.dirty = true;
     }
 
+    // 控えに取るだけで、OS のクリップボードには書かない
     if copy || cut {
-        if let Some(text) = state.copy_selection() {
-            ui.ctx().copy_text(text);
+        if let Some(notes) = state.copy_selection() {
+            state.note_clipboard = notes;
         }
     }
 
@@ -1326,10 +1317,12 @@ fn shortcuts(
         state.dirty = true;
     }
 
-    // 貼り付け位置は再生ヘッド。自分の形式でないテキストは無視する。
-    if let Some(notes) = pasted.as_deref().and_then(notes_from_text) {
+    // 貼り付け位置は再生ヘッド。控えが空なら何もしない。
+    if paste && !state.note_clipboard.is_empty() {
+        let notes = std::mem::take(&mut state.note_clipboard);
         state.history.record(EditGroup::Once);
         state.paste_notes(&notes, pos_quarters.max(0.0) as f32);
+        state.note_clipboard = notes; // 何度でも貼れるように戻す
         state.dirty = true;
     }
 
@@ -1927,6 +1920,22 @@ fn grid(
         }
     }
 
+    // 停止したときは、戻った再生ヘッドを画面に入れる。
+    //
+    // 再生中は追従スクロールで画面が先へ流れているため、そのままだと戻った
+    // 再生ヘッドが画面外に残る。**見えているときは動かさない**ので、
+    // 少し再生して止めただけのときに画面が跳ねることはない。
+    if let Some(quarters) = state.scroll_to_quarters.take() {
+        let target_x = to_x(quarters as f32);
+        let visible = ui.clip_rect();
+        if target_x < visible.left() || target_x > visible.right() - 40.0 {
+            ui.scroll_to_rect(
+                Rect::from_min_size(Pos2::new(target_x, origin.y), vec2(ppq * 4.0, 1.0)),
+                Some(egui::Align::Center),
+            );
+        }
+    }
+
     // ---- 操作 ----
     let snap = state.snap_unit().max(0.03125);
     let left_resize = state.left_resize;
@@ -2296,21 +2305,41 @@ fn grid(
 
     // ---- 横ズームの反映 ----
     // 縦ズームと同じく、1フレーム分の ppq で描き終えてから変える。
+    //
+    // **スクロールの補正は差分ではなく絶対位置で渡す。** 差分
+    // (`scroll_with_delta`) だと、ppq の変更が効くフレームと補正が効くフレームが
+    // 1つずれる。ドラッグ中はフレームごとの移動量が細かく揺れるので、そのずれが
+    // そのまま画面の左右の揺れになって見える。掴んだ位置が画面上のどこに居るべきかは
+    // 毎フレーム一意に決まるので、そこから**その場のオフセットを直接求める**。
+    // こうすると ppq と横位置が同じフレームで揃い、揺れようがない。
     if let Some(MiddleDrag::ZoomHorizontally { anchor_quarters }) = state.middle_drag {
         if zoom_pixels != 0.0 {
+            // 掴んだ位置が今いる画面上の x。ズームしてもここから動かさない
+            let anchor_x = origin.x + anchor_quarters * ppq;
             // 左へ動かすと拡大したいので、x の変化量の符号を反転して指数に使う
-            let grew = state.set_ppq(ppq * PPQ_ZOOM_PER_PIXEL.powf(-zoom_pixels));
-
-            // 掴んだ位置が画面上で動かないようスクロールを合わせる
-            // (縦と同じく、ScrollArea は offset -= delta で動く)
-            if grew != 0.0 && anchor_quarters > 0.0 {
-                ui.scroll_with_delta_animation(
-                    vec2(-anchor_quarters * grew, 0.0),
-                    egui::style::ScrollAnimation::none(),
-                );
-            }
+            state.set_ppq(ppq * PPQ_ZOOM_PER_PIXEL.powf(-zoom_pixels));
+            state.pending_scroll_x = Some(horizontal_offset_for_anchor(
+                ui.clip_rect().left(),
+                anchor_x,
+                anchor_quarters,
+                state.ppq,
+            ));
         }
     }
+}
+
+/// 掴んだ位置 (`anchor_quarters`) を画面上の `anchor_x` に留めるための横スクロール量。
+///
+/// `ScrollArea` のオフセットは「内容の左端からビューポート左端までの距離」なので、
+/// **内容上での位置から、画面上でのビューポート左端からのずれを引けば**求まる。
+/// 左端より手前へは送れないので 0 で止める。
+fn horizontal_offset_for_anchor(
+    viewport_left: f32,
+    anchor_x: f32,
+    anchor_quarters: f32,
+    ppq: f32,
+) -> f32 {
+    (anchor_quarters * ppq - (anchor_x - viewport_left)).max(0.0)
 }
 
 /// その位置が段の並んでいる範囲に入っているか。
@@ -2986,9 +3015,8 @@ mod tests {
         state.editor.notes = vec![placed(2.0, 1), placed(2.5, 3), placed(9.0, 0)];
         state.select_many(vec![0, 1]);
 
-        // 実際の経路と同じく、クリップボードのテキストを経由して貼り付ける
-        let text = state.copy_selection().expect("コピーできること");
-        let notes = notes_from_text(&text).expect("読み戻せること");
+        // 実際の経路と同じく、控えを経由して貼り付ける
+        let notes = state.copy_selection().expect("コピーできること");
         state.paste_notes(&notes, 4.0);
 
         assert_eq!(state.editor.notes.len(), 5);
@@ -3087,6 +3115,39 @@ mod tests {
         assert_eq!(state.row_h, MIN_ROW_H);
         // 頭打ちのあとは何も変わらない (スクロール補正を打たないため)
         assert_eq!(state.set_row_h(-100.0), 0.0);
+    }
+
+    /// 横ズームの補正: 掴んだ位置が画面上で動かないこと。
+    ///
+    /// ここが狂うとズーム中に画面が左右に揺れる。**倍率を変えても、掴んだ位置の
+    /// 画面座標は変わらない**ことを、拡大・縮小の両方で確かめる。
+    #[test]
+    fn horizontal_zoom_keeps_the_anchor_on_screen() {
+        let viewport_left = 200.0;
+        let anchor_quarters = 12.0;
+        let ppq = 40.0;
+
+        // 掴んだ位置がビューポート左端から 150px のところに見えている状態
+        let anchor_x = viewport_left + 150.0;
+
+        for new_ppq in [ppq * 2.0, ppq * 0.5, ppq * 8.0, ppq] {
+            let offset = horizontal_offset_for_anchor(viewport_left, anchor_x, anchor_quarters, new_ppq);
+            // オフセットから逆算した画面上の位置が元と一致すること
+            let origin_x = viewport_left - offset;
+            let shown_x = origin_x + anchor_quarters * new_ppq;
+            assert!(
+                (shown_x - anchor_x).abs() < 0.001,
+                "ppq={new_ppq} で掴んだ位置が動いた ({shown_x} != {anchor_x})"
+            );
+        }
+    }
+
+    /// 左端より手前へは送らないこと (ScrollArea が受け付けないため)
+    #[test]
+    fn horizontal_zoom_offset_never_goes_negative() {
+        // 内容上の位置より画面上のずれのほうが大きい = 左端が見えている状態
+        let offset = horizontal_offset_for_anchor(0.0, 500.0, 1.0, 10.0);
+        assert_eq!(offset, 0.0);
     }
 
     /// 横ズームは上下限で頭打ちになり、実際に変わった量を返すこと
@@ -3490,42 +3551,28 @@ mod tests {
         assert!((state.snap_unit() - 0.2).abs() < 1e-6);
     }
 
-    /// クリップボードのテキストが値を保ったまま往復すること
+    /// コピーした控えは、貼り付けても値を保ったまま残ること。
+    ///
+    /// テキスト化を挟まなくなったので値の往復は自明だが、**何度でも貼れること**は
+    /// 実装しだいで壊れる (控えを取り出したまま戻し忘れる)。
     #[test]
-    fn clipboard_text_round_trips() {
-        let notes = vec![
-            Note {
-                start_tick: 0.0,
-                duration: 0.125,
-                semitone: 11,
-                octave: -2,
-                velocity: 1,
-                track: 0,
-                lane: 0,
-            },
-            Note {
-                start_tick: 1.75,
-                duration: 2.5,
-                semitone: 3,
-                octave: 8,
-                velocity: 127,
-                track: 2,
-                lane: 17,
-            },
-        ];
-        let restored = notes_from_text(&notes_to_text(&notes)).expect("読み戻せること");
-        assert_eq!(restored, notes);
-    }
+    fn copied_notes_can_be_pasted_more_than_once() {
+        let mut state = EditorState::default();
+        state.editor.notes = vec![placed(2.0, 1), placed(2.5, 3)];
+        state.select_many(vec![0, 1]);
 
-    /// 他アプリでコピーしたテキストは無視すること
-    #[test]
-    fn clipboard_text_rejects_foreign_content() {
-        assert!(notes_from_text("hello world").is_none());
-        assert!(notes_from_text(CLIPBOARD_HEADER).is_none(), "ノートが無ければ無効");
-        assert!(
-            notes_from_text(&format!("{CLIPBOARD_HEADER}\n0,0.5,0,4,100")).is_none(),
-            "列が足りない行は無効"
-        );
+        let copied = state.copy_selection().expect("コピーできること");
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].start_tick, 0.0, "先頭が 0 の相対位置になること");
+        assert_eq!(copied[1].start_tick, 0.5);
+
+        state.paste_notes(&copied, 4.0);
+        state.paste_notes(&copied, 8.0);
+
+        assert_eq!(state.editor.notes.len(), 6);
+        assert_eq!(state.editor.notes[2].start_tick, 4.0);
+        assert_eq!(state.editor.notes[4].start_tick, 8.0);
+        assert_eq!(copied[0].start_tick, 0.0, "控えは貼っても変わらないこと");
     }
 
     /// 貼り付け時に、音階モードで使えない半音を丸めること
