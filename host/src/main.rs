@@ -323,6 +323,22 @@ fn notice_window(ctx: &egui::Context, notice: &mut Option<Notice>) {
 /// Windows で VST3 が置かれる標準の場所 (ダイアログの初期位置に使う)
 const VST3_STANDARD_DIRECTORY: &str = r"C:\Program Files\Common Files\VST3";
 
+/// 「♪」で聞く音源の選び方。
+///
+/// ダイアログの出し方が形式ごとに違うので、開く前に決めてもらう必要がある。
+/// VST3 は**入れ物が2通りある**ため3択になる (詳細は [`App::open_vst3_dialog`])。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadChoice {
+    /// .clap ファイル
+    Clap,
+    /// バンドルディレクトリ形式の .vst3 (現行の標準)
+    Vst3Bundle,
+    /// 素の DLL 1ファイルの .vst3 (VST 3.6.10 以降は非推奨だが、まだ出回っている)
+    Vst3File,
+    /// 読み込みをやめる
+    Cancel,
+}
+
 /// 表示用のファイル名 (取れなければパス全体)
 fn file_label(path: &std::path::Path) -> String {
     path.file_name()
@@ -333,7 +349,7 @@ fn file_label(path: &std::path::Path) -> String {
 #[derive(Default)]
 struct App {
     /// 「♪」を押したあと、音源の形式を選んでもらっている最中のトラック。
-    /// .clap はファイル、.vst3 はフォルダを選ばせるので、先に形式を決める必要がある。
+    /// 形式ごとにダイアログの出し方が違うので、先に [`LoadChoice`] を決める必要がある。
     pending_load: Option<usize>,
     candidates: Option<Candidates>,
     // 宣言順にドロップされるため、ストリームをインスタンスより先に止める
@@ -383,9 +399,21 @@ impl App {
 
     /// .vst3 を選ばせて候補を読み込む。
     ///
-    /// Windows の .vst3 は**バンドルディレクトリ**なので、ファイル選択では掴めない。
-    /// フォルダ選択で開かせる (素の DLL 形式は今のところ選べない)。
-    fn open_vst3_dialog(&mut self, target_track: usize) -> bool {
+    /// **同じ拡張子で入れ物が2通りある**ので、どちらを選ぶかを呼び出し側が決める。
+    ///
+    /// | `bundle` | 対象 | ダイアログ |
+    /// |---|---|---|
+    /// | `true` | `Foo.vst3\Contents\x86_64-win\Foo.vst3` (現行の標準) | フォルダ選択 |
+    /// | `false` | `Foo.vst3` 単体の DLL (VST 3.6.10 以降は非推奨) | ファイル選択 |
+    ///
+    /// Windows の共通ダイアログはフォルダとファイルを1つの選択で混ぜられないため、
+    /// ここを1つにまとめることはできない。読み込む側 (`discovery::load_vst3_file` /
+    /// `audio::activate_vst3_track`) はどちらのパスを渡しても通るので、
+    /// **違いはダイアログの出し方だけ**に閉じている。
+    ///
+    /// なお、ファイル選択でもバンドルディレクトリには**入っていける**ので、
+    /// 中の DLL を直接指してもよい (バンドルの場所を渡すのと同じ結果になる)。
+    fn open_vst3_dialog(&mut self, target_track: usize, bundle: bool) -> bool {
         let mut dialog = rfd::FileDialog::new();
         // 標準の置き場から始める。無ければダイアログの既定に任せる
         let standard = std::path::Path::new(VST3_STANDARD_DIRECTORY);
@@ -393,9 +421,12 @@ impl App {
             dialog = dialog.set_directory(standard);
         }
 
-        let Some(path) = dialog.pick_folder() else {
-            return false;
+        let picked = if bundle {
+            dialog.pick_folder()
+        } else {
+            dialog.add_filter("VST3 プラグイン", &["vst3"]).pick_file()
         };
+        let Some(path) = picked else { return false };
 
         let found = discovery::load_vst3_file(&path);
         self.accept_candidates(project::PluginKind::Vst3, path, target_track, found)
@@ -1293,19 +1324,33 @@ impl eframe::App for App {
             });
 
             // 音源の形式の選択。ダイアログの出し方が形式で違うので先に決めてもらう
-            // (.clap はファイル、.vst3 は Windows ではバンドルディレクトリ)。
+            // (.clap はファイル、.vst3 はバンドルディレクトリと単体ファイルの2通り)。
             let mut chosen_kind = None;
             if let Some(track) = self.pending_load {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("トラック {} に読み込む音源の形式:", track + 1));
                     if ui.button("CLAP (.clap ファイル)").clicked() {
-                        chosen_kind = Some(Some(project::PluginKind::Clap));
+                        chosen_kind = Some(LoadChoice::Clap);
                     }
-                    if ui.button("VST3 (.vst3 フォルダ)").clicked() {
-                        chosen_kind = Some(Some(project::PluginKind::Vst3));
+                    if ui
+                        .button("VST3 (.vst3 フォルダ)")
+                        .on_hover_text("現行の標準。フォルダ選択が開きます")
+                        .clicked()
+                    {
+                        chosen_kind = Some(LoadChoice::Vst3Bundle);
+                    }
+                    if ui
+                        .button("VST3 (.vst3 単体ファイル)")
+                        .on_hover_text(
+                            "フォルダになっていない古い形式。\
+                             バンドルの中の DLL を直接指すのにも使えます",
+                        )
+                        .clicked()
+                    {
+                        chosen_kind = Some(LoadChoice::Vst3File);
                     }
                     if ui.button("やめる").clicked() {
-                        chosen_kind = Some(None);
+                        chosen_kind = Some(LoadChoice::Cancel);
                     }
                 });
             }
@@ -1614,9 +1659,10 @@ impl eframe::App for App {
             if let Some(chosen) = chosen_kind {
                 let track = self.pending_load.take().unwrap_or(0);
                 let opened = match chosen {
-                    Some(project::PluginKind::Clap) => self.open_clap_dialog(track),
-                    Some(project::PluginKind::Vst3) => self.open_vst3_dialog(track),
-                    None => false,
+                    LoadChoice::Clap => self.open_clap_dialog(track),
+                    LoadChoice::Vst3Bundle => self.open_vst3_dialog(track, true),
+                    LoadChoice::Vst3File => self.open_vst3_dialog(track, false),
+                    LoadChoice::Cancel => false,
                 };
                 if opened {
                     // 候補が1つだけならそのまま載せる (選択の手間を省く)

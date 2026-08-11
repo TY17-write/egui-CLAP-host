@@ -266,6 +266,47 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 | **2** | VST3 バックエンド（音のみ。choke 含む） | **完了** |
 | **3** | VST3 の GUI（自前の Win32 埋め込みを使う） | **完了** |
 | **4** | 仕上げ（CLAP と VST3 の混在確認、ドキュメント） | **完了** |
+| **5** | 素の DLL 形式（単体ファイル）の `.vst3` を選べるようにする | **完了** |
+
+### フェーズ5 で分かったこと（実装後）
+
+**読み込む側は最初から両対応だった。足りなかったのはダイアログだけ。**
+`discovery::load_vst3_file` も `audio::activate_vst3_track` もパスを
+`vst3-host` にそのまま渡しており、`get_vst3_binary_path` が
+「`is_file()` ならそのパスを返す」形で単体ファイルを既に扱っている
+（`module_loader/windows.rs` がバンドルの解決に失敗しても元のパスへ落ちる）。
+`moduleinfo.json` も、見つからなければ `Ok(None)` になるだけで失敗しない。
+したがって変更は `open_vst3_dialog` に `bundle: bool` を足し、形式選択の行に
+ボタンを1つ増やすだけで済んだ（`LoadChoice`）。
+
+**ここは想像以上に効く。この環境の VST3 は大半が単体ファイルだった。**
+`C:\Program Files\Common Files\VST3` の直下 90 個のうち、バンドルディレクトリは
+**4個だけ**で、残りはすべて素の DLL。「非推奨の古い形式」という前提で後回しに
+していたが、実際には**そちらが多数派**だった。
+
+**ファイル選択はバンドルの中にも入れるので、逃げ道にもなる。** フォルダ選択が
+うまくいかないときは `Contents\x86_64-win\` の DLL を直接指せばよく、
+`get_vst3_binary_path` の `is_file()` 分岐でそのまま通る。Pianoteq 9 で
+バンドルと内側の DLL の両方に `vst3_smoke` をかけ、出力が1桁まで一致することを
+確かめた。
+
+**`vst3-host` 側に、単体ファイルでだけ表面化する不具合がある。**
+
+```
+Error: PluginLoadFailed("IPluginCompatibility::getCompatibilityJSON failed: 0x1")
+```
+
+`Plugin Compatibility Class` を名乗りながら `getCompatibilityJSON` が
+`kResultFalse` (=1) を返す音源があり、`module_info.rs` の
+`read_factory_compatibility` がこれを**致命的なエラーとして返す**
+（`0x1` は「互換情報なし」の意味なので、`Ok(Vec::new())` が正しい）。
+`moduleinfo.json` があればこの経路は通らないため、**バンドル形式では隠れていて、
+単体ファイルでのみ必ず表面化する**。読み込み経路
+（`plugin_impl.rs:1265`）も同じ関数を通るので、列挙だけでなく装填も失敗する。
+
+手元の 17 個で当たったのは `PapyrusKeys` の1つだけ。クレートの中で起きるので
+**公開 API では回避できない**。直すならフォークして `[patch.crates-io]` を張るか、
+上流へ報告するかになる。今は入れていない。
 
 ### フェーズ4 で分かったこと（実装後）
 
@@ -407,7 +448,8 @@ VST3 由来ではなくクレートの作り由来である。
   抱えるので、読み込みのたびに作って捨ててよい（CLAP の `PluginEntry` と同じ整理）
 - **Windows の `.vst3` はバンドルディレクトリなので、ファイル選択ダイアログでは掴めない。**
   「♪」を押したら先に形式を聞き、CLAP はファイル選択、VST3 はフォルダ選択を開く形にした。
-  素の DLL 形式の `.vst3`（VST 3.6.10 以降は非推奨）は今のところ選べない
+  素の DLL 形式の `.vst3`（VST 3.6.10 以降は非推奨）は当時選べなかった
+  → **フェーズ5 で選べるようにした**（下記）
 - 停止 (`setProcessing(false)`) はリアルタイム安全でないので、`RetiredProcessor::Vst3` は
   **止まっていない状態**でメインスレッドへ渡り、受け取った側が止める。CLAP は
   オーディオ処理器のまま止められるので、ここだけ非対称になっている
