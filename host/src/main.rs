@@ -432,6 +432,20 @@ impl App {
         self.accept_candidates(project::PluginKind::Vst3, path, target_track, found)
     }
 
+    /// どれか1つでも音源のエディタを開いているか。
+    ///
+    /// 開いている間は、その窓がこちらと同じスレッドのメッセージループに乗る。
+    /// 再描画の間隔を決めるのに使う (`update` の末尾を参照)。
+    fn any_editor_open(&self) -> bool {
+        self.tracks
+            .iter()
+            .flatten()
+            .any(|track| match &track.plugin {
+                TrackPlugin::Clap(clap) => clap.gui.as_ref().is_some_and(|gui| gui.is_open),
+                TrackPlugin::Vst3(vst3) => vst3.gui.is_open,
+            })
+    }
+
     /// 数え上げた結果を候補として受け取る (形式によらず共通)
     fn accept_candidates(
         &mut self,
@@ -1681,7 +1695,23 @@ impl eframe::App for App {
         // 結果通知は最前面に出したいので、パネルを描いたあとに重ねる
         notice_window(ctx, &mut self.notice);
 
-        // 鍵盤の離鍵検出などのために定期的に再描画する
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // 鍵盤の離鍵検出などのために定期的に再描画する。
+        //
+        // **間隔は実際のフレーム時間より長くすること。** eframe は「期限を過ぎた
+        // 再描画要求」を見つけると `ControlFlow::Poll` に落とす
+        // (eframe `native/run.rs` の `check_redraw_requests`)。vsync 60Hz の
+        // フレームは約 16.7ms なので、16ms を要求すると**毎回すでに期限切れ**になり、
+        // ループが一度も待機状態に入らなくなる。
+        //
+        // そうなると winit がメッセージ配送を捌ききれない。winit は
+        // `RedrawRequested` を配送するたびに配送ループを打ち切る作りのため
+        // (`interrupt_msg_dispatch`)、待機に入らない限りキューが常に捌き残る。
+        // 割を食うのは**同じスレッドに貼り付いたプラグインのエディタ**で、
+        // 単発のクリックは通るのにホバーやドラッグが効かなくなる
+        // (Native Instruments の音源で発覚。経緯は docs/vst3_host_plan.md のフェーズ7)。
+        //
+        // エディタを開いていないときは誰も割を食わないので、そのまま滑らかに保つ。
+        let interval = if self.any_editor_open() { 33 } else { 16 };
+        ctx.request_repaint_after(Duration::from_millis(interval));
     }
 }

@@ -14,9 +14,9 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow,
     GetWindowLongPtrW, LoadCursorW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, IDC_ARROW, SIZE_MINIMIZED,
+    CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, GW_CHILD, IDC_ARROW, SIZE_MINIMIZED,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WM_CLOSE,
     WM_DESTROY, WM_NCCREATE, WM_SIZE, WNDCLASSW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
     WS_THICKFRAME,
@@ -100,6 +100,97 @@ impl PluginWindow {
     /// (CLAP は `gui.set_parent`、VST3 は `IPlugView::attached` の行き先)
     pub fn hwnd(&self) -> *mut c_void {
         self.hwnd
+    }
+
+    /// プラグインが貼り付けた子ウィンドウを列挙して、1つずつ状態を文字列にする。
+    ///
+    /// 「描かれているのに一部しか押せない」を追うためのもの。描画と入力は別物で、
+    /// **無効化された (`EnableWindow(false)`) 子は、描かれるが入力を受け取らない**。
+    /// 位置がずれている子も、見た目どおりの場所を押しても当たらない。
+    /// どちらも、この一覧に出れば一目で分かる。
+    ///
+    /// 位置と大きさはこの窓のクライアント領域を基準にした値。
+    pub fn describe_embedded_children(&self) -> Vec<String> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetClassNameW, GetWindowRect, IsWindowVisible, GW_HWNDNEXT,
+        };
+
+        /// 異常な数の子がぶら下がっていても止まらないように上限を置く
+        const MAX_CHILDREN: usize = 16;
+
+        let mut described = Vec::new();
+        unsafe {
+            let mut parent = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(self.hwnd, &mut parent) == 0 {
+                return described;
+            }
+
+            let mut child = GetWindow(self.hwnd, GW_CHILD);
+            while !child.is_null() && described.len() < MAX_CHILDREN {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                let mut class = [0u16; 64];
+                let length = GetClassNameW(child, class.as_mut_ptr(), class.len() as i32);
+                let class = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+
+                if GetWindowRect(child, &mut rect) != 0 {
+                    described.push(format!(
+                        "{class}: {}x{} @({},{}) 有効={} 表示={}",
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        rect.left - parent.left,
+                        rect.top - parent.top,
+                        IsWindowEnabled(child) != 0,
+                        IsWindowVisible(child) != 0,
+                    ));
+                } else {
+                    described.push(format!("{class}: 位置を取得できない"));
+                }
+
+                child = GetWindow(child, GW_HWNDNEXT);
+            }
+        }
+        described
+    }
+
+    /// プラグインが貼り付けた中身 (子ウィンドウ) のクライアント領域サイズ。
+    ///
+    /// CLAP も VST3 も、埋め込みではこの窓に**子ウィンドウとしてぶら下がる**ので、
+    /// ここが実際に描かれて入力を受け取る範囲になる。[`client_size`](Self::client_size)
+    /// と食い違っていれば、窓の一部に中身が無い (= その部分をクリックしても
+    /// 何も起きない) ことになる。
+    ///
+    /// 貼り付け前や、子を作らない実装では `None`。
+    pub fn embedded_child_size(&self) -> Option<(u32, u32)> {
+        unsafe {
+            let child = GetWindow(self.hwnd, GW_CHILD);
+            if child.is_null() {
+                return None;
+            }
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetClientRect(child, &mut rect) == 0 {
+                return None;
+            }
+            Some((
+                (rect.right - rect.left).max(0) as u32,
+                (rect.bottom - rect.top).max(0) as u32,
+            ))
+        }
     }
 
     /// クライアント領域が指定サイズになるようウィンドウをリサイズする

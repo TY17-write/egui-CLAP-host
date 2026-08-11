@@ -25,6 +25,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
+    # 埋め込んだ子ウィンドウが入力を受け取れる状態かを見るため (IsWindowEnabled)
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 # parallel (rayon) は不要なので既定機能を切る
 midly = { version = "0.5.3", default-features = false, features = ["std", "alloc"] }

@@ -252,10 +252,29 @@ impl Vst3GuiManager {
         unsafe { plugin.open_editor(WindowHandle::from_hwnd(window.hwnd()))? };
 
         window.set_resizable(plugin.editor_can_resize());
-        if let Ok((width, height)) = plugin.get_editor_size() {
+        let reported = plugin.get_editor_size();
+        if let Ok((width, height)) = reported {
             if width > 0 && height > 0 {
                 window.resize_client(width as u32, height as u32);
             }
+        }
+
+        // 開いたときの寸法を1行だけ出す。
+        //
+        // 「窓は開くが触れない」を追うのに要る。**音源が言う大きさ・こちらの窓・
+        // 実際に貼り付いた中身**が食い違っていれば、窓の一部に中身が無いことになり、
+        // その範囲をクリックしても何も起きない。
+        println!(
+            "[vst3 gui] {title}: 音源={} 窓={:?} 中身={:?}",
+            match reported {
+                Ok((width, height)) => format!("{width}x{height}"),
+                Err(e) => format!("不明 ({e})"),
+            },
+            window.client_size(),
+            window.embedded_child_size(),
+        );
+        for child in window.describe_embedded_children() {
+            println!("[vst3 gui]   子: {child}");
         }
 
         self.window = Some(window);
