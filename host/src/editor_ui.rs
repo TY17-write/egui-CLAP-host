@@ -26,6 +26,14 @@ const PPQ_ZOOM_PER_PIXEL: f32 = 1.006;
 const ROW_H: f32 = 24.0;
 /// 段の高さの下限。左のトラック欄のボタンが潰れるので、これ以上は縮めない
 const MIN_ROW_H: f32 = 12.0;
+/// トラック欄2段目 (段の増減ボタン) の上端。1段目のボタンの下に置く。
+///
+/// トラックの高さは段数 × 段の高さで決まり、グリッドと揃える必要があるため
+/// 広げられない。**入らない高さのときは1段目に並べる** (隠れると段を増やす
+/// 手立てが無くなるため)。
+const LANE_BUTTON_ROW_Y: f32 = 22.0;
+/// 2段目の高さ。これが入らなければ1段目へ回す
+const LANE_BUTTON_ROW_H: f32 = 18.0;
 /// 段の高さの上限
 const MAX_ROW_H: f32 = 96.0;
 /// Ctrl+ホイール1ノッチあたりの倍率 (段の高さ)
@@ -274,6 +282,8 @@ pub struct EditorState {
     pending_scroll_x: Option<f32>,
     /// 一度だけ画面に入れたい再生ヘッドの位置 (停止したときに使う)
     scroll_to_quarters: Option<f64>,
+    /// 段の種別を設定する一覧を開いているトラック (閉じていれば None)
+    lane_config_track: Option<usize>,
     /// コピー・カットしたノートの控え (先頭を 0 とした相対位置)。
     ///
     /// **OS のクリップボードは使わない。** 使うと、ノートをコピーするたびに
@@ -326,10 +336,151 @@ impl Default for EditorState {
             middle_drag: None,
             pending_scroll_x: None,
             scroll_to_quarters: None,
+            lane_config_track: None,
             note_clipboard: Vec::new(),
         }
     }
 }
+
+/// 段ごとに「音符を置く段」か「CC を書く段」かを決める一覧。
+///
+/// 段は何段にも増えるので、左のトラック欄に並べず別窓にしている。
+///
+/// **CC 段では、ブロックの頭で値を送り、尻で 0 に戻す。** MIDI に「CC 無し」は
+/// 無いので、書いていない区間は 0 を送ることで表す (`CC_RELEASE`)。停止・シークでも
+/// 同じように戻すので、ペダルが踏みっぱなしで残ることはない。
+fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
+    let Some(track) = state.lane_config_track else {
+        return;
+    };
+    if track >= state.editor.track_count() {
+        state.lane_config_track = None;
+        return;
+    }
+
+    let mut open = true;
+    egui::Window::new(format!("CC 段 — {}", state.editor.tracks[track].name))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            // 追加・削除はここにも置く。トラック欄が狭いときは行に出ないので、
+            // ここが唯一の入口になる。
+            ui.horizontal(|ui| {
+                ui.label("CC 段:");
+                cc_lane_buttons(ui, state, track);
+            });
+            ui.separator();
+
+            let lanes = state.editor.lanes(track);
+            let first_cc = state.editor.tracks[track].normal_lanes();
+            if first_cc >= lanes {
+                ui.label("このトラックに CC 段はありません。");
+                ui.weak("上の「+」で最下段に追加できます。");
+                return;
+            }
+
+            ui.label("置いたブロックの長さだけ CC が効きます。");
+            ui.weak("値はベロシティをそのまま使います。書いていない区間は 0 です。");
+            ui.separator();
+
+            for lane in first_cc..lanes {
+                let current = state.editor.lane_cc(track, lane);
+                ui.horizontal(|ui| {
+                    ui.label(format!("段 {}", lane + 1));
+
+                    if let Some(number) = current {
+                        let mut number = number;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut number)
+                                    .range(0..=127)
+                                    .speed(0.25)
+                                    .prefix("CC "),
+                            )
+                            .changed()
+                        {
+                            state.history.record(EditGroup::Once);
+                            state.editor.tracks[track].set_lane_cc(lane, Some(number));
+                            state.dirty = true;
+                        }
+
+                        egui::ComboBox::from_id_salt(("cc_preset", track, lane))
+                            .selected_text(
+                                COMMON_CCS
+                                    .iter()
+                                    .find(|(n, _)| *n == number)
+                                    .map_or("その他", |(_, name)| name),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (n, name) in COMMON_CCS {
+                                    if ui
+                                        .selectable_label(n == number, format!("CC{n} {name}"))
+                                        .clicked()
+                                    {
+                                        state.history.record(EditGroup::Once);
+                                        state.editor.tracks[track].set_lane_cc(lane, Some(n));
+                                        state.dirty = true;
+                                    }
+                                }
+                            });
+
+                        // 0 が「効いていない」に当たらない CC は、書いていない区間が
+                        // 無音・左端・片寄りになってしまう。黙って壊れないよう断っておく。
+                        // (7 音量 / 8 バランス / 10 パン)
+                        if matches!(number, 7 | 8 | 10) {
+                            ui.colored_label(palette::YELLOW, "⚠ 0 が中立ではありません")
+                                .on_hover_text(
+                                    "書いていない区間が 0 になります。\
+                                     音量やパンでは無音・左端になってしまうので、\
+                                     区間を切らずに書いてください。",
+                                );
+                        }
+                    }
+                });
+            }
+        });
+
+    if !open {
+        state.lane_config_track = None;
+    }
+}
+
+/// クリップボードが空のときにだけ置く印。
+///
+/// 中身に意味は無く、**Ctrl+V を発火させるためだけ**のもの。他所へ貼られても
+/// 何が起きたか分かる文言にしてある。
+const CLIPBOARD_MARKER: &str = "clap-host-test: ノートをコピーしました";
+
+/// クリップボードにテキストが入っているか。
+///
+/// egui はクリップボードを読む口をアプリへ出していない (貼り付けはイベントで
+/// 届くだけ) ので、Win32 に直接聞く。`IsClipboardFormatAvailable` は
+/// **開かずに問い合わせられる**ので、他アプリのコピー操作と競合しない。
+///
+/// 見るのは Unicode テキストと ANSI テキストの2つ。egui-winit の裏にいる
+/// `arboard` が読むのがこれらなので、判定を揃えておく (画像だけが入っている
+/// ときは「テキスト無し」= Ctrl+V が発火しない、という実際の挙動に合う)。
+fn clipboard_has_text() -> bool {
+    use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
+    use windows_sys::Win32::System::Ole::{CF_TEXT, CF_UNICODETEXT};
+
+    // SAFETY: 引数を取るだけで、こちらの資源には触れない問い合わせ
+    unsafe {
+        IsClipboardFormatAvailable(CF_UNICODETEXT as u32) != 0
+            || IsClipboardFormatAvailable(CF_TEXT as u32) != 0
+    }
+}
+
+/// CC 段の設定でよく使う番号。名前を出しておかないと番号だけでは分からない。
+const COMMON_CCS: [(u8, &str); 6] = [
+    (1, "モジュレーション"),
+    (11, "エクスプレッション"),
+    (64, "ペダル (サステイン)"),
+    (66, "ソステヌート"),
+    (67, "ソフト"),
+    (7, "音量"),
+];
 
 impl EditorState {
     /// 実際に使うスナップ幅 (四分音符単位)。連符モードなら連符1音分。
@@ -962,6 +1113,7 @@ pub fn editor_panel(
         }
     });
     help_window(ui.ctx(), &mut state.show_help);
+    lane_config_window(ui.ctx(), state);
 
     shortcuts(ui, state, pos_quarters, playing, &mut commands);
 
@@ -1028,7 +1180,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("←", "選択の頭を、いちばん早いノートに揃える"),
                     ("→", "選択の尾を、いちばん遅い終端に揃える (音価を伸ばす)"),
                     ("Ctrl+C / X / V", "コピー / カット / 貼り付け (貼り付けは再生ヘッド位置)"),
-                    ("Ctrl+B", "貼り付け (Ctrl+V が効かないときに使う)"),
+                    ("Ctrl+B", "貼り付け (Ctrl+V と同じ。押しやすい方で)"),
                     ("Ctrl+Z / Ctrl+Y", "元に戻す / やり直し"),
                     ("Ctrl+S", "プロジェクトを保存 (保存先が未設定なら選ぶ)"),
                 ],
@@ -1256,11 +1408,11 @@ fn shortcuts(
             keys.transpose -= 1;
         }
 
-        // Ctrl+V の保険。egui-winit は Ctrl+V をキーとして通さず、**OS の
-        // クリップボードに文字列があるときだけ** `Event::Paste` を作る
-        // (`egui-winit` の `lib.rs`)。こちらはもうクリップボードへ書かないので、
-        // 起動直後などクリップボードが空のままだと Ctrl+V が無反応になる。
-        // 横取りされないこの組み合わせを、確実に効く口として用意しておく。
+        // Ctrl+V の代わりにも使える口。egui-winit は Ctrl+V をキーとして通さず、
+        // クリップボードにテキストがあるときしか `Event::Paste` を作らないので、
+        // **横取りされないこの組み合わせは常に届く**。
+        // (コピー時に空のクリップボードへ印を置いているので Ctrl+V も効くが、
+        //  クリップボードの状態に依存しない道を1本残しておく)
         keys.paste |= i.consume_key(Modifiers::COMMAND, Key::B);
 
         keys.save = i.consume_key(Modifiers::COMMAND, Key::S);
@@ -1304,10 +1456,18 @@ fn shortcuts(
         state.dirty = true;
     }
 
-    // 控えに取るだけで、OS のクリップボードには書かない
+    // ノートの中身は控えに取るだけで、OS のクリップボードには書かない。
+    //
+    // **ただし空のときだけ印を書く。** egui-winit は Ctrl+V をキーとして通さず、
+    // `Event::Paste` を作るのは**クリップボードにテキストがあるときだけ**なので、
+    // 空のままだと Ctrl+V が何も起こさない (`clipboard_has_text` を参照)。
+    // 空のときに限れば、書いてもユーザーの持ち物は壊さない。
     if copy || cut {
         if let Some(notes) = state.copy_selection() {
             state.note_clipboard = notes;
+            if !clipboard_has_text() {
+                ui.ctx().copy_text(CLIPBOARD_MARKER.to_string());
+            }
         }
     }
 
@@ -1772,6 +1932,23 @@ fn grid(
         }
     }
 
+    // ---- CC 段の地色 ----
+    // 音符段と見分けが付かないと、音高のつもりで置いた音が CC になってしまう。
+    // トラックの地色より上に敷いて、どちらのトラックでも同じ色に見えるようにする。
+    for (track, offset) in row_offsets.iter().enumerate() {
+        for lane in 0..state.editor.lanes(track) {
+            if state.editor.lane_cc(track, lane).is_none() {
+                continue;
+            }
+            let top = origin.y + RULER_H + (*offset + lane) as f32 * row_h;
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(origin.x, top), vec2(size.x, row_h)),
+                CornerRadius::ZERO,
+                palette::GREEN.gamma_multiply(0.14),
+            );
+        }
+    }
+
     // ---- 段の区切り線 ----
     let lane_stroke = Stroke::new(0.5, palette::BG_SELECT.gamma_multiply(0.7));
     for row in 0..=display_rows {
@@ -1845,7 +2022,12 @@ fn grid(
     // ---- ノート ----
     for (idx, note) in state.editor.notes.iter().enumerate() {
         let rect = note_rect(origin, note_row(&row_offsets, note), note, ppq, row_h);
-        let fill = note_fill(note, state.editor.scale);
+        // CC ブロックは音高で色を変えても意味が無い。音符と取り違えないよう、
+        // 段の地色と同じ緑で塗り分ける (ベロシティの塗り高さはそのまま使える)。
+        let fill = match state.editor.lane_cc(note.track, note.lane) {
+            Some(_) => palette::GREEN,
+            None => note_fill(note, state.editor.scale),
+        };
         // ベロシティは「下からの塗りの高さ」で表す。明度やアルファを直接下げると
         // ダークな背景で弱いノートが見えなくなるため、色相はそのままに
         // 満たない部分をゴーストとして残す (輪郭と音高の色は常に見える)。
@@ -1889,10 +2071,15 @@ fn grid(
             } else {
                 palette::FG
             };
+            // CC 段では音名に意味が無いので、送る値のほうを出す
+            let label = match state.editor.lane_cc(note.track, note.lane) {
+                Some(number) => format!("CC{number}={}", note.velocity.min(127)),
+                None => note.name(),
+            };
             painter.text(
                 rect.left_center() + vec2(4.0, 0.0),
                 Align2::LEFT_CENTER,
-                note.name(),
+                label,
                 FontId::proportional(NOTE_LABEL_SIZE),
                 color,
             );
@@ -2092,6 +2279,7 @@ fn grid(
                     let (dx, d_row) = move_delta(
                         &drag.targets,
                         &row_offsets,
+                        &state.editor,
                         content.x - drag.origin.x,
                         (content.y - drag.origin.y).round() as i32,
                         snap,
@@ -2395,6 +2583,7 @@ fn edge_scroll_delta(visible: Rect, pointer: Pos2, vertical: bool) -> egui::Vec2
 fn move_delta(
     targets: &[(usize, Note)],
     row_offsets: &[usize],
+    editor: &MidiEditor,
     dx_raw: f32,
     d_row_raw: i32,
     snap: f32,
@@ -2421,10 +2610,39 @@ fn move_delta(
         .max()
         .unwrap_or(0) as i32;
 
-    (
-        dx.max(-min_start),
-        d_row_raw.clamp(-min_row, rows as i32 - 1 - max_row),
-    )
+    // まず画面の範囲へ収め、そのうえで段の種別をまたぐぶんを削る。
+    // 0 へ向かって1段ずつ戻すので、**行けるところまでは行く**
+    // (CC 段が下にあるトラックでも、その手前までは動かせる)。
+    let mut d_row = d_row_raw.clamp(-min_row, rows as i32 - 1 - max_row);
+    while d_row != 0 && !keeps_lane_kind(targets, row_offsets, editor, d_row) {
+        d_row -= d_row.signum();
+    }
+
+    (dx.max(-min_start), d_row)
+}
+
+/// その移動量で、全員が自分と同じ種別の段に着地するか。
+///
+/// **CC 段のノートは段から動かさない。** CC は段に割り当てた番号で意味が決まるので、
+/// 別の段へ移すと黙って別の CC になってしまう。逆に、音符が CC 段へ入ると
+/// 音として鳴らずに CC を送ってしまう。どちらも見た目では気付きにくいので、
+/// そもそも動かせないようにする (横方向は自由)。
+fn keeps_lane_kind(
+    targets: &[(usize, Note)],
+    row_offsets: &[usize],
+    editor: &MidiEditor,
+    d_row: i32,
+) -> bool {
+    targets.iter().all(|(_, note)| {
+        let row = (note_row(row_offsets, note) as i32 + d_row).max(0) as usize;
+        let (track, lane) = row_to_track_lane(row_offsets, editor, row);
+        match editor.lane_cc(note.track, note.lane) {
+            // CC 段のノートは、その段のまま以外を認めない
+            Some(_) => track == note.track && lane == note.lane,
+            // 音符は CC 段へ入れない
+            None => editor.lane_cc(track, lane).is_none(),
+        }
+    })
 }
 
 /// 再生ヘッドの移動先 (四分音符単位) を求める。
@@ -2619,8 +2837,14 @@ fn track_gutter_content(
             "スウィングは N/4 拍子のときだけ使えます"
         });
 
+        // 狭いときは名前の枠を詰める (右のボタンを見切れさせないため)
+        let name_w = if rect.height() >= LANE_BUTTON_ROW_Y + LANE_BUTTON_ROW_H {
+            44.0
+        } else {
+            32.0
+        };
         let name = state.editor.tracks[track].name.clone();
-        content.allocate_ui(vec2(44.0, ROW_H - 4.0), |ui| {
+        content.allocate_ui(vec2(name_w, ROW_H - 4.0), |ui| {
             ui.add(
                 egui::Label::new(egui::RichText::new(name).size(11.0).color(palette::FG))
                     .truncate(),
@@ -2646,32 +2870,130 @@ fn track_gutter_content(
             None => "音源 (.clap / .vst3) を読み込む".to_string(),
         });
 
-        if content
-            .small_button("+")
-            .on_hover_text("このトラックに段を追加")
-            .clicked()
-        {
-            state.history.record(EditGroup::Once);
-            state.editor.add_lane(track);
-        }
-
-        // ノートのある段と、最後の1段は消せない
-        let last_lane = lanes.saturating_sub(1);
-        let removable = lanes > 1
-            && !state
-                .editor
-                .notes
-                .iter()
-                .any(|note| note.track == track && note.lane == last_lane);
-        let response = content.add_enabled(removable, egui::Button::new("−").small());
-        if response.clicked() {
-            state.history.record(EditGroup::Once);
-            state.editor.remove_last_lane(track);
-        }
-        if !removable {
-            response.on_hover_text("最後の段にノートがある (または段が1つ) ので消せません");
+        // 段の増減は2段目へ回す。1行に詰めると 200px に収まらないうえ、
+        // **通常段と CC 段で別のボタンが要る** (最下段は CC 段のことがあるので、
+        // 1組では「消したい段と違うものが消える」)。
+        //
+        // ただし2段目が入らない高さのときは、同じ行に続けて置く。
+        // **隠れると段を増やす手立てが無くなる**ので、窮屈なほうがまだよい
+        // (段が1つのトラックは既定でこの高さになる)。
+        if rect.height() >= LANE_BUTTON_ROW_Y + LANE_BUTTON_ROW_H {
+            drop(content);
+            let mut second = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(Rect::from_min_max(
+                        Pos2::new(rect.left() + 6.0, rect.top() + LANE_BUTTON_ROW_Y),
+                        rect.right_bottom() - vec2(6.0, pad_y),
+                    ))
+                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
+            );
+            second.set_clip_rect(rect);
+            second.spacing_mut().item_spacing.x = 2.0;
+            lane_buttons(&mut second, state, track, false);
+        } else {
+            lane_buttons(&mut content, state, track, true);
         }
     }
+}
+
+/// 段の増減 (通常段と CC 段で別々)。トラック欄の2段目に置く。
+///
+/// `compact` のときは、同じ行に続けて置くので見出しと区切りを省く。
+fn lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize, compact: bool) {
+    let lanes = state.editor.lanes(track);
+    let normal = state.editor.tracks[track].normal_lanes();
+
+    // ---- 通常段 ----
+    if !compact {
+        ui.label(egui::RichText::new("段").size(10.0).color(palette::FG_DIM));
+    }
+    if ui
+        .small_button("+")
+        .on_hover_text("段を追加 (CC 段より上に入ります)")
+        .clicked()
+    {
+        state.history.record(EditGroup::Once);
+        state.editor.add_lane(track);
+    }
+
+    // 通常段の最下段。ノートがあるとき、通常段が1つのときは消せない
+    let removable = normal > 1
+        && !state
+            .editor
+            .notes
+            .iter()
+            .any(|note| note.track == track && note.lane + 1 == normal);
+    let response = ui.add_enabled(removable, egui::Button::new("−").small());
+    if response.clicked() {
+        state.history.record(EditGroup::Once);
+        state.editor.remove_last_normal_lane(track);
+    }
+    response.on_hover_text(if removable {
+        "いちばん下の段を削除 (CC 段には触れません)"
+    } else {
+        "その段にノートがある (または段が1つ) ので消せません"
+    });
+
+    if !compact {
+        ui.separator();
+    }
+
+    // ---- CC 段 ----
+    let has_cc = normal < lanes;
+    let label = egui::RichText::new("CC").size(10.0).color(if has_cc {
+        palette::GREEN
+    } else {
+        palette::FG_DIM
+    });
+    let response = ui.add(egui::Button::new(label).small());
+    if response.clicked() {
+        state.lane_config_track = (state.lane_config_track != Some(track)).then_some(track);
+    }
+    response.on_hover_text("CC 段の番号の一覧を開く");
+
+    // 狭いときは CC の増減を行に出さない。**押せるが見切れる**より、
+    // 一覧 (上の「CC」ボタン) にまとめたほうが扱える。一覧側にも同じ操作がある。
+    if !compact {
+        cc_lane_buttons(ui, state, track);
+    }
+}
+
+/// CC 段の追加・削除。トラック欄の2段目と、CC 段の一覧の両方から使う。
+fn cc_lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
+    let lanes = state.editor.lanes(track);
+    let has_cc = state.editor.tracks[track].normal_lanes() < lanes;
+
+    if ui
+        .small_button("+")
+        .on_hover_text("CC 段を最下段に追加 (ペダル CC64。番号は一覧で変えられます)")
+        .clicked()
+    {
+        state.history.record(EditGroup::Once);
+        // 既定はペダル。いちばん使ううえ、0 が「離す」で自然に効く
+        state.editor.add_cc_lane(track, 64);
+        state.lane_config_track = Some(track);
+        state.dirty = true;
+    }
+
+    let removable = has_cc
+        && !state
+            .editor
+            .notes
+            .iter()
+            .any(|note| note.track == track && note.lane + 1 == lanes);
+    let response = ui.add_enabled(removable, egui::Button::new("−").small());
+    if response.clicked() {
+        state.history.record(EditGroup::Once);
+        state.editor.remove_last_cc_lane(track);
+        state.dirty = true;
+    }
+    response.on_hover_text(if removable {
+        "いちばん下の CC 段を削除"
+    } else if has_cc {
+        "その CC 段にブロックがあるので消せません"
+    } else {
+        "CC 段がありません"
+    });
 }
 
 /// 各トラックの段が画面の何行目から始まるかを求める。
@@ -2810,6 +3132,13 @@ mod tests {
     /// テスト用: トラック1本 (段は十分にある) の行オフセット
     fn single_track_rows() -> Vec<usize> {
         vec![0]
+    }
+
+    /// 段が16ある1トラックだけのエディタ (全部が音符段)
+    fn single_track_editor() -> MidiEditor {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 16;
+        editor
     }
 
     /// いちばん低い音は寒色、いちばん高い音は赤い
@@ -2988,9 +3317,79 @@ mod tests {
     fn bulk_move_keeps_relative_positions() {
         // 0.1 だけずれた位置にあるノートも、掴んだノートと同じ移動量で動く
         let targets = vec![(0, placed(1.0, 2)), (1, placed(1.1, 3))];
-        let (dx, d_lane) = move_delta(&targets, &single_track_rows(), 0.6, 1, 0.25, 16);
+        let (dx, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.6, 1, 0.25, 16);
         assert_eq!(dx, 0.5, "掴んだノートが 1.5 に来るようスナップされること");
         assert_eq!(d_lane, 1);
+    }
+
+    /// CC 段のブロックをコピーして貼り付けられること。
+    ///
+    /// 貼り付け先は元と同じ段でなければならない (別の段に落ちると、
+    /// 黙って別の CC になるか、音符として鳴ってしまう)。
+    #[test]
+    fn cc_blocks_can_be_copied_and_pasted() {
+        let mut state = EditorState::default();
+        state.editor.tracks[0].lanes = 1;
+        state.editor.add_cc_lane(0, 64); // 段1 が CC
+        state.editor.notes = vec![Note {
+            lane: 1,
+            velocity: 100,
+            ..placed(1.0, 1)
+        }];
+        state.select_many(vec![0]);
+
+        let copied = state.copy_selection().expect("コピーできること");
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].lane, 1, "段を保つこと");
+
+        assert!(state.paste_notes(&copied, 4.0));
+        assert_eq!(state.editor.notes.len(), 2);
+        let pasted = state.editor.notes[1];
+        assert_eq!(pasted.start_tick, 4.0);
+        assert_eq!(pasted.lane, 1, "CC 段に貼られること");
+        assert_eq!(pasted.velocity, 100, "CC 値を保つこと");
+        assert_eq!(
+            state.editor.lane_cc(pasted.track, pasted.lane),
+            Some(64),
+            "貼り付け先が CC 段のままであること"
+        );
+    }
+
+    /// 段が16の1トラックで、下2段 (14,15) を CC 段にしたエディタ
+    fn editor_with_cc_lanes() -> MidiEditor {
+        let mut editor = single_track_editor();
+        editor.tracks[0].set_lane_cc(14, Some(64));
+        editor.tracks[0].set_lane_cc(15, Some(1));
+        editor
+    }
+
+    /// 音符は CC 段へ入れないこと。**手前までは動ける。**
+    #[test]
+    fn notes_stop_above_the_cc_lanes() {
+        let editor = editor_with_cc_lanes();
+        let targets = vec![(0, placed(1.0, 10))];
+
+        // 下へ大きく動かしても、CC 段の1つ上 (13段目) で止まる
+        let (_, d_lane) = move_delta(&targets, &single_track_rows(), &editor, 0.0, 5, 0.25, 16);
+        assert_eq!(d_lane, 3, "13段目まで (10 + 3) しか下がらないこと");
+
+        // 上方向は普通に動ける
+        let (_, d_lane) = move_delta(&targets, &single_track_rows(), &editor, 0.0, -4, 0.25, 16);
+        assert_eq!(d_lane, -4);
+    }
+
+    /// CC 段のノートは、その段から動かせないこと (横だけ動く)
+    #[test]
+    fn cc_notes_cannot_leave_their_lane() {
+        let editor = editor_with_cc_lanes();
+        let targets = vec![(0, placed(1.0, 14))];
+
+        for requested in [-1, 1, -5, 5] {
+            let (dx, d_lane) =
+                move_delta(&targets, &single_track_rows(), &editor, 0.5, requested, 0.25, 16);
+            assert_eq!(d_lane, 0, "段を移動できないこと (要求 {requested})");
+            assert_eq!(dx, 0.5, "横方向は動かせること");
+        }
     }
 
     /// 一括移動: 選択の端が範囲外に出ないよう移動量が抑えられること
@@ -2998,13 +3397,13 @@ mod tests {
     fn bulk_move_clamps_to_bounds() {
         let targets = vec![(0, placed(1.0, 1)), (1, placed(0.5, 15))];
         // 左へ大きく動かしても、先頭のノートが 0 未満にならない分しか動かない
-        let (dx, _) = move_delta(&targets, &single_track_rows(), -5.0, 0, 0.25, 16);
+        let (dx, _) = move_delta(&targets, &single_track_rows(), &single_track_editor(), -5.0, 0, 0.25, 16);
         assert_eq!(dx, -0.5);
         // 下へ動かしても、最下段のノートが 15 段目に留まる
-        let (_, d_lane) = move_delta(&targets, &single_track_rows(), 0.0, 5, 0.25, 16);
+        let (_, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.0, 5, 0.25, 16);
         assert_eq!(d_lane, 0);
         // 上へ動かすときは最上段のノートが 0 段目で止まる
-        let (_, d_lane) = move_delta(&targets, &single_track_rows(), 0.0, -5, 0.25, 16);
+        let (_, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.0, -5, 0.25, 16);
         assert_eq!(d_lane, -1);
     }
 

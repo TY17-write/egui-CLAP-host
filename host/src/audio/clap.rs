@@ -10,6 +10,7 @@ use crate::audio::config::FullAudioConfig;
 use crate::audio::events::{BlockEvent, BlockEvents};
 use crate::audio::ProcessError;
 use crate::host::MiniHost;
+use crate::sequencer::CC_RELEASE;
 use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNotePorts};
 use clack_host::events::event_types::{
     MidiEvent, NoteChokeEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent,
@@ -23,21 +24,27 @@ pub struct ClapProcessor {
     buffers: HostAudioBuffers,
     /// 中立のイベントを移す先。毎ブロック clear して使い回す。
     native: EventBuffer,
-    /// (ノートポートのインデックス, MIDI ダイアレクト優先か)。ノート入力がなければ None。
-    note_port: Option<(u16, bool)>,
+    /// 使うノート入力ポート。ノート入力が無ければ None。
+    note_port: Option<NoteInput>,
+    /// 効かせている CC。ビット位置が CC 番号 (0〜127)。
+    ///
+    /// choke で解除値に戻すために覚えておく。これが無いと、ペダルを踏んだまま
+    /// 停止したときに踏みっぱなしで残る。128ビットなので確保は起きない。
+    active_ccs: u128,
 }
 
 impl ClapProcessor {
     pub fn new(
         audio_processor: StartedPluginAudioProcessor<MiniHost>,
         config: FullAudioConfig,
-        note_port: Option<(u16, bool)>,
+        note_port: Option<NoteInput>,
     ) -> Self {
         Self {
             audio_processor,
             buffers: HostAudioBuffers::from_config(config),
             native: EventBuffer::with_capacity(128),
             note_port,
+            active_ccs: 0,
         }
     }
 
@@ -86,6 +93,11 @@ impl ClapProcessor {
                 } => self.push_note_on(offset, key, velocity),
                 BlockEvent::NoteOff { offset, key } => self.push_note_off(offset, key),
                 BlockEvent::Choke { offset } => self.push_choke(offset),
+                BlockEvent::Cc {
+                    offset,
+                    number,
+                    value,
+                } => self.push_cc(offset, number, value),
                 BlockEvent::Param { offset, id, value } => {
                     // 中立側は素の u32。CLAP の ID に載らない値は捨てる
                     if let Some(id) = ClapId::from_raw(id) {
@@ -102,7 +114,12 @@ impl ClapProcessor {
     }
 
     fn push_note_on(&mut self, offset: u32, key: u8, velocity: f64) {
-        let Some((port, prefers_midi)) = self.note_port else {
+        let Some(NoteInput {
+            index: port,
+            prefers_midi,
+            ..
+        }) = self.note_port
+        else {
             return;
         };
         if prefers_midi {
@@ -124,7 +141,12 @@ impl ClapProcessor {
     }
 
     fn push_note_off(&mut self, offset: u32, key: u8) {
-        let Some((port, prefers_midi)) = self.note_port else {
+        let Some(NoteInput {
+            index: port,
+            prefers_midi,
+            ..
+        }) = self.note_port
+        else {
             return;
         };
         if prefers_midi {
@@ -141,8 +163,16 @@ impl ClapProcessor {
 
     /// CLAP には NoteChoke があるので1つで済む。
     /// MIDI ダイアレクトのプラグインには CC 123 (All Notes Off) を送る。
+    ///
+    /// **効かせた CC も解除する。** 音符を止めてもペダルは踏まれたままなので、
+    /// これが無いと停止・シークのあとも踏みっぱなしで残る。
     fn push_choke(&mut self, offset: u32) {
-        let Some((port, prefers_midi)) = self.note_port else {
+        let Some(NoteInput {
+            index: port,
+            prefers_midi,
+            ..
+        }) = self.note_port
+        else {
             return;
         };
         if prefers_midi {
@@ -154,12 +184,59 @@ impl ClapProcessor {
                 &NoteChokeEvent::new(offset, Pckn::match_all()).with_flags(EventFlags::IS_LIVE),
             );
         }
+
+        let mut remaining = self.active_ccs;
+        while remaining != 0 {
+            let number = remaining.trailing_zeros() as u8;
+            remaining &= remaining - 1; // 最下位の立っているビットを落とす
+            self.push_cc(offset, number, CC_RELEASE);
+        }
+    }
+
+    /// CC を生 MIDI で送る。
+    ///
+    /// CLAP に CC のイベントは無いので、MIDI を受け取れるポートでしか送れない。
+    /// 送れないときは黙って捨てる (段の見た目で分かるようにしてある)。
+    fn push_cc(&mut self, offset: u32, number: u8, value: u8) {
+        let Some(NoteInput {
+            index: port,
+            supports_midi: true,
+            ..
+        }) = self.note_port
+        else {
+            return;
+        };
+        let number = number.min(127);
+        self.native.push(
+            &MidiEvent::new(offset, port, [0xB0, number, value.min(127)])
+                .with_flags(EventFlags::IS_LIVE),
+        );
+
+        // 解除値まで戻したものは「効いていない」ので覚えておく必要がない
+        if value == CC_RELEASE {
+            self.active_ccs &= !(1u128 << number);
+        } else {
+            self.active_ccs |= 1u128 << number;
+        }
     }
 }
 
-/// プラグインのメインノート入力ポートを探す。
-/// 戻り値は (ポートインデックス, MIDI ダイアレクトを優先するか)。
-pub fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<(u16, bool)> {
+/// 使うノート入力ポートと、そこで通じる表し方。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteInput {
+    pub index: u16,
+    /// CLAP の音符イベントを解さないので、音符も生 MIDI で送る
+    pub prefers_midi: bool,
+    /// 生 MIDI を受け取れる。
+    ///
+    /// **CC はこれが真のときしか送れない。** CLAP には CC に当たる
+    /// イベントが無く、生 MIDI で送るしかないため。CLAP のダイアレクト
+    /// しか持たないポートでは CC 段が効かない。
+    pub supports_midi: bool,
+}
+
+/// プラグインのメインノート入力ポートを探す
+pub fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<NoteInput> {
     let handle = instance.plugin_handle();
     let plugin_note_ports = handle.get_extension::<PluginNotePorts>()?;
 
@@ -179,8 +256,11 @@ pub fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<(u
             continue;
         }
 
-        let prefers_midi = !port_info.supported_dialects.intersects(NoteDialects::CLAP);
-        return Some((i as u16, prefers_midi));
+        return Some(NoteInput {
+            index: i as u16,
+            prefers_midi: !port_info.supported_dialects.intersects(NoteDialects::CLAP),
+            supports_midi: port_info.supported_dialects.intersects(NoteDialects::MIDI),
+        });
     }
 
     None

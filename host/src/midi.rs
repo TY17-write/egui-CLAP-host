@@ -4,7 +4,7 @@
 //! ここで相互変換する。段 (lane) は MIDI に存在しない概念なので、読み込み時は
 //! 重ならないように機械的に割り振る。
 
-use crate::sequencer::{MidiEditor, Note, ScaleMode};
+use crate::sequencer::{MidiEditor, Note, ScaleMode, CC_RELEASE};
 #[cfg(test)]
 use crate::sequencer::TrackInfo;
 use midly::num::{u4, u7, u15, u24, u28};
@@ -93,18 +93,50 @@ pub fn to_bytes(editor: &MidiEditor) -> Result<Vec<u8>, String> {
         let mut events: Vec<(u32, u8, TrackEventKind)> = Vec::new();
         let channel = u4::from((lane % 16) as u8);
 
+        // CC 段は音符ではなくコントロールチェンジとして書き出す
+        let lane_cc = editor.lane_cc(track_index, lane);
+
         for note in performed
             .iter()
             .filter(|note| note.track == track_index && note.lane == lane)
         {
-            let Some(key) = note.key(scale) else {
-                continue; // MIDI の範囲外 (0..=127) は書き出せない
-            };
             if note.duration <= 0.0 {
                 continue;
             }
             let start = (note.start_tick.max(0.0) * tpq).round() as u32;
             let end = ((note.end_tick().max(0.0) * tpq).round() as u32).max(start + 1);
+
+            // 書いた区間だけ効かせる。頭で値、尻で解除値 (再生時と同じ)。
+            if let Some(number) = lane_cc {
+                let controller = u7::from(number.min(127));
+                events.push((
+                    start,
+                    1,
+                    TrackEventKind::Midi {
+                        channel,
+                        message: MidiMessage::Controller {
+                            controller,
+                            value: u7::from(note.velocity.min(127)),
+                        },
+                    },
+                ));
+                events.push((
+                    end,
+                    0,
+                    TrackEventKind::Midi {
+                        channel,
+                        message: MidiMessage::Controller {
+                            controller,
+                            value: u7::from(CC_RELEASE),
+                        },
+                    },
+                ));
+                continue;
+            }
+
+            let Some(key) = note.key(scale) else {
+                continue; // MIDI の範囲外 (0..=127) は書き出せない
+            };
             let key = u7::from(key.min(127));
             let velocity = u7::from(note.velocity.clamp(1, 127));
 
@@ -131,8 +163,10 @@ pub fn to_bytes(editor: &MidiEditor) -> Result<Vec<u8>, String> {
 
         // 同時刻ではノートオフを先に (順序フィールドが小さい方が先)
         events.sort_by_key(|(tick, order, _)| (*tick, *order));
+        // 続くブロックの手前で解除を挟まない (踏み直しになるため。再生側と同じ扱い)
+        suppress_redundant_cc_releases(&mut events);
 
-        let mut track: Track = Vec::with_capacity(events.len() + 2);
+        let mut track: Track = Vec::with_capacity(events.len() + 3);
         track.push(TrackEvent {
             delta: u28::from(0),
             kind: TrackEventKind::Meta(MetaMessage::TrackName(name.as_bytes())),
@@ -165,6 +199,43 @@ pub fn to_bytes(editor: &MidiEditor) -> Result<Vec<u8>, String> {
     smf.write_std(&mut bytes)
         .map_err(|e| format!("MIDI の書き出しに失敗しました: {e}"))?;
     Ok(bytes)
+}
+
+/// 同じ位置で「解除 → 次のブロックの値」と並ぶ解除を取り除く。
+///
+/// ブロックが隙間なく続くとき、解除の 0 をそのまま書くと**一瞬離して踏み直す**
+/// 形になる。再生側 (`sequencer`) と同じ扱いに揃えてある。
+///
+/// 並び替え済みであること (同時刻では解除が先に来る) が前提。
+fn suppress_redundant_cc_releases(events: &mut Vec<(u32, u8, TrackEventKind)>) {
+    let controller_of = |kind: &TrackEventKind| match kind {
+        TrackEventKind::Midi {
+            message: MidiMessage::Controller { controller, value },
+            ..
+        } => Some((controller.as_int(), value.as_int())),
+        _ => None,
+    };
+
+    let mut remove = vec![false; events.len()];
+    for index in 0..events.len() {
+        let Some((number, value)) = controller_of(&events[index].2) else {
+            continue;
+        };
+        if value != CC_RELEASE {
+            continue;
+        }
+        for later in events[index + 1..].iter() {
+            if later.0 != events[index].0 {
+                break;
+            }
+            if controller_of(&later.2).is_some_and(|(n, _)| n == number) {
+                remove[index] = true;
+                break;
+            }
+        }
+    }
+    let mut keep = remove.iter().map(|r| !r);
+    events.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// SMF のバイト列を読み込む。段は重ならないように割り振る。
@@ -376,6 +447,48 @@ mod tests {
         let swung = from_bytes(&to_bytes(&editor).unwrap(), ScaleMode::Equal12).unwrap();
         assert!(swung.notes[0].start_tick > 0.0, "拍頭が遅れること");
         assert!(swung.notes[1].start_tick > 0.5, "裏拍が跳ねること");
+    }
+
+    /// CC 段は音符ではなく、頭で値・尻で解除値のコントロールチェンジになること。
+    ///
+    /// **「書かれていない部分は CC 無し」の書き出し側。** ここが抜けると、
+    /// 書き出した MIDI でペダルが踏みっぱなしになる。
+    #[test]
+    fn cc_lane_exports_value_and_release() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].set_lane_cc(0, Some(64));
+        editor.notes = vec![note(0.0, 1.0, 0, 4, 100)];
+
+        let bytes = to_bytes(&editor).unwrap();
+        let smf = Smf::parse(&bytes).expect("解析できること");
+        let mut seen: Vec<(u32, u8, u8)> = Vec::new();
+        for track in &smf.tracks {
+            let mut tick = 0u32;
+            for event in track {
+                tick += event.delta.as_int();
+                if let TrackEventKind::Midi {
+                    message: MidiMessage::Controller { controller, value },
+                    ..
+                } = event.kind
+                {
+                    seen.push((tick, controller.as_int(), value.as_int()));
+                }
+            }
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (0, 64, 100),
+                (TICKS_PER_QUARTER as u32, 64, CC_RELEASE),
+            ],
+            "頭で値、尻で解除値が並ぶこと"
+        );
+
+        // 音符としては1つも出ていないこと (CC 段なので当然だが、取り違えると
+        // 音源が鳴ってしまうので明示的に確かめる)
+        let notes_back = from_bytes(&to_bytes(&editor).unwrap(), ScaleMode::Equal12).unwrap();
+        assert!(notes_back.notes.is_empty(), "CC 段から音符は出ないこと");
     }
 
     fn on_track(mut note: Note, track: usize, lane: usize) -> Note {

@@ -135,6 +135,12 @@ pub struct TrackInfo {
     /// 伴奏は正確な拍のまま、ソロだけ跳ねさせる、という使い方をするので
     /// トラックごとに持つ。
     pub swing: bool,
+    /// 段ごとの CC 番号。`None` の段は通常の音符段。
+    ///
+    /// **`lanes` より短くてよい。** 足りない分は音符段として扱うので、段を増やした
+    /// ときに長さを合わせ忘れても壊れない (`lanes` と二重に管理しないための作り)。
+    /// 読み書きは [`lane_cc`](Self::lane_cc) / [`set_lane_cc`](Self::set_lane_cc) を使う。
+    pub lane_ccs: Vec<Option<u8>>,
 }
 
 impl TrackInfo {
@@ -145,6 +151,42 @@ impl TrackInfo {
             muted: false,
             soloed: false,
             swing: false,
+            lane_ccs: Vec::new(),
+        }
+    }
+
+    /// この段に割り当てられた CC 番号。`None` なら音符段。
+    pub fn lane_cc(&self, lane: usize) -> Option<u8> {
+        self.lane_ccs.get(lane).copied().flatten()
+    }
+
+    /// 通常 (音符) 段の数。**CC 段はこれより下に並ぶ。**
+    ///
+    /// 段の並びは「通常段が上、CC 段が下」で揃えてある。境目がここなので、
+    /// 通常段を足すときの挿し込み位置にも、ノートを動かせる範囲の判定にも使う。
+    pub fn normal_lanes(&self) -> usize {
+        let cc_count = self
+            .lane_ccs
+            .iter()
+            .take(self.lanes)
+            .filter(|cc| cc.is_some())
+            .count();
+        self.lanes.saturating_sub(cc_count)
+    }
+
+    /// 段を CC 段にする (`None` で音符段に戻す)。
+    ///
+    /// 末尾が `None` だけになったら詰めておく。保存したときに意味のない
+    /// `None` が並ばないようにするため。
+    pub fn set_lane_cc(&mut self, lane: usize, cc: Option<u8>) {
+        if cc.is_some() && self.lane_ccs.len() <= lane {
+            self.lane_ccs.resize(lane + 1, None);
+        }
+        if let Some(slot) = self.lane_ccs.get_mut(lane) {
+            *slot = cc;
+        }
+        while self.lane_ccs.last().is_some_and(Option::is_none) {
+            self.lane_ccs.pop();
         }
     }
 }
@@ -238,24 +280,82 @@ impl MidiEditor {
     }
 
     /// 指定トラックの段を1つ増やす
+    /// 通常の段を追加する。
+    ///
+    /// **CC 段より上に入れる。** トラック内は「通常段が上、CC 段が下」で揃えてあり、
+    /// ここで末尾に足すと CC 段の下に潜り込んでしまう。挿し込んだ位置より下の
+    /// 段は1つずつ繰り下がるので、そこに乗っているノートの段番号も直す。
     pub fn add_lane(&mut self, track: usize) -> bool {
-        match self.tracks.get_mut(track) {
-            Some(info) => {
-                info.lanes += 1;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// 指定トラックの最後の段を削除する。
-    /// その段にノートがあるときと、段が1つしかないときは削除しない。
-    pub fn remove_last_lane(&mut self, track: usize) -> bool {
         let Some(info) = self.tracks.get_mut(track) else {
             return false;
         };
-        if info.lanes <= 1 {
+        let at = info.normal_lanes();
+        info.lanes += 1;
+        info.lane_ccs.insert(at.min(info.lane_ccs.len()), None);
+        for note in &mut self.notes {
+            if note.track == track && note.lane >= at {
+                note.lane += 1;
+            }
+        }
+        true
+    }
+
+    /// CC 段を末尾に追加する (トラック内でいちばん下)
+    pub fn add_cc_lane(&mut self, track: usize, cc: u8) -> bool {
+        let Some(info) = self.tracks.get_mut(track) else {
             return false;
+        };
+        let at = info.lanes;
+        info.lanes += 1;
+        info.set_lane_cc(at, Some(cc));
+        true
+    }
+
+    /// 通常段のいちばん下を削除する。
+    ///
+    /// **CC 段には手を出さない。** 最下段は CC 段のことがあるので、単に末尾を
+    /// 消すと消したい段と違うものが消える。削った位置より下 (= CC 段) は
+    /// 繰り上がるので、そこに乗っているブロックの段番号も直す。
+    ///
+    /// その段にノートがあるとき、通常段が1つしかないときは削除しない。
+    pub fn remove_last_normal_lane(&mut self, track: usize) -> bool {
+        let Some(info) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        let normal = info.normal_lanes();
+        if normal <= 1 {
+            return false;
+        }
+        let last = normal - 1;
+        if self
+            .notes
+            .iter()
+            .any(|note| note.track == track && note.lane == last)
+        {
+            return false;
+        }
+
+        let info = &mut self.tracks[track];
+        info.lanes -= 1;
+        if last < info.lane_ccs.len() {
+            info.lane_ccs.remove(last);
+        }
+        for note in &mut self.notes {
+            if note.track == track && note.lane > last {
+                note.lane -= 1;
+            }
+        }
+        true
+    }
+
+    /// CC 段のいちばん下 (= トラックの最下段) を削除する。
+    /// CC 段が無いとき、その段にブロックがあるときは削除しない。
+    pub fn remove_last_cc_lane(&mut self, track: usize) -> bool {
+        let Some(info) = self.tracks.get(track) else {
+            return false;
+        };
+        if info.normal_lanes() >= info.lanes {
+            return false; // CC 段が無い
         }
         let last = info.lanes - 1;
         if self
@@ -265,7 +365,11 @@ impl MidiEditor {
         {
             return false;
         }
+
+        let info = &mut self.tracks[track];
         info.lanes -= 1;
+        info.set_lane_cc(last, None);
+        info.lane_ccs.truncate(info.lanes);
         true
     }
 
@@ -386,45 +490,139 @@ impl MidiEditor {
             if only_track.is_some_and(|track| note.track != track) {
                 continue;
             }
-            let Some(key) = note.key(self.scale) else {
-                continue;
-            };
             if note.duration <= 0.0 {
                 continue;
             }
             let start = (note.start_tick.max(0.0) as f64 * spq) as u64;
             let end = (note.end_tick().max(0.0) as f64 * spq) as u64;
+
+            // CC 段のブロックは、頭で値・尻で解除値。
+            // 隣のブロックが同じ位置から始まるときの解除の抑制は下でまとめて行う。
+            if let Some(number) = self.lane_cc(note.track, note.lane) {
+                events.push(SeqEvent {
+                    sample_time: start,
+                    kind: SeqEventKind::Cc {
+                        number,
+                        value: note.velocity.min(127),
+                    },
+                });
+                events.push(SeqEvent {
+                    sample_time: end.max(start + 1),
+                    kind: SeqEventKind::Cc {
+                        number,
+                        value: CC_RELEASE,
+                    },
+                });
+                continue;
+            }
+
+            let Some(key) = note.key(self.scale) else {
+                continue;
+            };
             events.push(SeqEvent {
                 sample_time: start,
-                key,
-                velocity: note.velocity as f64 / 127.0,
-                is_on: true,
+                kind: SeqEventKind::NoteOn {
+                    key,
+                    velocity: note.velocity as f64 / 127.0,
+                },
             });
             events.push(SeqEvent {
                 sample_time: end.max(start + 1),
-                key,
-                velocity: 0.0,
-                is_on: false,
+                kind: SeqEventKind::NoteOff { key },
             });
         }
 
-        // 同時刻ならオフを先に (false < true)
-        events.sort_by_key(|e| (e.sample_time, e.is_on));
+        // 同時刻ならオフ → CC → オン の順に
+        events.sort_by_key(|e| (e.sample_time, e.order()));
+        suppress_redundant_cc_releases(&mut events);
         events
+    }
+
+    /// その段に割り当てられた CC 番号 (音符段なら `None`)
+    pub fn lane_cc(&self, track: usize, lane: usize) -> Option<u8> {
+        self.tracks.get(track)?.lane_cc(lane)
     }
 }
 
-/// 再生エンジンに渡す、サンプル時刻の付いたノートイベント
+/// 同じ位置で「解除 → 次のブロックの値」と並ぶ解除を取り除く。
+///
+/// ブロックが隙間なく続くとき、解除の 0 をそのまま送ると**一瞬離して踏み直す**
+/// 形になる。ペダルなら踏み直しの音が出るし、書き出した MIDI にも無駄な値が並ぶ。
+/// 同時刻に同じ CC 番号の値が続くなら、先に来る解除のほうを捨てる。
+///
+/// 並び替え済みであること (`order()` により、同時刻では解除が先に来る) が前提。
+fn suppress_redundant_cc_releases(events: &mut Vec<SeqEvent>) {
+    let mut remove = vec![false; events.len()];
+    for index in 0..events.len() {
+        let SeqEventKind::Cc { number, value } = events[index].kind else {
+            continue;
+        };
+        if value != CC_RELEASE {
+            continue;
+        }
+        // 同時刻に同じ番号の CC が後ろにあれば、この解除は要らない
+        for later in events[index + 1..].iter() {
+            if later.sample_time != events[index].sample_time {
+                break;
+            }
+            if matches!(later.kind, SeqEventKind::Cc { number: n, .. } if n == number) {
+                remove[index] = true;
+                break;
+            }
+        }
+    }
+    let mut keep = remove.iter().map(|r| !r);
+    events.retain(|_| keep.next().unwrap_or(true));
+}
+
+/// 再生エンジンに渡す、サンプル時刻の付いたイベント
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SeqEvent {
     /// シーケンス先頭からのサンプル位置
     pub sample_time: u64,
-    /// MIDI ノート番号
-    pub key: u8,
-    /// 0.0..=1.0
-    pub velocity: f64,
-    /// true = NoteOn, false = NoteOff
-    pub is_on: bool,
+    pub kind: SeqEventKind,
+}
+
+/// [`SeqEvent`] の中身
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SeqEventKind {
+    NoteOff {
+        /// MIDI ノート番号
+        key: u8,
+    },
+    /// CC 段が出すコントロールチェンジ。
+    ///
+    /// 「書いた区間だけ効かせる」ため、ブロックの頭で値を、尻で
+    /// [`CC_RELEASE`] を出す。MIDI に「CC 無し」は無いので、
+    /// **解除値を送ることで無効状態を表す**。
+    Cc { number: u8, value: u8 },
+    NoteOn {
+        key: u8,
+        /// 0.0..=1.0
+        velocity: f64,
+    },
+}
+
+/// CC 段で「書かれていない区間」を表す値。
+///
+/// 64/66/67 (ペダル類) や 1/11 は 0 が「効いていない」に当たるので、
+/// これで「書いた区間だけ踏んでいる」が素直に表せる。
+/// 0 が中立でない CC (7 音量・10 パン) を段に割り当てると、書いていない区間が
+/// 無音・左端になる点だけ注意。
+pub const CC_RELEASE: u8 = 0;
+
+impl SeqEvent {
+    /// 同時刻に並んだときの順序。
+    ///
+    /// **オフ → CC → オン** の順にする。ペダルを踏んでから音を出し、
+    /// 音を切ってから離す形になるので、区切りで音が欠けない。
+    fn order(&self) -> u8 {
+        match self.kind {
+            SeqEventKind::NoteOff { .. } => 0,
+            SeqEventKind::Cc { .. } => 1,
+            SeqEventKind::NoteOn { .. } => 2,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -469,12 +667,15 @@ mod tests {
             lane: last_lane,
             ..note(0.0, 1.0, 0, 4)
         });
-        assert!(!editor.remove_last_lane(1), "ノートのある段は残ること");
+        assert!(
+            !editor.remove_last_normal_lane(1),
+            "ノートのある段は残ること"
+        );
         assert!(!editor.remove_last_track(), "ノートのあるトラックは残ること");
 
         // 空の段は消せる
         editor.add_lane(1);
-        assert!(editor.remove_last_lane(1));
+        assert!(editor.remove_last_normal_lane(1));
         assert_eq!(editor.lanes(1), last_lane + 1);
     }
 
@@ -527,6 +728,18 @@ mod tests {
     }
 
     /// 再生用イベントの生成が、設定した音階モードを実際に反映していること。
+    /// 出てきたイベントのノート番号 (オン・オフの順に並ぶ)
+    fn event_keys(editor: &MidiEditor) -> Vec<u8> {
+        editor
+            .to_events(44100.0)
+            .iter()
+            .filter_map(|event| match event.kind {
+                SeqEventKind::NoteOn { key, .. } | SeqEventKind::NoteOff { key } => Some(key),
+                SeqEventKind::Cc { .. } => None,
+            })
+            .collect()
+    }
+
     /// (Note::key が正しくても to_events がモードを渡し忘れると再生だけズレるため)
     #[test]
     fn to_events_uses_scale_mode() {
@@ -536,12 +749,18 @@ mod tests {
         editor.notes = vec![note(0.0, 1.0, 0, 5)];
 
         editor.scale = ScaleMode::Equal12;
-        let keys: Vec<u8> = editor.to_events(44100.0).iter().map(|e| e.key).collect();
-        assert_eq!(keys, vec![72, 72], "12平均律で (0,5) は 72 になること");
+        assert_eq!(
+            event_keys(&editor),
+            vec![72, 72],
+            "12平均律で (0,5) は 72 になること"
+        );
 
         editor.scale = ScaleMode::BohlenPierce13;
-        let keys: Vec<u8> = editor.to_events(44100.0).iter().map(|e| e.key).collect();
-        assert_eq!(keys, vec![73, 73], "B-P で (0,5) は 73 になること");
+        assert_eq!(
+            event_keys(&editor),
+            vec![73, 73],
+            "B-P で (0,5) は 73 になること"
+        );
     }
 
     /// スウィングを掛けた4/4のエディタ (トラック0 のみ ON)
@@ -889,6 +1108,192 @@ mod tests {
         assert_eq!(note(0.0, 1.0, 0, 3).key(bp), Some(47)); // 下のトライターブ
     }
 
+    /// CC 段は、書いた区間の頭で値・尻で解除値を出すこと。
+    ///
+    /// **これが「書かれていない部分は CC 無し」の実体。** MIDI に「CC 無し」は
+    /// 無いので、解除値を送ることで無効状態を表している。
+    #[test]
+    fn cc_lane_emits_value_at_the_head_and_release_at_the_tail() {
+        let mut editor = MidiEditor::default(); // 120bpm → 四分音符 = 22050 samples @44.1k
+        editor.tracks[0].set_lane_cc(0, Some(64)); // ペダル
+        editor.notes = vec![Note {
+            velocity: 100,
+            ..note(0.0, 1.0, 0, 4)
+        }];
+
+        let events = editor.to_events(44100.0);
+        assert_eq!(events.len(), 2, "音符ではなく CC が2つだけ出ること");
+        assert_eq!(events[0].sample_time, 0);
+        assert_eq!(
+            events[0].kind,
+            SeqEventKind::Cc {
+                number: 64,
+                value: 100
+            }
+        );
+        assert_eq!(events[1].sample_time, 22050);
+        assert_eq!(
+            events[1].kind,
+            SeqEventKind::Cc {
+                number: 64,
+                value: CC_RELEASE
+            },
+            "書いていない区間へ入るところで解除すること"
+        );
+    }
+
+    /// 隙間なく続くブロックの境目で、解除を挟まないこと。
+    ///
+    /// 挟むと一瞬離して踏み直す形になり、ペダルなら踏み直しの音が出る。
+    #[test]
+    fn adjacent_cc_blocks_do_not_release_in_between() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].set_lane_cc(0, Some(64));
+        editor.notes = vec![
+            Note {
+                velocity: 100,
+                ..note(0.0, 1.0, 0, 4)
+            },
+            Note {
+                velocity: 40,
+                ..note(1.0, 1.0, 0, 4)
+            },
+        ];
+
+        let events = editor.to_events(44100.0);
+        let values: Vec<(u64, u8)> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                SeqEventKind::Cc { value, .. } => Some((event.sample_time, value)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![(0, 100), (22050, 40), (44100, CC_RELEASE)],
+            "境目 (22050) では解除せず次の値へ移り、最後だけ解除すること"
+        );
+    }
+
+    /// 通常の段は CC 段より上に入り、下の段のノートが付いていくこと。
+    ///
+    /// **末尾に足すと CC 段の下に潜り込む。** そうなると「CC は最下段」が崩れ、
+    /// 音符段が CC 段に挟まれて操作が破綻する。
+    #[test]
+    fn adding_a_normal_lane_goes_above_the_cc_lanes() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 2;
+        editor.add_cc_lane(0, 64); // 段2 が CC
+
+        assert_eq!(editor.lanes(0), 3);
+        assert_eq!(editor.lane_cc(0, 2), Some(64));
+
+        // CC 段にブロックを1つ置いてから、通常段を足す
+        editor.notes = vec![Note {
+            lane: 2,
+            ..note(0.0, 1.0, 0, 4)
+        }];
+        editor.add_lane(0);
+
+        assert_eq!(editor.lanes(0), 4);
+        assert_eq!(editor.lane_cc(0, 2), None, "足した段は音符段");
+        assert_eq!(editor.lane_cc(0, 3), Some(64), "CC 段は1つ下へ繰り下がる");
+        assert_eq!(editor.notes[0].lane, 3, "CC 段のブロックも付いていくこと");
+    }
+
+    /// 通常段を消しても CC 段は残ること。
+    ///
+    /// **これが分かれていないと、通常段を消したつもりで CC 段が消える**
+    /// (最下段は CC 段のことがあるため)。
+    #[test]
+    fn removing_a_normal_lane_leaves_the_cc_lanes() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 3; // 通常段 3つ
+        editor.add_cc_lane(0, 64); // 段3 が CC
+
+        // CC 段にブロックを置いておく (巻き込まれたら分かるように)
+        editor.notes = vec![Note {
+            lane: 3,
+            ..note(0.0, 1.0, 0, 4)
+        }];
+
+        assert!(editor.remove_last_normal_lane(0));
+        assert_eq!(editor.lanes(0), 3);
+        assert_eq!(editor.tracks[0].normal_lanes(), 2);
+        assert_eq!(editor.lane_cc(0, 2), Some(64), "CC 段は残り、繰り上がること");
+        assert_eq!(editor.notes[0].lane, 2, "CC 段のブロックも付いてくること");
+    }
+
+    /// CC 段の削除は CC 段だけを消し、通常段には触れないこと
+    #[test]
+    fn removing_a_cc_lane_leaves_the_normal_lanes() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 2;
+        editor.add_cc_lane(0, 64);
+
+        assert!(editor.remove_last_cc_lane(0));
+        assert_eq!(editor.lanes(0), 2);
+        assert_eq!(editor.tracks[0].normal_lanes(), 2);
+        assert!(
+            !editor.remove_last_cc_lane(0),
+            "CC 段が無ければ何も消さないこと"
+        );
+        assert_eq!(editor.lanes(0), 2);
+    }
+
+    /// 中身のある段は、通常段でも CC 段でも消せないこと
+    #[test]
+    fn lanes_with_content_are_not_removed() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 2;
+        editor.add_cc_lane(0, 64);
+        editor.notes = vec![
+            Note {
+                lane: 1,
+                ..note(0.0, 1.0, 0, 4)
+            },
+            Note {
+                lane: 2,
+                ..note(0.0, 1.0, 0, 4)
+            },
+        ];
+
+        assert!(!editor.remove_last_normal_lane(0), "段1 にノートがある");
+        assert!(!editor.remove_last_cc_lane(0), "段2 にブロックがある");
+        assert_eq!(editor.lanes(0), 3);
+    }
+
+    /// CC 段は必ず最下段に積まれること
+    #[test]
+    fn cc_lanes_stack_at_the_bottom() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 2;
+        editor.add_cc_lane(0, 64);
+        editor.add_cc_lane(0, 1);
+
+        assert_eq!(editor.tracks[0].normal_lanes(), 2);
+        assert_eq!(editor.lane_cc(0, 0), None);
+        assert_eq!(editor.lane_cc(0, 1), None);
+        assert_eq!(editor.lane_cc(0, 2), Some(64));
+        assert_eq!(editor.lane_cc(0, 3), Some(1));
+    }
+
+    /// 段の CC 設定は、音符段へ戻せること (末尾は詰める)
+    #[test]
+    fn lane_cc_can_be_set_and_cleared() {
+        let mut track = TrackInfo::new(0);
+        assert_eq!(track.lane_cc(0), None, "既定は音符段");
+        assert_eq!(track.lane_cc(99), None, "範囲外は音符段として扱うこと");
+
+        track.set_lane_cc(2, Some(64));
+        assert_eq!(track.lane_cc(2), Some(64));
+        assert_eq!(track.lane_cc(0), None, "間の段は音符段のまま");
+
+        track.set_lane_cc(2, None);
+        assert!(track.lane_ccs.is_empty(), "末尾の None は詰めること");
+    }
+
     #[test]
     fn events_sorted_off_before_on() {
         let mut editor = MidiEditor::default(); // 120bpm → 四分音符 = 22050 samples @44.1k
@@ -898,9 +1303,9 @@ mod tests {
         assert_eq!(events.len(), 4);
         // 22050 サンプル地点: C4 オフが E4 オンより先
         assert_eq!(events[1].sample_time, 22050);
-        assert!(!events[1].is_on);
+        assert!(matches!(events[1].kind, SeqEventKind::NoteOff { .. }));
         assert_eq!(events[2].sample_time, 22050);
-        assert!(events[2].is_on);
+        assert!(matches!(events[2].kind, SeqEventKind::NoteOn { .. }));
     }
 
     #[test]

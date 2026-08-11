@@ -17,6 +17,7 @@
 use crate::audio::config::StreamAudioConfig;
 use crate::audio::events::{BlockEvent, BlockEvents};
 use crate::audio::ProcessError;
+use crate::sequencer::CC_RELEASE;
 use std::sync::{Arc, Mutex, MutexGuard};
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
@@ -96,6 +97,11 @@ pub struct Vst3Processor {
     /// VST3 には消音イベントが無いので、choke ではここに立っているキーを
     /// 1つずつ note-off する。128ビットなのでオーディオスレッドでも確保は起きない。
     active: u128,
+    /// 効かせている CC。ビット位置が CC 番号 (0〜127)。
+    ///
+    /// choke で解除値に戻すために覚えておく。これが無いと、ペダルを踏んだまま
+    /// 停止したときに踏みっぱなしで残る。
+    active_ccs: u128,
     /// 音源を取れずに送れなかったイベント。次に取れたブロックの先頭で送り直す。
     ///
     /// 捨ててしまうと note-off が失われて音が鳴りっぱなしになる。
@@ -120,6 +126,7 @@ impl Vst3Processor {
             ),
             output_channels: stream_config.output_channel_count.max(1),
             active: 0,
+            active_ccs: 0,
             deferred: Vec::with_capacity(MAX_DEFERRED),
         }
     }
@@ -151,11 +158,23 @@ impl Vst3Processor {
         // 溜めておいたぶんを先に送る (順序は保つ)
         for index in 0..self.deferred.len() {
             let event = self.deferred[index];
-            send(&mut plugin, &mut self.active, event, frames);
+            send(
+                &mut plugin,
+                &mut self.active,
+                &mut self.active_ccs,
+                event,
+                frames,
+            );
         }
         self.deferred.clear();
         for event in events {
-            send(&mut plugin, &mut self.active, *event, frames);
+            send(
+                &mut plugin,
+                &mut self.active,
+                &mut self.active_ccs,
+                *event,
+                frames,
+            );
         }
 
         self.buffers.clear();
@@ -219,7 +238,13 @@ impl Vst3Processor {
 ///
 /// 送信に失敗しても続ける。1件の取りこぼしでブロック全体を落とすより、
 /// 残りを届けたほうが被害が小さい。
-fn send(plugin: &mut Plugin, active: &mut u128, event: BlockEvent, frames: usize) {
+fn send(
+    plugin: &mut Plugin,
+    active: &mut u128,
+    active_ccs: &mut u128,
+    event: BlockEvent,
+    frames: usize,
+) {
     // ブロックの外を指す位置は端に寄せる (VST3 側の扱いが実装依存のため)
     let clamp = |offset: u32| offset.min(frames as u32 - 1) as i32;
 
@@ -259,6 +284,35 @@ fn send(plugin: &mut Plugin, active: &mut u128, event: BlockEvent, frames: usize
                 let _ = plugin.send_midi_event_at(note_off(key), offset);
             }
             *active = 0;
+
+            // 効かせた CC も戻す。音符を止めてもペダルは踏まれたままなので、
+            // これが無いと停止・シークのあとも踏みっぱなしで残る。
+            let mut remaining = *active_ccs;
+            while remaining != 0 {
+                let number = remaining.trailing_zeros() as u8;
+                remaining &= remaining - 1;
+                let _ = plugin.send_midi_event_at(control_change(number, CC_RELEASE), offset);
+            }
+            *active_ccs = 0;
+        }
+        BlockEvent::Cc {
+            offset,
+            number,
+            value,
+        } => {
+            let number = number.min(127);
+            let value = value.min(127);
+            if plugin
+                .send_midi_event_at(control_change(number, value), clamp(offset))
+                .is_ok()
+            {
+                // 解除値まで戻したものは「効いていない」ので覚えなくてよい
+                if value == CC_RELEASE {
+                    *active_ccs &= !(1u128 << number);
+                } else {
+                    *active_ccs |= 1u128 << number;
+                }
+            }
         }
         BlockEvent::Param { offset, id, value } => {
             // パラメータ UI は現在無効なので、ここを通るのは鍵盤 UI 経由のときだけ。
@@ -276,6 +330,16 @@ fn note_off(key: u8) -> MidiEvent {
     }
 }
 
+/// VST3 では CC はイベントではなく、`IMidiMapping` で対応付けられた
+/// パラメータの変更として届く。その変換は `vst3-host` が受け持つ。
+fn control_change(number: u8, value: u8) -> MidiEvent {
+    MidiEvent::ControlChange {
+        channel: MidiChannel::Ch1,
+        controller: number,
+        value,
+    }
+}
+
 /// ブロック内の位置を先頭へ潰す (持ち越したイベント用)
 fn at_block_start(event: BlockEvent) -> BlockEvent {
     match event {
@@ -289,6 +353,11 @@ fn at_block_start(event: BlockEvent) -> BlockEvent {
         BlockEvent::Param { id, value, .. } => BlockEvent::Param {
             offset: 0,
             id,
+            value,
+        },
+        BlockEvent::Cc { number, value, .. } => BlockEvent::Cc {
+            offset: 0,
+            number,
             value,
         },
     }

@@ -2,7 +2,7 @@
 //! サンプル精度でノートイベントをブロック内オフセット付きで発行する。
 
 use crate::audio::events::{BlockEvent, BlockEvents};
-use crate::sequencer::SeqEvent;
+use crate::sequencer::{SeqEvent, SeqEventKind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -323,18 +323,17 @@ mod tests {
     fn on(sample_time: u64) -> SeqEvent {
         SeqEvent {
             sample_time,
-            key: 60,
-            velocity: 0.8,
-            is_on: true,
+            kind: SeqEventKind::NoteOn {
+                key: 60,
+                velocity: 0.8,
+            },
         }
     }
 
     fn off(sample_time: u64) -> SeqEvent {
         SeqEvent {
             sample_time,
-            key: 60,
-            velocity: 0.0,
-            is_on: false,
+            kind: SeqEventKind::NoteOff { key: 60 },
         }
     }
 
@@ -429,16 +428,17 @@ mod tests {
 
 /// シーケンスイベント1つをブロックイベントにする
 fn note_event(offset: u32, event: &SeqEvent) -> BlockEvent {
-    if event.is_on {
-        BlockEvent::NoteOn {
+    match event.kind {
+        SeqEventKind::NoteOn { key, velocity } => BlockEvent::NoteOn {
             offset,
-            key: event.key,
-            velocity: event.velocity,
-        }
-    } else {
-        BlockEvent::NoteOff {
+            key,
+            velocity,
+        },
+        SeqEventKind::NoteOff { key } => BlockEvent::NoteOff { offset, key },
+        SeqEventKind::Cc { number, value } => BlockEvent::Cc {
             offset,
-            key: event.key,
-        }
+            number,
+            value,
+        },
     }
 }

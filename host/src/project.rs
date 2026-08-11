@@ -131,6 +131,10 @@ struct TrackEntry {
     soloed: bool,
     #[serde(default)]
     swing: bool,
+    /// 段ごとの CC 番号 (`None` は音符段)。CC 段が無ければ空。
+    /// これより前のバージョンのファイルには無いので `default` で空になる。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lane_ccs: Vec<Option<u8>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,6 +191,7 @@ pub fn to_string(
                 muted: info.muted,
                 soloed: info.soloed,
                 swing: info.swing,
+                lane_ccs: info.lane_ccs.clone(),
             })
             .collect(),
         notes: editor
@@ -370,6 +375,13 @@ fn build(project: Project) -> Loaded {
                 muted: entry.muted,
                 soloed: entry.soloed,
                 swing: entry.swing,
+                // 範囲外の CC 番号は音符段として読む (壊れたファイルで
+                // 段が丸ごと使えなくなるより、音符段に落ちるほうがまし)
+                lane_ccs: entry
+                    .lane_ccs
+                    .into_iter()
+                    .map(|cc| cc.filter(|number| *number <= 127))
+                    .collect(),
             })
             .collect(),
         tempo: project.tempo,
@@ -449,6 +461,24 @@ mod tests {
     }
 
     /// スウィングの設定が保存されること (MIDI では持てなかったもの)
+    #[test]
+    /// CC 段の割り当てが保存・復元されること。
+    ///
+    /// 落ちると、開き直したときに CC 段が音符段に戻り、**ペダルのつもりの
+    /// ブロックが音として鳴ってしまう**。
+    #[test]
+    fn round_trip_keeps_cc_lanes() {
+        let mut editor = sample();
+        editor.tracks[0].lanes = 3;
+        editor.tracks[0].set_lane_cc(1, Some(64));
+
+        let restored = load(&save(&editor)).unwrap();
+        assert_eq!(restored.tracks[0].lane_cc(0), None, "音符段のまま");
+        assert_eq!(restored.tracks[0].lane_cc(1), Some(64));
+        assert_eq!(restored.tracks[0].lane_cc(2), None);
+        assert_eq!(restored.tracks[1].lane_cc(0), None, "他のトラックは無関係");
+    }
+
     #[test]
     fn round_trip_keeps_swing_settings() {
         let restored = load(&save(&sample())).unwrap();
