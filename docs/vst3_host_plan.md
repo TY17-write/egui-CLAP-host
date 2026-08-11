@@ -261,6 +261,36 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 **フェーズ A は単体で価値がある。** VST3 に進まない判断をしても無駄にならない
 （「開いたら音源も音作りも戻る」は現状いちばん欠けている機能）。
 
+### フェーズ2 の設計調査（実装前に判明したこと）
+
+**`Plugin` も `RealtimePluginRunner` も `Send` だった**（`spike/vst3/src/bin/sendness.rs`
+でコンパイルにより確定）。処理器をリングバッファでオーディオスレッドへ渡す本体の
+設計がそのまま使える。
+
+**`RealtimePluginRunner` は使わず、`Plugin` を直接持つ。**
+
+runner は「音源を所有し、指示を SPSC リングで受ける」ものだが、**本体には既に
+同じ役割のリングバッファ (`GuiMsg`) がある**。runner を挟むと
+`BlockEvents` → `RtControl` のリング → runner の drain という二重の受け渡しになり、
+リングが溢れると指示を落とす。`Plugin::send_midi_event_at` と
+`Plugin::process_audio` はどちらも公開されているので、自前の処理器から直接呼べる。
+
+破棄の安全性も確保できる。VST3 は音源を作ったスレッドで破棄する必要があるが、
+本体は「音源はメインスレッドで作り、処理器はメインスレッドへ返して解放する」
+設計なので、構造的に満たされる。
+
+**`process_audio` はオーディオスレッドで Mutex を取る。**
+
+```rust
+if let Ok(mut levels) = self.audio_levels.lock() { ... }   // 毎ブロック
+```
+
+`process_bus_audio` も同じ。この Mutex を取る相手は**メータ取得 API
+(`get_output_levels`) だけ**なので、**それを使わなければ競合しない**
+(取得者がいなければロックは常に空いており、実質ノーコスト)。
+本体はメータを使っていないので、このまま進める。使いたくなったら
+別途アトミックで持つこと。
+
 ### フェーズ1 で分かったこと
 
 - **`buffers.rs` の共通化は見送った。** チャンネル変換 (`mux` / `mix_mono` /
