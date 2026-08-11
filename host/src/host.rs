@@ -10,6 +10,7 @@ use clack_extensions::params::{
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::prelude::*;
 use crossbeam_channel::Sender;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -96,14 +97,18 @@ impl HostGuiImpl for MiniHostShared {
     }
 }
 
-/// メインスレッド専用データ
+/// メインスレッド専用データ。
+///
+/// 拡張のコールバックは `&self` で呼ばれるので、書き換えるものは
+/// 内部可変性で持つ。`PluginGui` / `PluginTimer` は `Copy` なので `Cell`、
+/// `InitializedPluginHandle` は `Clone` だけなので `RefCell` にしている。
 pub struct MiniHostMainThread<'a> {
     _shared: &'a MiniHostShared,
-    plugin: Option<InitializedPluginHandle<'a>>,
+    plugin: RefCell<Option<InitializedPluginHandle<'a>>>,
     /// プラグインの GUI 拡張 (あれば)
-    pub gui: Option<PluginGui>,
+    pub gui: Cell<Option<PluginGui>>,
     /// プラグインのタイマー拡張 (あれば)
-    pub timer_support: Option<PluginTimer>,
+    pub timer_support: Cell<Option<PluginTimer>>,
     /// ホスト側のタイマー管理
     pub timers: Rc<Timers>,
 }
@@ -112,30 +117,30 @@ impl<'a> MiniHostMainThread<'a> {
     pub fn new(shared: &'a MiniHostShared) -> Self {
         Self {
             _shared: shared,
-            plugin: None,
-            gui: None,
-            timer_support: None,
+            plugin: RefCell::new(None),
+            gui: Cell::new(None),
+            timer_support: Cell::new(None),
             timers: Rc::new(Timers::new()),
         }
     }
 }
 
 impl<'a> MainThreadHandler<'a> for MiniHostMainThread<'a> {
-    fn initialized(&mut self, instance: InitializedPluginHandle<'a>) {
-        self.gui = instance.get_extension();
-        self.timer_support = instance.get_extension();
-        self.plugin = Some(instance);
+    fn initialized(&self, instance: InitializedPluginHandle<'a>) {
+        self.gui.set(instance.get_extension());
+        self.timer_support.set(instance.get_extension());
+        *self.plugin.borrow_mut() = Some(instance);
     }
 }
 
 impl HostTimerImpl for MiniHostMainThread<'_> {
-    fn register_timer(&mut self, period_ms: u32) -> Result<TimerId, HostError> {
+    fn register_timer(&self, period_ms: u32) -> Result<TimerId, HostError> {
         Ok(self
             .timers
             .register_new(Duration::from_millis(period_ms as u64)))
     }
 
-    fn unregister_timer(&mut self, timer_id: TimerId) -> Result<(), HostError> {
+    fn unregister_timer(&self, timer_id: TimerId) -> Result<(), HostError> {
         if self.timers.unregister(timer_id) {
             Ok(())
         } else {
@@ -154,11 +159,11 @@ impl HostLogImpl for MiniHostShared {
 }
 
 impl HostParamsImplMainThread for MiniHostMainThread<'_> {
-    fn rescan(&mut self, _flags: ParamRescanFlags) {
+    fn rescan(&self, _flags: ParamRescanFlags) {
         // パラメータの動的変更は追跡しない
     }
 
-    fn clear(&mut self, _param_id: ClapId, _flags: ParamClearFlags) {}
+    fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
 }
 
 impl HostParamsImplShared for MiniHostShared {

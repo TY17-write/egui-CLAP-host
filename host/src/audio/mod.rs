@@ -6,7 +6,6 @@ use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNoteP
 use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::events::{EventFlags, Match};
 use clack_host::prelude::*;
-use clack_host::utils::Cookie;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BuildStreamError, Device, FromSample, OutputCallbackInfo, SampleFormat, Stream, StreamConfig,
@@ -327,13 +326,9 @@ impl StreamAudioProcessor {
                     let Some(Some(target)) = self.tracks.get_mut(track) else {
                         continue;
                     };
-                    target.events.push(&ParamValueEvent::new(
-                        0,
-                        id,
-                        Pckn::match_all(),
-                        value,
-                        Cookie::empty(),
-                    ));
+                    target
+                        .events
+                        .push(&ParamValueEvent::new(0, id, Pckn::match_all(), value));
                 }
                 GuiMsg::Transport(msg) => {
                     // 状態の更新は1回。消音が要るときは全トラックへ配る

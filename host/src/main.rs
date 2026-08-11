@@ -832,7 +832,7 @@ fn instantiate_plugin(
     let params = params::read_params(&mut instance);
 
     // gui 拡張があれば GUI マネージャを用意する
-    let gui_ext = instance.access_handler(|mt| mt.gui);
+    let gui_ext = instance.access_handler(|mt| mt.gui.get());
     let gui = gui_ext.map(|ext| PluginGuiManager::new(ext, &mut instance.plugin_handle()));
 
     Ok((
@@ -911,7 +911,7 @@ impl eframe::App for App {
             // プラグインが登録したタイマーを駆動する (GUI 描画などに必要)
             let timer = track
                 .instance
-                .access_handler(|mt| mt.timer_support.map(|ext| (mt.timers.clone(), ext)));
+                .access_handler(|mt| mt.timer_support.get().map(|ext| (mt.timers.clone(), ext)));
             if let Some((timers, timer_ext)) = timer {
                 timers.tick_timers(&timer_ext, &mut track.instance.plugin_handle());
             }

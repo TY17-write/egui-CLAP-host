@@ -151,7 +151,7 @@ impl<'a> PluginAudioProcessor<'a, TestSineShared, TestSineMainThread<'a>>
 {
     fn activate(
         _host: HostAudioProcessorHandle<'a>,
-        _main_thread: &mut TestSineMainThread,
+        _main_thread: &TestSineMainThread,
         shared: &'a TestSineShared,
         audio_config: PluginAudioConfiguration,
     ) -> Result<Self, PluginError> {
@@ -270,7 +270,7 @@ impl TestSineAudioProcessor<'_> {
 }
 
 impl PluginAudioPortsImpl for TestSineMainThread<'_> {
-    fn count(&mut self, is_input: bool) -> u32 {
+    fn count(&self, is_input: bool) -> u32 {
         if is_input {
             0
         } else {
@@ -278,7 +278,7 @@ impl PluginAudioPortsImpl for TestSineMainThread<'_> {
         }
     }
 
-    fn get(&mut self, index: u32, is_input: bool, writer: &mut AudioPortInfoWriter) {
+    fn get(&self, index: u32, is_input: bool, writer: &mut AudioPortInfoWriter) {
         if !is_input && index == 0 {
             writer.set(&AudioPortInfo {
                 id: ClapId::new(1),
@@ -293,7 +293,7 @@ impl PluginAudioPortsImpl for TestSineMainThread<'_> {
 }
 
 impl PluginNotePortsImpl for TestSineMainThread<'_> {
-    fn count(&mut self, is_input: bool) -> u32 {
+    fn count(&self, is_input: bool) -> u32 {
         if is_input {
             1
         } else {
@@ -301,7 +301,7 @@ impl PluginNotePortsImpl for TestSineMainThread<'_> {
         }
     }
 
-    fn get(&mut self, index: u32, is_input: bool, writer: &mut NotePortInfoWriter) {
+    fn get(&self, index: u32, is_input: bool, writer: &mut NotePortInfoWriter) {
         if is_input && index == 0 {
             writer.set(&NotePortInfo {
                 id: ClapId::new(1),
@@ -314,11 +314,11 @@ impl PluginNotePortsImpl for TestSineMainThread<'_> {
 }
 
 impl PluginMainThreadParams for TestSineMainThread<'_> {
-    fn count(&mut self) -> u32 {
+    fn count(&self) -> u32 {
         1
     }
 
-    fn get_info(&mut self, param_index: u32, info: &mut ParamInfoWriter) {
+    fn get_info(&self, param_index: u32, info: &mut ParamInfoWriter) {
         if param_index == 0 {
             info.set(&ParamInfo {
                 id: PARAM_VOLUME_ID,
@@ -333,7 +333,7 @@ impl PluginMainThreadParams for TestSineMainThread<'_> {
         }
     }
 
-    fn get_value(&mut self, param_id: ClapId) -> Option<f64> {
+    fn get_value(&self, param_id: ClapId) -> Option<f64> {
         if param_id == PARAM_VOLUME_ID {
             Some(self.shared.volume.load(Ordering::SeqCst) as f64)
         } else {
@@ -342,7 +342,7 @@ impl PluginMainThreadParams for TestSineMainThread<'_> {
     }
 
     fn value_to_text(
-        &mut self,
+        &self,
         param_id: ClapId,
         value: f64,
         writer: &mut ParamDisplayWriter,
@@ -354,7 +354,7 @@ impl PluginMainThreadParams for TestSineMainThread<'_> {
         }
     }
 
-    fn text_to_value(&mut self, param_id: ClapId, text: &CStr) -> Option<f64> {
+    fn text_to_value(&self, param_id: ClapId, text: &CStr) -> Option<f64> {
         if param_id != PARAM_VOLUME_ID {
             return None;
         }
@@ -364,7 +364,7 @@ impl PluginMainThreadParams for TestSineMainThread<'_> {
     }
 
     fn flush(
-        &mut self,
+        &self,
         input_parameter_changes: &InputEvents,
         _output_parameter_changes: &mut OutputEvents,
     ) {

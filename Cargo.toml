@@ -14,4 +14,6 @@ clack-extensions = { git = "https://github.com/prokopyl/clack.git", features = [
     "gui",
     "log",
     "timer",
+    # プロジェクト保存で音源の状態を持ち回るために使う
+    "state",
 ] }
