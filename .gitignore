@@ -1,4 +1,7 @@
 /target
+# spike/ は親のワークスペースから切り離してあり、自前の target を持つ
+spike/*/target
+spike/*/Cargo.lock
 # MIDI エクスポートの動作確認用 (作業データなので追跡しない)
 /saved_midi
 # 手元の起動用スクリプト (パスが環境依存なので追跡しない)

@@ -1,0 +1,15 @@
+[package]
+name = "vst3-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 親のワークスペースから切り離す。
+# フェーズ0 は「VST3 に進めるか」の可否判断が目的なので、
+# 本体のビルドを VST3 側の依存で壊さないようにする。
+[workspace]
+
+[dependencies]
+# 既定機能の cpal バックエンドとプロセス分離は使わない。
+# ここで見たいのはオフラインでの処理経路だけ。
+vst3-host = { version = "0.9", default-features = false }
