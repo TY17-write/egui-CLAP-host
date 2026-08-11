@@ -251,7 +251,7 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 
 | フェーズ | 内容 | 状態 |
 |---|---|---|
-| **A** | **音源の保存・復元（CLAP のみ）。`clap.state` の実装を含む** | |
+| **A** | **音源の保存・復元（CLAP のみ）。`clap.state` の実装を含む** | **完了** |
 | **0** | **VST3 のスパイク（可否判断）** | |
 | **1** | 抽象化層（CLAP のみ。挙動を変えない） | |
 | **2** | VST3 バックエンド（音のみ。choke 含む） | |
@@ -260,6 +260,17 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 
 **フェーズ A は単体で価値がある。** VST3 に進まない判断をしても無駄にならない
 （「開いたら音源も音作りも戻る」は現状いちばん欠けている機能）。
+
+### フェーズ A で分かったこと
+
+- **`test-plugin` が `clap.state` を持っていなかった。** そのままでは保存経路の検証が
+  「空を保存して空を戻す」になるため、テスト用プラグイン側にも実装した。
+  `state_smoke` で往復を実プラグインに対して確かめている
+- **`PluginEntry` をホスト側で持ち続ける必要はない。** clack は
+  `PluginInstanceInner` に entry を保持しており（DLL を生かすため）、
+  インスタンス化のたびに開き直してよい。`Candidates` から entry を外した
+- clack の更新で拡張のコールバックが `&mut self` から `&self` になったため、
+  ホストのメインスレッド側は内部可変性 (`Cell` / `RefCell`) へ移した
 
 ### フェーズ0: スパイク（最重要）
 

@@ -21,6 +21,7 @@ use editor_ui::{EditorCommand, EditorState};
 use gui::PluginGuiManager;
 use host::{MainThreadMessage, MiniHost, MiniHostMainThread, MiniHostShared};
 use params::ParamUi;
+use project::PluginSnapshot;
 use sequencer::SeqEvent;
 use std::sync::atomic::Ordering;
 use std::collections::HashSet;
@@ -105,7 +106,6 @@ fn setup_japanese_fonts(ctx: &egui::Context) {
 /// ロード済みの .clap ファイル (プラグイン選択待ち)
 struct Candidates {
     path: PathBuf,
-    entry: PluginEntry,
     plugins: Vec<discovery::FoundPlugin>,
     /// この候補から選んだプラグインを載せるトラック
     target_track: usize,
@@ -128,6 +128,10 @@ struct Engine {
 /// トラック1本にロードされた音源
 struct TrackAudio {
     name: String,
+    /// この音源の .clap のパス。プロジェクトに保存して読み直すために持つ。
+    path: PathBuf,
+    /// プラグイン ID。1つの .clap に複数入りうるので、パスだけでは足りない。
+    id: String,
     instance: PluginInstance<MiniHost>,
     receiver: Receiver<MainThreadMessage>,
     sender: Sender<MainThreadMessage>,
@@ -274,11 +278,12 @@ impl App {
         let Some(path) = picked else { return false };
 
         match discovery::load_clap_file(&path) {
-            Ok((entry, plugins)) => {
+            // entry はここでは持たない。clack が PluginInstance の中で
+            // DLL を生かしておくので、載せるときに開き直せばよい。
+            Ok((_entry, plugins)) => {
                 self.error = None;
                 self.candidates = Some(Candidates {
                     path,
-                    entry,
                     plugins,
                     target_track,
                 });
@@ -375,7 +380,9 @@ impl App {
             self.project_path.clone().unwrap_or_default()
         };
 
-        let text = match project::to_string(&self.editor.editor) {
+        // 音源の状態を集めてから組み立てる (音源はエディタではなく App 側にある)
+        let snapshots = self.plugin_snapshots();
+        let text = match project::to_string(&self.editor.editor, &snapshots) {
             Ok(text) => text,
             Err(e) => {
                 self.notice = Some(Notice::error("保存できません", e));
@@ -416,20 +423,35 @@ impl App {
         };
 
         match project::from_str(&text) {
-            Ok(editor) => {
-                let notes = editor.notes.len();
-                let tracks = editor.tracks.len();
-                self.editor.replace_project(editor);
+            Ok(loaded) => {
+                let notes = loaded.editor.notes.len();
+                let tracks = loaded.editor.tracks.len();
+                let wanted = loaded.plugins.iter().flatten().count();
+
+                self.editor.replace_project(loaded.editor);
+                // 音源はシーケンスを入れ替えたあとに載せる
+                // (トラック数が揃ってからでないと行き先が決まらない)
+                let failures = self.restore_plugins(loaded.plugins);
+
                 self.set_project_path(path.clone());
                 self.error = None;
                 self.status = Some(format!("開きました: {}", file_label(&path)));
-                self.notice = Some(Notice::ok(
-                    "プロジェクトを開きました",
-                    format!(
-                        "{}\n\n{tracks} トラック / {notes} ノート",
-                        path.display()
-                    ),
-                ));
+
+                let mut body = format!(
+                    "{}\n\n{tracks} トラック / {notes} ノート / 音源 {} 個",
+                    path.display(),
+                    wanted - failures.len()
+                );
+                // 一部が読めなくてもシーケンスは開く。何が欠けたかは伝える。
+                if failures.is_empty() {
+                    self.notice = Some(Notice::ok("プロジェクトを開きました", body));
+                } else {
+                    body.push_str("\n\n次の音源は読み込めませんでした。");
+                    body.push_str("\nそのトラックは音源なしになっています (ノートは残っています)。\n");
+                    body.push_str(&failures.join("\n"));
+                    self.notice =
+                        Some(Notice::error("プロジェクトを一部だけ開きました", body));
+                }
             }
             Err(e) => {
                 self.notice = Some(Notice::error(
@@ -715,53 +737,167 @@ impl App {
         }
     }
 
-    /// 選んだプラグインを指定トラックに載せる
+    /// 選んだプラグインを指定トラックに載せる (トラック欄からの操作)
     fn instantiate(&mut self, plugin_index: usize, track: usize) {
-        // 最初のロード時にストリームを用意する
-        if self.engine.is_none() {
-            match start_engine() {
-                Ok(engine) => self.engine = Some(engine),
-                Err(e) => {
-                    self.error = Some(format!("オーディオを開始できません: {e}"));
-                    return;
-                }
-            }
-        }
-        let Some(engine) = &mut self.engine else {
-            return;
-        };
         let Some(candidates) = &self.candidates else {
             return;
         };
-        let plugin = &candidates.plugins[plugin_index];
+        let path = candidates.path.clone();
+        let id = candidates.plugins[plugin_index].id.clone();
 
-        match instantiate_plugin(&candidates.entry, &plugin.id, &plugin.name, &engine.config) {
-            Ok((audio_track, processor)) => {
-                self.error = None;
-                let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
-
-                // 未ロード中に動かした再生ヘッドの位置を引き継ぐ
-                let spq = self
-                    .editor
-                    .editor
-                    .samples_per_quarter(engine.config.sample_rate as f64);
-                let sample = (self.pos_quarters * spq).max(0.0) as u64;
-                let _ = engine
-                    .producer
-                    .push(GuiMsg::Transport(TransportMsg::Seek { sample }));
-
-                self.ensure_track_slots(track);
-                // 前の音源は、処理器が返ってくるまで生かしておく
-                if let Some(previous) = self.tracks[track].take() {
-                    self.retiring.push_back((track, previous));
-                }
-                self.tracks[track] = Some(audio_track);
-                // 新しいプラグインにシーケンスを送り直す
-                self.editor.dirty = true;
-            }
-            Err(e) => self.error = Some(format!("インスタンス化失敗: {e}")),
+        match self.load_plugin(track, &path, &id, None) {
+            Ok(_) => self.error = None,
+            Err(e) => self.error = Some(e),
         }
     }
+
+    /// 指定トラックに音源を載せる。`state` があれば復元してから鳴らせる状態にする。
+    ///
+    /// 呼び出し元は2つ。トラック欄の「♪」からの選択と、プロジェクトを開いたとき。
+    /// 戻り値は「状態を戻せたか」で、`state` が無いときは常に true。
+    fn load_plugin(
+        &mut self,
+        track: usize,
+        path: &std::path::Path,
+        id: &str,
+        state: Option<&[u8]>,
+    ) -> Result<bool, String> {
+        // 最初のロード時にストリームを用意する
+        if self.engine.is_none() {
+            let engine =
+                start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
+            self.engine = Some(engine);
+        }
+
+        let (entry, found) = discovery::load_clap_file(path).map_err(|e| e.to_string())?;
+        let Some(plugin) = found.iter().find(|plugin| plugin.id == id) else {
+            return Err(format!("プラグイン {id} がこのファイルにありません"));
+        };
+        let name = plugin.name.clone();
+
+        let Some(engine) = &mut self.engine else {
+            return Err("オーディオを開始できません".into());
+        };
+
+        let (mut audio_track, processor) =
+            instantiate_plugin(&entry, path, id, &name, &engine.config)
+                .map_err(|e| format!("インスタンス化失敗: {e}"))?;
+
+        // 状態の復元は、処理器をオーディオスレッドへ渡す前に済ませる
+        // (初期値のまま鳴り始めるのを避けるため)
+        let restored = match state {
+            Some(bytes) => restore_state(&mut audio_track, bytes),
+            None => true,
+        };
+
+        let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
+
+        // 未ロード中に動かした再生ヘッドの位置を引き継ぐ
+        let spq = self
+            .editor
+            .editor
+            .samples_per_quarter(engine.config.sample_rate as f64);
+        let sample = (self.pos_quarters * spq).max(0.0) as u64;
+        let _ = engine
+            .producer
+            .push(GuiMsg::Transport(TransportMsg::Seek { sample }));
+
+        self.ensure_track_slots(track);
+        // 前の音源は、処理器が返ってくるまで生かしておく
+        if let Some(previous) = self.tracks[track].take() {
+            self.retiring.push_back((track, previous));
+        }
+        self.tracks[track] = Some(audio_track);
+        // 新しいプラグインにシーケンスを送り直す
+        self.editor.dirty = true;
+
+        Ok(restored)
+    }
+
+    /// 保存用に、各トラックの音源とその状態を集める
+    fn plugin_snapshots(&mut self) -> Vec<Option<PluginSnapshot>> {
+        let count = self.editor.editor.track_count();
+        let mut snapshots = Vec::with_capacity(count);
+        for track in 0..count {
+            let slot = self.tracks.get_mut(track).and_then(|slot| slot.as_mut());
+            snapshots.push(slot.map(|audio| PluginSnapshot {
+                kind: project::PluginKind::Clap,
+                path: audio.path.clone(),
+                id: audio.id.clone(),
+                state: capture_state(audio),
+            }));
+        }
+        snapshots
+    }
+
+    /// 今載っている音源を全部降ろす (プロジェクトを開く前の片付け)
+    fn unload_all_plugins(&mut self) {
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        for track in 0..self.tracks.len() {
+            if let Some(previous) = self.tracks[track].take() {
+                let _ = engine.producer.push(GuiMsg::ClearTrack { track });
+                // 処理器が返ってくるまで生かしておく (解放はメインスレッド)
+                self.retiring.push_back((track, previous));
+            }
+        }
+    }
+
+    /// プロジェクトに書かれていた音源を読み直す。
+    /// 失敗したトラックの説明を返す (そのトラックは音源なしのままになる)。
+    fn restore_plugins(&mut self, plugins: Vec<Option<PluginSnapshot>>) -> Vec<String> {
+        self.unload_all_plugins();
+
+        let mut failures = Vec::new();
+        for (track, slot) in plugins.into_iter().enumerate() {
+            let Some(plugin) = slot else { continue };
+            let label = file_label(&plugin.path);
+            match self.load_plugin(track, &plugin.path, &plugin.id, Some(&plugin.state)) {
+                Ok(true) => {}
+                Ok(false) => failures.push(format!(
+                    "・トラック {}: {label} は読み込めましたが、音作りの復元に失敗しました",
+                    track + 1
+                )),
+                Err(e) => failures.push(format!("・トラック {}: {label} — {e}", track + 1)),
+            }
+        }
+        failures
+    }
+}
+
+/// 保存しておいた状態を音源へ戻す。戻せたら true。
+///
+/// 失敗しても音源自体は使えるので、呼び出し側は続行してよい
+/// (音作りだけ初期値になる)。
+fn restore_state(track: &mut TrackAudio, state: &[u8]) -> bool {
+    if state.is_empty() {
+        return true;
+    }
+    let Some(extension) = track.instance.access_handler(|mt| mt.state.get()) else {
+        return false; // state 拡張を持たない音源
+    };
+    let mut reader = std::io::Cursor::new(state);
+    extension
+        .load(&mut track.instance.plugin_handle(), &mut reader)
+        .is_ok()
+}
+
+/// 音源の今の状態を取り出す。state 拡張が無い、または失敗したときは空。
+///
+/// 空でもパスと ID は保存するので、次に開いたとき音源自体は載る。
+fn capture_state(track: &mut TrackAudio) -> Vec<u8> {
+    let Some(extension) = track.instance.access_handler(|mt| mt.state.get()) else {
+        return Vec::new();
+    };
+    let mut buffer = Vec::new();
+    if extension
+        .save(&mut track.instance.plugin_handle(), &mut buffer)
+        .is_err()
+    {
+        buffer.clear();
+    }
+    buffer
 }
 
 /// `ClearTrack` で外した処理器が返ってくるのを待つ。
@@ -807,6 +943,7 @@ fn start_engine() -> Result<Engine, Box<dyn Error>> {
 /// 戻り値の処理器は呼び出し側がエンジンへ送る。
 fn instantiate_plugin(
     entry: &PluginEntry,
+    path: &std::path::Path,
     plugin_id: &str,
     plugin_name: &str,
     stream_config: &StreamAudioConfig,
@@ -838,6 +975,8 @@ fn instantiate_plugin(
     Ok((
         TrackAudio {
             name: plugin_name.to_string(),
+            path: path.to_path_buf(),
+            id: plugin_id.to_string(),
             instance,
             receiver,
             sender,
@@ -854,10 +993,9 @@ impl eframe::App for App {
         // 起動時の自動ロード (検証用 CLI)
         if let Some((path, open_gui)) = self.autoload.take() {
             match discovery::load_clap_file(&path) {
-                Ok((entry, plugins)) => {
+                Ok((_entry, plugins)) => {
                     self.candidates = Some(Candidates {
                         path,
-                        entry,
                         plugins,
                         target_track: 0,
                     });

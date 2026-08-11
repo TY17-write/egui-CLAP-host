@@ -2,11 +2,12 @@
 //! ボリュームパラメータを1つだけ持つ。
 //! clack の polysynth サンプルを簡略化したもの。
 
-use clack_extensions::{audio_ports::*, note_ports::*, params::*};
+use clack_extensions::{audio_ports::*, note_ports::*, params::*, state::*};
 use clack_plugin::events::event_types::ParamValueEvent;
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::events::Match;
 use clack_plugin::prelude::*;
+use clack_plugin::stream::{InputStream, OutputStream};
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,7 +30,9 @@ impl Plugin for TestSinePlugin {
         builder
             .register::<PluginAudioPorts>()
             .register::<PluginNotePorts>()
-            .register::<PluginParams>();
+            .register::<PluginParams>()
+            // ホスト側のプロジェクト保存を検証できるように state も持つ
+            .register::<PluginState>();
     }
 }
 
@@ -266,6 +269,35 @@ impl TestSineAudioProcessor<'_> {
             self.voices.swap(index, self.active_voices - 1);
             self.active_voices -= 1;
         }
+    }
+}
+
+/// 状態の先頭に置く目印。別形式のデータを読まされたときに弾くため。
+const STATE_MAGIC: &[u8; 4] = b"TSS1";
+
+impl PluginStateImpl for TestSineMainThread<'_> {
+    /// 目印 + ボリューム (f32 リトルエンディアン) の8バイト
+    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
+        use std::io::Write;
+        let volume = self.shared.volume.load(Ordering::SeqCst);
+        output.write_all(STATE_MAGIC)?;
+        output.write_all(&volume.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
+        use std::io::Read;
+        let mut buffer = [0u8; 8];
+        input.read_exact(&mut buffer)?;
+        if &buffer[..4] != STATE_MAGIC {
+            return Err(PluginError::Message("状態の形式が違います"));
+        }
+        let volume = f32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+        if !volume.is_finite() {
+            return Err(PluginError::Message("ボリュームが数値ではありません"));
+        }
+        self.shared.volume.store(volume.clamp(0.0, 1.0), Ordering::SeqCst);
+        Ok(())
     }
 }
 

@@ -7,6 +7,7 @@ use clack_extensions::log::{HostLog, HostLogImpl, LogSeverity};
 use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamRescanFlags,
 };
+use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::prelude::*;
 use crossbeam_channel::Sender;
@@ -41,6 +42,7 @@ impl HostHandlers for MiniHost {
             .register::<HostLog>()
             .register::<HostParams>()
             .register::<HostGui>()
+            .register::<HostState>()
             .register::<HostTimer>();
     }
 }
@@ -109,6 +111,8 @@ pub struct MiniHostMainThread<'a> {
     pub gui: Cell<Option<PluginGui>>,
     /// プラグインのタイマー拡張 (あれば)
     pub timer_support: Cell<Option<PluginTimer>>,
+    /// プラグインの state 拡張 (あれば)。音作りをプロジェクトに保存するために使う。
+    pub state: Cell<Option<PluginState>>,
     /// ホスト側のタイマー管理
     pub timers: Rc<Timers>,
 }
@@ -120,6 +124,7 @@ impl<'a> MiniHostMainThread<'a> {
             plugin: RefCell::new(None),
             gui: Cell::new(None),
             timer_support: Cell::new(None),
+            state: Cell::new(None),
             timers: Rc::new(Timers::new()),
         }
     }
@@ -129,7 +134,15 @@ impl<'a> MainThreadHandler<'a> for MiniHostMainThread<'a> {
     fn initialized(&self, instance: InitializedPluginHandle<'a>) {
         self.gui.set(instance.get_extension());
         self.timer_support.set(instance.get_extension());
+        self.state.set(instance.get_extension());
         *self.plugin.borrow_mut() = Some(instance);
+    }
+}
+
+impl HostStateImpl for MiniHostMainThread<'_> {
+    fn mark_dirty(&self) {
+        // 「保存されていない変更がある」という通知。プロジェクトの保存は
+        // ユーザーの操作で行うので、ここでは何もしない。
     }
 }
 

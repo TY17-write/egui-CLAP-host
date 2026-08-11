@@ -26,3 +26,5 @@ uuid = { version = "1", features = ["v4"] }
 # プロジェクトファイル (.ron) の読み書き
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
+# 音源の状態 (不透明なバイト列) を .ron に載せるため
+base64 = "0.22"

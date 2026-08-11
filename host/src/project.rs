@@ -14,10 +14,42 @@
 
 use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
 use crate::swing;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-/// 今このビルドが書き出す形式のバージョン
-const VERSION: u32 = 1;
+/// 今このビルドが書き出す形式のバージョン。
+///
+/// 1: シーケンスと設定のみ / 2: 音源 (`plugins`) を追加
+const VERSION: u32 = 2;
+
+/// 音源の種別。VST3 対応時にここへ選択肢が増える。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum PluginKind {
+    #[default]
+    Clap,
+}
+
+/// 保存する音源1つぶん。
+///
+/// `main.rs` が組み立てて渡す。`project.rs` は `state` の中身を解釈しない
+/// (プラグイン形式の知識をここへ持ち込まないため)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginSnapshot {
+    pub kind: PluginKind,
+    pub path: PathBuf,
+    /// CLAP のプラグイン ID。1つのファイルに複数入りうるので、パスだけでは足りない。
+    pub id: String,
+    /// 音源が書き出した状態。中身は不透明なバイト列。
+    pub state: Vec<u8>,
+}
+
+/// 読み込んだプロジェクト
+pub struct Loaded {
+    pub editor: MidiEditor,
+    /// トラック番号順の音源。載っていないトラックは `None`。
+    pub plugins: Vec<Option<PluginSnapshot>>,
+}
 
 /// テンポの許容範囲
 const TEMPO_RANGE: std::ops::RangeInclusive<u32> = 1..=999;
@@ -62,6 +94,25 @@ struct Project {
     tracks: Vec<TrackEntry>,
     #[serde(default)]
     notes: Vec<NoteEntry>,
+    /// トラック番号順の音源。巨大になりうるので**末尾に置く**
+    /// (テンポ・拍子・ノートといった読みたい部分をファイル先頭に残すため)。
+    /// バージョン1 のファイルには無いので `default` で空になる。
+    #[serde(default)]
+    plugins: Vec<Option<PluginEntry>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PluginEntry {
+    #[serde(default)]
+    kind: PluginKind,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    id: String,
+    /// 状態を base64 にしたもの。`Vec<u8>` のまま serde に渡すと
+    /// RON では数値の配列になってしまう。
+    #[serde(default)]
+    state: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,11 +147,27 @@ struct NoteEntry {
     lane: usize,
 }
 
-/// シーケンスを .ron のテキストにする。
+/// シーケンスと音源を .ron のテキストにする。
 ///
 /// スウィングは適用しない (記譜位置をそのまま残す)。
-pub fn to_string(editor: &MidiEditor) -> Result<String, String> {
+/// `plugins` はトラック番号順で、載っていないトラックは `None`。
+pub fn to_string(
+    editor: &MidiEditor,
+    plugins: &[Option<PluginSnapshot>],
+) -> Result<String, String> {
+    let base64 = base64::engine::general_purpose::STANDARD;
     let project = Project {
+        plugins: plugins
+            .iter()
+            .map(|slot| {
+                slot.as_ref().map(|plugin| PluginEntry {
+                    kind: plugin.kind,
+                    path: plugin.path.to_string_lossy().into_owned(),
+                    id: plugin.id.clone(),
+                    state: base64.encode(&plugin.state),
+                })
+            })
+            .collect(),
         version: VERSION,
         tempo: editor.tempo,
         beats: editor.beats,
@@ -143,7 +210,7 @@ pub fn to_string(editor: &MidiEditor) -> Result<String, String> {
 }
 
 /// .ron のテキストを読む。構文・意味の両方を検証してから返す。
-pub fn from_str(text: &str) -> Result<MidiEditor, String> {
+pub fn from_str(text: &str) -> Result<Loaded, String> {
     // 1. バージョンだけ先に見る
     let probe: VersionProbe = ron::from_str(text)
         .map_err(|e| format!("プロジェクトファイルとして読めません:\n{e}"))?;
@@ -169,6 +236,32 @@ pub fn from_str(text: &str) -> Result<MidiEditor, String> {
     }
 
     Ok(build(project))
+}
+
+/// 検証済みの音源欄をデータへ移す。
+///
+/// base64 が壊れているものは**その音源だけ捨てる**（トラックは音源なしになる）。
+/// ノートやトラック構成は無事なので、プロジェクト全体を拒否するのは損が大きい。
+fn build_plugins(entries: Vec<Option<PluginEntry>>, tracks: usize) -> Vec<Option<PluginSnapshot>> {
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let mut plugins: Vec<Option<PluginSnapshot>> = entries
+        .into_iter()
+        .map(|slot| {
+            let entry = slot?;
+            if entry.path.is_empty() {
+                return None;
+            }
+            Some(PluginSnapshot {
+                kind: entry.kind,
+                path: PathBuf::from(entry.path),
+                id: entry.id,
+                state: base64.decode(&entry.state).unwrap_or_default(),
+            })
+        })
+        .collect();
+    // トラック数と長さを揃える (音源欄が短い/長いファイルへの備え)
+    plugins.resize(tracks, None);
+    plugins
 }
 
 /// 意味の検証。見つかった問題を人が読める形で並べて返す。
@@ -242,8 +335,10 @@ fn validate(project: &Project) -> Vec<String> {
 }
 
 /// 検証済みのファイル内容をデータモデルに移す
-fn build(project: Project) -> MidiEditor {
-    MidiEditor {
+fn build(project: Project) -> Loaded {
+    let tracks = project.tracks.len().max(1);
+    let plugins = build_plugins(project.plugins, tracks);
+    let editor = MidiEditor {
         notes: project
             .notes
             .into_iter()
@@ -280,12 +375,23 @@ fn build(project: Project) -> MidiEditor {
         swing_peak_ratio: project
             .swing_peak_ratio
             .clamp(swing::MIN_PEAK_RATIO, swing::MAX_PEAK_RATIO),
-    }
+    };
+    Loaded { editor, plugins }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 音源なしで書き出す (音源を扱わないテスト用)
+    fn save(editor: &MidiEditor) -> String {
+        to_string(editor, &[]).unwrap()
+    }
+
+    /// 読み込んでエディタだけ取り出す
+    fn load(text: &str) -> Result<MidiEditor, String> {
+        from_str(text).map(|loaded| loaded.editor)
+    }
 
     fn sample() -> MidiEditor {
         let mut editor = MidiEditor::default();
@@ -327,7 +433,7 @@ mod tests {
     #[test]
     fn round_trip_keeps_everything() {
         let original = sample();
-        let restored = from_str(&to_string(&original).unwrap()).unwrap();
+        let restored = load(&save(&original)).unwrap();
 
         assert_eq!(restored.tempo, original.tempo);
         assert_eq!(restored.beats, original.beats);
@@ -341,7 +447,7 @@ mod tests {
     /// スウィングの設定が保存されること (MIDI では持てなかったもの)
     #[test]
     fn round_trip_keeps_swing_settings() {
-        let restored = from_str(&to_string(&sample()).unwrap()).unwrap();
+        let restored = load(&save(&sample())).unwrap();
         assert!(!restored.tracks[0].swing, "伴奏は OFF のまま");
         assert!(restored.tracks[1].swing, "ソロは ON のまま");
         assert_eq!(restored.swing_peak_ratio, 1.75);
@@ -362,9 +468,94 @@ mod tests {
             lane: 0,
         }];
 
-        let restored = from_str(&to_string(&editor).unwrap()).unwrap();
+        let restored = load(&save(&editor)).unwrap();
         assert_eq!(restored.notes[0].start_tick, 0.0, "拍頭のまま");
         assert_eq!(restored.notes[0].duration, 0.5);
+    }
+
+    fn snapshot(path: &str, id: &str, state: &[u8]) -> PluginSnapshot {
+        PluginSnapshot {
+            kind: PluginKind::Clap,
+            path: PathBuf::from(path),
+            id: id.into(),
+            state: state.to_vec(),
+        }
+    }
+
+    /// 音源のパス・ID・状態が往復すること
+    #[test]
+    fn round_trip_keeps_plugins() {
+        let editor = sample(); // トラック2本
+        let plugins = vec![
+            Some(snapshot("C:\\音源\\Surge XT.clap", "org.surge-synth-team.surge-xt", &[0, 1, 2, 255])),
+            None,
+        ];
+
+        let restored = from_str(&to_string(&editor, &plugins).unwrap()).unwrap();
+        assert_eq!(restored.plugins, plugins);
+    }
+
+    /// 状態は base64 で載ること (数値の配列にしない)
+    #[test]
+    fn state_is_stored_as_base64() {
+        let plugins = vec![Some(snapshot("a.clap", "x", b"Hello"))];
+        let text = to_string(&MidiEditor::default(), &plugins).unwrap();
+
+        assert!(text.contains("SGVsbG8="), "base64 で載ること: {text}");
+        assert!(!text.contains("state: ["), "数値の配列にしないこと");
+    }
+
+    /// 音源欄はファイル末尾に置くこと (読みたい部分を先頭に残すため)
+    #[test]
+    fn plugins_are_written_last() {
+        let plugins = vec![Some(snapshot("a.clap", "x", &[0; 64]))];
+        let text = to_string(&sample(), &plugins).unwrap();
+
+        let at = |needle: &str| text.find(needle).expect(needle);
+        assert!(at("tempo:") < at("plugins:"));
+        assert!(at("notes:") < at("plugins:"));
+    }
+
+    /// バージョン1 のファイル (音源欄なし) がそのまま読めること
+    #[test]
+    fn version_one_files_still_load() {
+        let text = "(version: 1, tempo: 120, beats: 4, beat_type: 4, \
+                    tracks: [ (name: \"A\", lanes: 1) ], \
+                    notes: [ (start: 0.0, duration: 1.0) ])";
+
+        let loaded = from_str(text).expect("読めること");
+        assert_eq!(loaded.editor.tempo, 120);
+        assert_eq!(loaded.plugins, vec![None], "音源なしとして扱うこと");
+    }
+
+    /// 音源欄の長さがトラック数と合わなくても、トラック数に揃うこと
+    #[test]
+    fn plugin_list_is_resized_to_the_tracks() {
+        let editor = sample(); // トラック2本
+        // 音源を3つ書いた壊れたファイル相当
+        let plugins = vec![
+            Some(snapshot("a.clap", "x", b"1")),
+            Some(snapshot("b.clap", "y", b"2")),
+            Some(snapshot("c.clap", "z", b"3")),
+        ];
+
+        let restored = from_str(&to_string(&editor, &plugins).unwrap()).unwrap();
+        assert_eq!(restored.plugins.len(), 2, "トラック数に揃うこと");
+    }
+
+    /// base64 が壊れていても、その音源だけを捨ててプロジェクトは読めること
+    #[test]
+    fn broken_state_only_drops_that_plugin() {
+        let text = "(version: 2, tempo: 120, beats: 4, beat_type: 4, \
+                    tracks: [ (name: \"A\", lanes: 1) ], \
+                    notes: [ (start: 0.0, duration: 1.0) ], \
+                    plugins: [ Some((kind: Clap, path: \"a.clap\", id: \"x\", state: \"!!!壊れた!!!\")) ])";
+
+        let loaded = from_str(text).expect("プロジェクト自体は読めること");
+        assert_eq!(loaded.editor.notes.len(), 1, "ノートは無事であること");
+        let plugin = loaded.plugins[0].as_ref().expect("音源は残ること");
+        assert!(plugin.state.is_empty(), "状態だけ諦めること");
+        assert_eq!(plugin.id, "x");
     }
 
     /// 知らないフィールドは無視し、欠けたフィールドは既定値で埋めること。
@@ -381,7 +572,7 @@ mod tests {
             notes: [ (start: 0.0, duration: 1.0, velocity: 90) ],
         )"#;
 
-        let editor = from_str(text).expect("読めること");
+        let editor = load(text).expect("読めること");
         assert_eq!(editor.tempo, 140);
         assert_eq!(editor.tracks[0].name, "A");
         assert_eq!(editor.scale, ScaleMode::Equal12, "省略時は既定の音階");
@@ -398,14 +589,14 @@ mod tests {
     #[test]
     fn newer_versions_are_refused_clearly() {
         let text = "(version: 99, tempo: 120, beats: 4, beat_type: 4, tracks: [], notes: [])";
-        let error = from_str(text).unwrap_err();
+        let error = load(text).unwrap_err();
         assert!(error.contains("バージョン 99"), "実際: {error}");
     }
 
     /// 壊れた構文は位置つきで伝えること
     #[test]
     fn broken_syntax_is_reported() {
-        let error = from_str("これは RON ではありません").unwrap_err();
+        let error = load("これは RON ではありません").unwrap_err();
         assert!(error.contains("読めません"), "実際: {error}");
     }
 
@@ -419,11 +610,11 @@ mod tests {
             )
         };
 
-        assert!(from_str(&doc("120", "4", "4")).is_ok(), "正常なものは通ること");
-        assert!(from_str(&doc("0", "4", "4")).unwrap_err().contains("テンポ"));
-        assert!(from_str(&doc("1000", "4", "4")).unwrap_err().contains("テンポ"));
-        assert!(from_str(&doc("120", "0", "4")).unwrap_err().contains("分子"));
-        assert!(from_str(&doc("120", "4", "3")).unwrap_err().contains("分母"));
+        assert!(load(&doc("120", "4", "4")).is_ok(), "正常なものは通ること");
+        assert!(load(&doc("0", "4", "4")).unwrap_err().contains("テンポ"));
+        assert!(load(&doc("1000", "4", "4")).unwrap_err().contains("テンポ"));
+        assert!(load(&doc("120", "0", "4")).unwrap_err().contains("分子"));
+        assert!(load(&doc("120", "4", "3")).unwrap_err().contains("分母"));
     }
 
     /// ノートの値が範囲外なら弾くこと
@@ -437,7 +628,7 @@ mod tests {
         };
 
         assert!(
-            from_str(&doc("start: 0.0, duration: 1.0")).is_ok(),
+            load(&doc("start: 0.0, duration: 1.0")).is_ok(),
             "正常なものは通ること"
         );
         for (note, expected) in [
@@ -447,7 +638,7 @@ mod tests {
             ("start: 0.0, duration: 1.0, track: 5", "トラック"),
             ("start: 0.0, duration: 1.0, lane: 7", "段"),
         ] {
-            let error = from_str(&doc(note)).unwrap_err();
+            let error = load(&doc(note)).unwrap_err();
             assert!(
                 error.contains(expected),
                 "{note} で「{expected}」を指摘すること。実際: {error}"
@@ -465,7 +656,7 @@ mod tests {
                  tracks: [ (name: \"A\", lanes: 1) ], \
                  notes: [ (start: {value}, duration: 1.0) ])"
             );
-            let error = from_str(&text).unwrap_err();
+            let error = load(&text).unwrap_err();
             assert!(error.contains("数値ではありません"), "{value}: {error}");
         }
     }
@@ -474,7 +665,7 @@ mod tests {
     #[test]
     fn every_problem_is_listed_at_once() {
         let text = "(version: 1, tempo: 0, beats: 0, beat_type: 3, tracks: [], notes: [])";
-        let error = from_str(text).unwrap_err();
+        let error = load(text).unwrap_err();
 
         assert!(error.contains("テンポ"));
         assert!(error.contains("分子"));
