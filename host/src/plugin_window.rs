@@ -16,9 +16,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
     GetWindowLongPtrW, LoadCursorW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, IDC_ARROW, SIZE_MINIMIZED, SWP_NOMOVE,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_SIZE, WNDCLASSW,
-    WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, IDC_ARROW, SIZE_MINIMIZED,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WM_CLOSE,
+    WM_DESTROY, WM_NCCREATE, WM_SIZE, WNDCLASSW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
+    WS_THICKFRAME,
 };
 
 /// ウィンドウクラス名 (UTF-16, NUL 終端)
@@ -95,7 +96,8 @@ impl PluginWindow {
         Some(Self { hwnd })
     }
 
-    /// CLAP の set_parent に渡す HWND
+    /// プラグインに渡す HWND
+    /// (CLAP は `gui.set_parent`、VST3 は `IPlugView::attached` の行き先)
     pub fn hwnd(&self) -> *mut c_void {
         self.hwnd
     }
@@ -119,6 +121,36 @@ impl PluginWindow {
                 rect.right - rect.left,
                 rect.bottom - rect.top,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 枠のリサイズ可否を後から変える。
+    ///
+    /// VST3 では「リサイズできるか」を開く前に聞くと、そのためだけに使い捨ての
+    /// エディタが作られてしまう (重い音源だと数秒かかる)。貼り付けたあとに聞いて
+    /// ここで直すほうが速い。
+    pub fn set_resizable(&self, resizable: bool) {
+        unsafe {
+            let current = GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32;
+            let updated = if resizable {
+                current | WS_THICKFRAME | WS_MAXIMIZEBOX
+            } else {
+                current & !(WS_THICKFRAME | WS_MAXIMIZEBOX)
+            };
+            if updated == current {
+                return;
+            }
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, updated as isize);
+            // 枠を描き直させる。位置と大きさは触らない
+            SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
     }

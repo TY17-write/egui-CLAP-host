@@ -438,8 +438,13 @@ impl StreamAudioProcessor {
 
         let steady = self.steady_counter;
         for track in self.tracks.iter_mut().flatten() {
-            if let Err(e) = track.process(steady, mix) {
-                eprintln!("{e}");
+            match track.process(steady, mix) {
+                Ok(()) => {}
+                // 想定内で、放っておけば直る。VST3 のエディタを開くときに
+                // 数秒ぶん出ることがあり (音源の生成が重い)、そのたびに
+                // オーディオスレッドから書き出すほうが害が大きい
+                Err(ProcessError::Busy) => {}
+                Err(e) => eprintln!("{e}"),
             }
         }
 

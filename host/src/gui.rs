@@ -1,5 +1,12 @@
-//! プラグイン独自 GUI (clap.gui 拡張) の管理。
-//! embedded (Win32 埋め込み) を優先し、非対応なら floating にフォールバックする。
+//! プラグイン独自 GUI の管理。
+//!
+//! CLAP ([`PluginGuiManager`]) と VST3 ([`Vst3GuiManager`]) で別の型になる。
+//! 拡張の呼び方が違うだけで、**ネイティブウィンドウ (`plugin_window.rs`) は共通**。
+//! ホストが Win32 の窓を作り、プラグインにはその HWND を渡して中身を描かせる、
+//! という組み立ては両形式で同じ。
+//!
+//! CLAP は embedded (Win32 埋め込み) を優先し、非対応なら floating に落とす。
+//! VST3 に floating に当たるものは無いので、常に埋め込みになる。
 
 #![allow(unsafe_code)]
 
@@ -12,6 +19,7 @@ use clack_host::prelude::*;
 use crossbeam_channel::Sender;
 use std::error::Error;
 use std::ffi::CString;
+use vst3_host::plugin::{Plugin as Vst3Plugin, WindowHandle};
 
 /// プラグイン GUI の状態を管理する (メインスレッド専用)
 pub struct PluginGuiManager {
@@ -176,6 +184,133 @@ impl PluginGuiManager {
     pub fn close(&mut self, plugin: &mut PluginMainThreadHandle) {
         if self.is_open {
             self.plugin_gui.destroy(plugin);
+            self.is_open = false;
+        }
+        // Drop で DestroyWindow が呼ばれる
+        self.window = None;
+    }
+}
+
+/// エディタを貼り付ける前の仮のウィンドウサイズ。
+///
+/// 本来のサイズもリサイズ可否も、**貼り付けたあとに**聞いて合わせる。開く前に
+/// 聞くこともできるが、エディタが無い状態での問い合わせは**そのためだけに
+/// 使い捨ての view を作る**。Surge XT ではエディタの生成そのものが数秒かかり、
+/// その間ずっと音源を握ることになる (= そのトラックが無音になる) ので、
+/// 問い合わせは生きている view に対してだけ行う。
+const VST3_PROVISIONAL_SIZE: (u32, u32) = (640, 480);
+
+/// VST3 エディタの管理 (メインスレッド専用)。
+///
+/// `IPlugView` を直接叩くのではなく `vst3-host` の `open_editor` / `close_editor` を
+/// 使う。中身は `createView` → `setFrame` → `attached(hwnd, kPlatformTypeHWND)` で、
+/// **窓を作るのはこちら**。`vst3-host` 側の `PluginWindow` / `EmbeddedEditor` には
+/// 頼っていない (どちらも Windows での実行時検証がされていないため)。
+pub struct Vst3GuiManager {
+    /// エディタを埋め込むネイティブウィンドウ (CLAP と同じ型)
+    window: Option<PluginWindow>,
+    pub is_open: bool,
+    /// このプラグインがエディタを持つか
+    has_editor: bool,
+}
+
+impl Vst3GuiManager {
+    pub fn new(plugin: &Vst3Plugin) -> Self {
+        Self {
+            window: None,
+            is_open: false,
+            has_editor: plugin.has_editor(),
+        }
+    }
+
+    /// このプラグインでエディタを開けるか
+    pub fn supports_gui(&self) -> bool {
+        self.has_editor
+    }
+
+    /// エディタを開く
+    pub fn open(
+        &mut self,
+        plugin: &mut Vst3Plugin,
+        title: &str,
+        sender: Sender<MainThreadMessage>,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.is_open {
+            return Ok(());
+        }
+        if !self.has_editor {
+            return Err("このプラグインはエディタを持っていません".into());
+        }
+
+        // まず仮の大きさ・リサイズ可で窓を作って貼り付ける。
+        // 大きさも可否も、生きている view に聞き直して後から直す。
+        let (width, height) = VST3_PROVISIONAL_SIZE;
+        let window = PluginWindow::create(title, width, height, true, sender)
+            .ok_or("ネイティブウィンドウの作成に失敗しました")?;
+
+        // SAFETY: window はエディタを閉じる (close) まで生存する
+        unsafe { plugin.open_editor(WindowHandle::from_hwnd(window.hwnd()))? };
+
+        window.set_resizable(plugin.editor_can_resize());
+        if let Ok((width, height)) = plugin.get_editor_size() {
+            if width > 0 && height > 0 {
+                window.resize_client(width as u32, height as u32);
+            }
+        }
+
+        self.window = Some(window);
+        self.is_open = true;
+        Ok(())
+    }
+
+    /// プラグイン発のリサイズ要求 (`IPlugFrame::resizeView`) を拾う。
+    ///
+    /// CLAP は要求がコールバックで届くが、VST3 は溜まった要求を取りに行く形なので、
+    /// エディタを開いている間は毎フレーム呼ぶこと。
+    ///
+    /// view 側の `onSize` は `vst3-host` が要求を受けた時点で済ませているので、
+    /// ここでやることはこちらの窓を合わせるだけ。
+    pub fn poll_resize_request(&mut self, plugin: &Vst3Plugin) {
+        if !self.is_open {
+            return;
+        }
+        let Some((width, height)) = plugin.take_editor_resize_request() else {
+            return;
+        };
+        if let Some(window) = &self.window {
+            if width > 0 && height > 0 {
+                window.resize_client(width as u32, height as u32);
+            }
+        }
+    }
+
+    /// ユーザーがネイティブウィンドウをリサイズしたときの処理。
+    ///
+    /// 固定サイズのエディタでも `resize_editor` が今のサイズを返してくるので、
+    /// CLAP 側のように分岐を書き分ける必要はない。
+    pub fn on_user_resized(&mut self, plugin: &mut Vst3Plugin, width: u32, height: u32) {
+        if !self.is_open {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        let Ok((accepted_width, accepted_height)) =
+            plugin.resize_editor(width.max(1) as i32, height.max(1) as i32)
+        else {
+            return;
+        };
+
+        if accepted_width as u32 != width || accepted_height as u32 != height {
+            window.resize_client(accepted_width.max(1) as u32, accepted_height.max(1) as u32);
+        }
+    }
+
+    /// エディタを閉じてリソースを解放する
+    pub fn close(&mut self, plugin: &mut Vst3Plugin) {
+        if self.is_open {
+            let _ = plugin.close_editor();
             self.is_open = false;
         }
         // Drop で DestroyWindow が呼ばれる

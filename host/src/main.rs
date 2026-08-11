@@ -19,7 +19,7 @@ use clack_host::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use editor_ui::{EditorCommand, EditorState};
-use gui::PluginGuiManager;
+use gui::{PluginGuiManager, Vst3GuiManager};
 use host::{MainThreadMessage, MiniHost, MiniHostMainThread, MiniHostShared};
 use params::ParamUi;
 use project::PluginSnapshot;
@@ -166,6 +166,11 @@ struct Vst3Track {
     /// オーディオスレッドの処理器と同じ音源を指す。
     /// 触るときは必ず `lock()` する (相手は1ブロックしか握らない)。
     plugin: SharedPlugin,
+    /// ネイティブウィンドウからの通知 (閉じる・リサイズ)。
+    /// CLAP と違い、プラグイン発の要求はこちらから取りに行く。
+    receiver: Receiver<MainThreadMessage>,
+    sender: Sender<MainThreadMessage>,
+    gui: Vst3GuiManager,
 }
 
 impl TrackAudio {
@@ -223,10 +228,17 @@ impl TrackAudio {
 
 impl Drop for TrackAudio {
     fn drop(&mut self) {
-        // インスタンス破棄前にプラグイン GUI を確実に閉じる
-        if let TrackPlugin::Clap(clap) = &mut self.plugin {
-            if let Some(gui) = &mut clap.gui {
-                gui.close(&mut clap.instance.plugin_handle());
+        // 音源の破棄前にプラグイン GUI を確実に閉じる
+        // (窓だけ残ると、貼り付いていた view の後始末が宙に浮く)
+        match &mut self.plugin {
+            TrackPlugin::Clap(clap) => {
+                if let Some(gui) = &mut clap.gui {
+                    gui.close(&mut clap.instance.plugin_handle());
+                }
+            }
+            TrackPlugin::Vst3(vst3) => {
+                let mut plugin = vst3.plugin.lock();
+                vst3.gui.close(&mut plugin);
             }
         }
     }
@@ -1118,13 +1130,21 @@ fn instantiate_vst3(
 ) -> Result<(TrackAudio, Box<audio::TrackProcessor>), Box<dyn Error>> {
     let (plugin, processor) = audio::activate_vst3_track(path, class_id, stream_config)?;
 
+    let gui = Vst3GuiManager::new(&plugin.lock());
+    let (sender, receiver) = crossbeam_channel::unbounded();
+
     Ok((
         TrackAudio {
             name: plugin_name.to_string(),
             path: path.to_path_buf(),
             id: class_id.to_string(),
             pressed_keys: HashSet::new(),
-            plugin: TrackPlugin::Vst3(Vst3Track { plugin }),
+            plugin: TrackPlugin::Vst3(Vst3Track {
+                plugin,
+                receiver,
+                sender,
+                gui,
+            }),
         },
         processor,
     ))
@@ -1158,16 +1178,21 @@ impl eframe::App for App {
                     if open_gui {
                         if let Some(Some(track)) = self.tracks.get_mut(0) {
                             let name = track.name.clone();
-                            if let TrackPlugin::Clap(clap) = &mut track.plugin {
-                                if let Some(gui) = &mut clap.gui {
-                                    if let Err(e) = gui.open(
+                            let opened = match &mut track.plugin {
+                                TrackPlugin::Clap(clap) => clap.gui.as_mut().map(|gui| {
+                                    gui.open(
                                         &mut clap.instance.plugin_handle(),
                                         &name,
                                         clap.sender.clone(),
-                                    ) {
-                                        self.error = Some(format!("GUI を開けません: {e}"));
-                                    }
+                                    )
+                                }),
+                                TrackPlugin::Vst3(vst3) => {
+                                    let mut plugin = vst3.plugin.lock();
+                                    Some(vst3.gui.open(&mut plugin, &name, vst3.sender.clone()))
                                 }
+                            };
+                            if let Some(Err(e)) = opened {
+                                self.error = Some(format!("GUI を開けません: {e}"));
                             }
                         }
                     }
@@ -1179,11 +1204,41 @@ impl eframe::App for App {
         // 差し替えで外した音源をここで停止・解放する
         self.drain_retired();
 
-        // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理。
-        // ここは CLAP 固有 (VST3 の GUI はフェーズ3 で足す)。
+        // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理
         for track in self.tracks.iter_mut().flatten() {
-            let TrackPlugin::Clap(clap) = &mut track.plugin else {
-                continue;
+            let clap = match &mut track.plugin {
+                TrackPlugin::Clap(clap) => clap,
+                TrackPlugin::Vst3(vst3) => {
+                    // エディタを閉じているときは音源に触らない
+                    // (触るぶんだけオーディオスレッドと取り合いになる)
+                    if !vst3.gui.is_open && vst3.receiver.is_empty() {
+                        continue;
+                    }
+                    // ここで待ってはいけない。毎フレーム待ちに行くと、オーディオ
+                    // スレッドが手放すたびに横取りする形になり、次のブロックが
+                    // 落ちるのが常態化する。取れなければ次のフレームでよい。
+                    let Some(mut plugin) = vst3.plugin.try_lock() else {
+                        continue;
+                    };
+                    while let Ok(msg) = vst3.receiver.try_recv() {
+                        match msg {
+                            MainThreadMessage::PluginWindowClosed => vst3.gui.close(&mut plugin),
+                            MainThreadMessage::PluginWindowResized { width, height } => {
+                                vst3.gui.on_user_resized(&mut plugin, width, height)
+                            }
+                            // CLAP 拡張から来るものなので VST3 では届かない
+                            MainThreadMessage::RunOnMainThread
+                            | MainThreadMessage::GuiRequestResized { .. }
+                            | MainThreadMessage::GuiClosed => {}
+                        }
+                    }
+                    // プラグイン発のリサイズ要求はこちらから取りに行く
+                    vst3.gui.poll_resize_request(&plugin);
+                    // VSTGUI のエディタは Linux でこれを回さないと描画されない
+                    // (Windows では何もしない)
+                    plugin.service_run_loop();
+                    continue;
+                }
             };
             while let Ok(msg) = clap.receiver.try_recv() {
                 match msg {
@@ -1320,9 +1375,25 @@ impl eframe::App for App {
                                 }
                             }
                         }
-                        // VST3 のエディタはフェーズ3。載っていることだけ見せる
-                        TrackPlugin::Vst3(_) => {
-                            ui.weak("VST3 (エディタは未対応)");
+                        TrackPlugin::Vst3(vst3) => {
+                            ui.weak("VST3");
+                            if vst3.gui.supports_gui() {
+                                if !vst3.gui.is_open {
+                                    if ui.button("エディタを開く").clicked() {
+                                        let mut plugin = vst3.plugin.lock();
+                                        if let Err(e) = vst3.gui.open(
+                                            &mut plugin,
+                                            &track.name,
+                                            vst3.sender.clone(),
+                                        ) {
+                                            gui_error = Some(format!("GUI を開けません: {e}"));
+                                        }
+                                    }
+                                } else if ui.button("エディタを閉じる").clicked() {
+                                    let mut plugin = vst3.plugin.lock();
+                                    vst3.gui.close(&mut plugin);
+                                }
+                            }
                         }
                     }
                 });
