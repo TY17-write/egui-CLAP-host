@@ -267,6 +267,87 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 | **3** | VST3 の GUI（自前の Win32 埋め込みを使う） | **完了** |
 | **4** | 仕上げ（CLAP と VST3 の混在確認、ドキュメント） | **完了** |
 | **5** | 素の DLL 形式（単体ファイル）の `.vst3` を選べるようにする | **完了** |
+| **6** | エディタが開けない音源の切り分けと修正（`vst3-host` をフォーク） | **完了** |
+
+### フェーズ6: エディタが開けない音源（計測結果）
+
+Kontakt 7 で「GUI を開けません: Failed to get view size」が出たので、
+`editor_smoke` を足して手元の音源を総なめした。**Kontakt 固有の話ではなく、
+手元の VST3 の半分が開けない。**
+
+| 結果 | 数 | 音源 |
+|---|---|---|
+| 開けた | 12 | Pianoteq 9 / FM8 / Reaktor 6 / Driver / Supercharger / Transient Master / Solid EQ / Repro-1 / MODO BASS 2 / TypeA / smartcomp2 / TR5 EQual |
+| `Failed to get view size` | 10 | Kontakt 7 / Massive X / Raum / Flair / Choral / Bite / Phasis / Freak / Replika XT / Guitar Rig 6 |
+| `plugin editor returned an invalid width` | 1 | Battery 4 |
+| `Plugin rejected editor plug frame: 0x80004001` | 1 | Philharmonik 2 |
+| 判定できず（タイムアウト） | 1 | WaveShell1-VST3 15.0 |
+
+**「使い捨ての探り view」説は否定された。** ロード時の探り view
+（`plugin_impl.rs:1446`）は**全音源で同一の経路**を通る。FM8 と Massive X で
+コードの動きは1命令も変わらないのに、片方だけ開ける。したがって探り view は
+成否を分ける要因になりえない。分けているのは音源自身の振る舞いのほう。
+
+**ベンダーではなく UI フレームワークの世代で割れている。** 同じ Native Instruments
+でも、古い世代（FM8・Reaktor 6・Driver・Supercharger・Transient Master・Solid EQ）は
+開け、新しい世代（Kontakt 7・Massive X・Raum・Flair・Choral・Bite・Phasis・Freak・
+Replika XT・Guitar Rig 6）は開けない。**新しい世代は UI を `attached()` の時点で
+初めて組み立てるので、その前に大きさを聞かれても答えられない。**
+
+失敗はどれも **0.01 秒**で返る。view は作れていて、中身がまだ無いだけ。
+
+**3つの失敗はすべて同じ性質で、`vst3-host` が厳しすぎる。**
+
+| 音源の返し方 | クレートの扱い | 本来 |
+|---|---|---|
+| `getSize` が非 OK | 致命的エラー | 既定の大きさで貼り、後で直させる |
+| `getSize` が OK で 0×0（Battery 4） | 致命的エラー（`view_rect_size`） | 同上 |
+| `setFrame` が `kNotImplemented`（Philharmonik 2） | 致命的エラー | 無視して続行。frame は任意 |
+
+`0x80004001` は `E_NOTIMPL`。frame を実装していないだけの音源を弾いている。
+
+**直せば通る見込みは高い。** `open_editor` の中で `view_rect` は**最初から
+400×300 で初期化されており**、`getSize` が失敗しても値としてはそのまま使える。
+貼り付けたあとの本当の大きさは、こちら側が既に `poll_resize_request`
+（`IPlugFrame::resizeView`）で受け取れる。つまり**ホスト側の受け皿は揃っていて、
+クレートが手前で諦めているだけ**。
+
+**修正はクレートの中なので、フォークした。** <https://github.com/TY17-write/rust-vst3-host>
+を `host/Cargo.toml` から git 依存で指す。コミットは `Cargo.lock` が固定する。
+
+#### 修正の中身と結果
+
+`open_editor` の3つの判定を診断ログに落とし、`close_editor` の同種の判定も直した
+（`setFrame` を受け付けなかった view は、それを外すこともできない。開けたものは
+閉じられなければならない）。
+
+決め手は **`getSize` が埋める矩形がその後どこでも使われていない**こと。ホストは
+貼り付けたあとに `get_editor_size()` で聞き直すし、該当する音源は attach 直後に
+`IPlugFrame::resizeView` で本当の大きさを送ってくる。**あの検証は何も守っていない
+ゲートだった。**
+
+計測しなおした結果、**24個中24個が開く**（修正前は12個）。元から開けていた12個は
+大きさも含めて変化なし。
+
+| 音源 | 前 | 後 |
+|---|---|---|
+| Kontakt 7 | `Failed to get view size` | 1023x637 |
+| Massive X | 同上 | 1249x723 |
+| Guitar Rig 6 | 同上 | 1110x780 |
+| Replika XT | 同上 | 1089x472 |
+| Raum | 同上 | 616x382 |
+| Flair / Choral / Bite / Phasis / Freak | 同上 | 446x382 |
+| Battery 4 | `invalid width` | 1176x650 |
+| Philharmonik 2 | `rejected editor plug frame` | 850x625 |
+
+**PapyrusKeys（フェーズ5 で見送った件）も同じフォークで直した。** 互換情報は
+「古いクラス ID を新しいものへ読み替える」ためだけの任意のメタデータなので、
+取れないことが読み込みを止めてよい理由にならない。断られた場合と空の場合を
+「マッピングなし」として扱う（受け取れた JSON の検証は元のまま厳しくしてある）。
+列挙・装填・エディタ（1200x720）すべて通るようになった。
+
+**上流へ報告する価値がある。** クレートの README に「Windows のエディタ経路は
+作者が一度も実行していない」と明記されており、今回の3件はいずれもそこに当たる。
 
 ### フェーズ5 で分かったこと（実装後）
 
@@ -305,8 +386,7 @@ Error: PluginLoadFailed("IPluginCompatibility::getCompatibilityJSON failed: 0x1"
 （`plugin_impl.rs:1265`）も同じ関数を通るので、列挙だけでなく装填も失敗する。
 
 手元の 17 個で当たったのは `PapyrusKeys` の1つだけ。クレートの中で起きるので
-**公開 API では回避できない**。直すならフォークして `[patch.crates-io]` を張るか、
-上流へ報告するかになる。今は入れていない。
+**公開 API では回避できない**。→ **フェーズ6 のフォークで修正済み。**
 
 ### フェーズ4 で分かったこと（実装後）
 

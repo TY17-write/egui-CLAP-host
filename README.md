@@ -15,10 +15,14 @@ CLAP の C API を安全な Rust API で包み、**main-thread / audio-thread �
 担保**してくれるクレートです。crates.io に安定版が出ていないため git 依存とし、`Cargo.lock` で
 コミットを固定しています。
 
+**`vst3-host` も crates.io 版ではなくフォークを使っています。** エディタを開く経路と
+単体ファイル形式の読み込みに、手元の音源の多くが通らない箇所があったためです
+(内訳は [docs/vst3_host_plan.md](docs/vst3_host_plan.md) のフェーズ6)。
+
 | クレート | 用途 | ライセンス |
 |---|---|---|
 | [clack](https://github.com/prokopyl/clack) | CLAP ホスト/プラグイン実装 | MIT OR Apache-2.0 |
-| [vst3-host](https://crates.io/crates/vst3-host) | VST3 ホスト実装 | MIT |
+| [vst3-host](https://github.com/TY17-write/rust-vst3-host) (フォーク) | VST3 ホスト実装 | MIT |
 | cpal | オーディオ出力 | Apache-2.0 |
 | eframe / egui | GUI | MIT OR Apache-2.0 |
 | midly | 標準 MIDI ファイルの読み書き | Unlicense |
@@ -80,6 +84,9 @@ cargo run -p clap-host-test --bin vst3_smoke -- "C:\Program Files\Common Files\V
 
 # CLAP と VST3 を別トラックに載せた同時再生の検証
 cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap "C:\Program Files\Common Files\VST3\Surge Synth Team\Surge XT.vst3"
+
+# VST3 のエディタを開けるかだけの検証 (音は鳴らさない。GUI ウィンドウが一瞬出る)
+cargo run -p clap-host-test --bin editor_smoke -- "C:\Program Files\Common Files\VST3\Kontakt 7.vst3"
 
 # ユニットテスト
 cargo test -p clap-host-test --lib

@@ -10,7 +10,11 @@ clack-extensions = { workspace = true }
 # VST3 音源のホスティング。VST3 SDK 3.8.0 が MIT になったことで使えるようになった。
 # cpal バックエンドとプロセス分離は本体に同等の経路があるので既定機能を切る
 # (C のツールチェーンも不要になる)。
-vst3-host = { version = "0.9", default-features = false }
+#
+# crates.io 版ではなくフォークを指す。エディタを開く経路に手元の音源の半分が
+# 通らない箇所があり、上流待ちにできないため (docs/vst3_host_plan.md のフェーズ6)。
+# 版はここで固定しないが、Cargo.lock がコミットを固定するので再現性は保たれる。
+vst3-host = { git = "https://github.com/TY17-write/rust-vst3-host.git", default-features = false }
 cpal = "0.15"
 crossbeam-channel = "0.5"
 eframe = "0.31"
