@@ -10,8 +10,18 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, vec2,
 };
 
-/// 1四分音符の横幅 (ピクセル)
+/// 1四分音符の横幅の既定値 (ピクセル)。
+/// 実際の幅は `EditorState::ppq` (横ズームで変わる)
 const PPQ: f32 = 80.0;
+/// 1四分音符の横幅の下限。小節線が潰れて拍が読めなくなるので、これ以上は縮めない
+const MIN_PPQ: f32 = 16.0;
+/// 1四分音符の横幅の上限
+const MAX_PPQ: f32 = 480.0;
+/// Ctrl+中ドラッグ 1px あたりの横ズーム倍率。
+///
+/// 画面の端から端まで (およそ 900px) 動かして 200 倍前後になる大きさ。
+/// これより小さいと、下限から上限まで動かすのに何往復も必要になる。
+const PPQ_ZOOM_PER_PIXEL: f32 = 1.006;
 /// 段の高さの既定値。実際の高さは `EditorState::row_h` (縦ズームで変わる)
 const ROW_H: f32 = 24.0;
 /// 段の高さの下限。左のトラック欄のボタンが潰れるので、これ以上は縮めない
@@ -239,6 +249,9 @@ pub struct EditorState {
     /// 段1つの高さ (縦ズーム)。段が少ないときに広げて操作しやすくするためのもの。
     /// MIN_ROW_H..=MAX_ROW_H に収める (set_row_h を通すこと)。
     row_h: f32,
+    /// 四分音符1つの横幅 (横ズーム)。
+    /// MIN_PPQ..=MAX_PPQ に収める (set_ppq を通すこと)。
+    ppq: f32,
     /// プロジェクトの保存先 (表示用。実際のパス管理は main 側)
     pub project_path: Option<String>,
     /// トラックごとに載っている音源の名前 (表示用。main 側が毎フレーム更新する)
@@ -252,8 +265,25 @@ pub struct EditorState {
     /// ないため反映しない (新規ノートの設定が意図せず書き換わるのを防ぐ)。
     track_last_note: bool,
     drag: Option<DragState>,
-    /// 中クリックドラッグでスクロール中か
-    middle_panning: bool,
+    /// 中クリックドラッグの用途 (押していなければ None)
+    middle_drag: Option<MiddleDrag>,
+}
+
+/// 中ボタンドラッグで何をするか。
+///
+/// **押し始めに決めて、離すまで変えない。**途中で Ctrl を足したり離したりしても
+/// 切り替わらないので、ドラッグの最中に挙動が変わって驚くことがない。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MiddleDrag {
+    /// スクロール (修飾キーなし)
+    Pan,
+    /// 横ズーム (Ctrl 併用)。左へ動かすと拡大、右へ動かすと縮小。
+    ZoomHorizontally {
+        /// 押した位置の四分音符。ズームしてもここが動かないようスクロールを合わせる。
+        /// カーソルの現在位置ではなく**押した位置**を使うので、
+        /// ドラッグ中に掴んだ場所が逃げていかない。
+        anchor_quarters: f32,
+    },
 }
 
 impl Default for EditorState {
@@ -273,13 +303,14 @@ impl Default for EditorState {
             show_help: false,
             grid_scroll_y: 0.0,
             row_h: ROW_H,
+            ppq: PPQ,
             project_path: None,
             track_plugins: Vec::new(),
             play_return: None,
             was_playing: false,
             track_last_note: false,
             drag: None,
-            middle_panning: false,
+            middle_drag: None,
         }
     }
 }
@@ -304,6 +335,17 @@ impl EditorState {
         let clamped = row_h.clamp(MIN_ROW_H, MAX_ROW_H);
         let delta = clamped - self.row_h;
         self.row_h = clamped;
+        delta
+    }
+
+    /// 四分音符1つの横幅を変える。範囲外は丸める。実際に変わった量 (新 - 旧) を返す。
+    ///
+    /// 戻り値はズーム後も掴んだ位置を動かさないためのスクロール補正に使う
+    /// ([`set_row_h`](Self::set_row_h) と同じ形)。
+    fn set_ppq(&mut self, ppq: f32) -> f32 {
+        let clamped = ppq.clamp(MIN_PPQ, MAX_PPQ);
+        let delta = clamped - self.ppq;
+        self.ppq = clamped;
         delta
     }
 
@@ -756,18 +798,18 @@ struct DragState {
 }
 
 /// 画面座標を楽譜座標 (x = 四分音符単位, y = 段) に変換する。
-/// `row_h` は縦ズームで変わるので呼び出し側から渡す。
-fn to_content_pos(grid_origin: Pos2, screen: Pos2, row_h: f32) -> Pos2 {
+/// `ppq` と `row_h` はズームで変わるので呼び出し側から渡す。
+fn to_content_pos(grid_origin: Pos2, screen: Pos2, ppq: f32, row_h: f32) -> Pos2 {
     Pos2::new(
-        (screen.x - grid_origin.x) / PPQ,
+        (screen.x - grid_origin.x) / ppq,
         (screen.y - grid_origin.y - RULER_H) / row_h,
     )
 }
 
 /// 楽譜座標を画面座標に戻す (to_content_pos の逆変換)
-fn to_screen_pos(grid_origin: Pos2, content: Pos2, row_h: f32) -> Pos2 {
+fn to_screen_pos(grid_origin: Pos2, content: Pos2, ppq: f32, row_h: f32) -> Pos2 {
     Pos2::new(
-        grid_origin.x + content.x * PPQ,
+        grid_origin.x + content.x * ppq,
         grid_origin.y + RULER_H + content.y * row_h,
     )
 }
@@ -990,6 +1032,10 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("Shift+クリック", "選択に追加 / 選択から外す"),
                     ("右クリック", "削除 (選択中のノートなら選択ごと)"),
                     ("中ドラッグ", "スクロール"),
+                    (
+                        "Ctrl+中ドラッグ",
+                        "横幅を拡大 / 縮小 (左へ動かすと拡大。掴んだ位置は動きません)",
+                    ),
                     ("Alt+ホイール", "選択中ノートのベロシティを増減"),
                     ("Ctrl+ホイール", "段の縦幅を拡大 / 縮小 (カーソルの下の段は動きません)"),
                     ("ルーラーをクリック", "再生ヘッドを移動 (拍にスナップ / Alt で自由)"),
@@ -1444,12 +1490,17 @@ fn toolbar(
         {
             state.set_row_h(row_h);
         }
+        // 横ズームはドラッグでしか変えられないので、戻す口をここに置く
+        // (ここが無いと、行きすぎたときに手で戻すしかない)
         if ui
             .small_button("既定")
-            .on_hover_text(format!("段幅を {ROW_H:.0}px に戻す"))
+            .on_hover_text(format!(
+                "拡大率を既定に戻す (段幅 {ROW_H:.0}px / 四分音符 {PPQ:.0}px)"
+            ))
             .clicked()
         {
             state.set_row_h(ROW_H);
+            state.set_ppq(PPQ);
         }
 
         ui.separator();
@@ -1673,8 +1724,10 @@ fn grid(
         0.0
     };
 
-    // 段の高さはこのフレームの間ずっと同じ値を使う (ズームの反映は次のフレーム)
+    // 段の高さと四分音符の横幅は、このフレームの間ずっと同じ値を使う
+    // (ズームの反映は次のフレーム)
     let row_h = state.row_h;
+    let ppq = state.ppq;
 
     // 表示する行数 = 全トラックの段の合計。
     // (フェーズ1ではトラックは1本なので、そのトラックの段数と同じ)
@@ -1694,11 +1747,11 @@ fn grid(
     // スクロールに化けてしまい、段の外から範囲選択を始められない。
     // 広げるのは当たり判定だけで、描画はすべて content_h までに留める
     // (空白に段があるように見せないため)。
-    let size = vec2(total_quarters * PPQ, content_h.max(ui.clip_rect().height()));
+    let size = vec2(total_quarters * ppq, content_h.max(ui.clip_rect().height()));
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     let origin = response.rect.min;
 
-    let to_x = |quarters: f32| origin.x + quarters * PPQ;
+    let to_x = |quarters: f32| origin.x + quarters * ppq;
 
     // ---- 背景 ----
     painter.rect_filled(
@@ -1749,7 +1802,7 @@ fn grid(
     // ---- 連符の補助線 ----
     // 拍線・小節線より先に描いて、重なる位置は上から塗り潰させる
     let unit = state.snap_unit();
-    if state.tuplet > 1 && unit * PPQ >= 6.0 {
+    if state.tuplet > 1 && unit * ppq >= 6.0 {
         let tuplet_stroke = Stroke::new(0.5, palette::PURPLE.gamma_multiply(0.45));
         let mut q = unit;
         while q <= total_quarters {
@@ -1798,7 +1851,7 @@ fn grid(
 
     // ---- ノート ----
     for (idx, note) in state.editor.notes.iter().enumerate() {
-        let rect = note_rect(origin, note_row(&row_offsets, note), note, row_h);
+        let rect = note_rect(origin, note_row(&row_offsets, note), note, ppq, row_h);
         let fill = note_fill(note, state.editor.scale);
         // ベロシティは「下からの塗りの高さ」で表す。明度やアルファを直接下げると
         // ダークな背景で弱いノートが見えなくなるため、色相はそのままに
@@ -1868,7 +1921,7 @@ fn grid(
         let visible = ui.clip_rect();
         if playhead_x > visible.right() - 40.0 || playhead_x < visible.left() {
             ui.scroll_to_rect(
-                Rect::from_min_size(Pos2::new(playhead_x, origin.y), vec2(PPQ * 4.0, 1.0)),
+                Rect::from_min_size(Pos2::new(playhead_x, origin.y), vec2(ppq * 4.0, 1.0)),
                 Some(egui::Align::Min),
             );
         }
@@ -1888,33 +1941,56 @@ fn grid(
         .and_then(|i| state.editor.notes.get(i))
         .map(|n| n.start_tick.max(0.0));
     let seek_quarters = move |x: f32| -> f64 {
-        let raw = ((x - origin.x) / PPQ).max(0.0);
+        let raw = ((x - origin.x) / ppq).max(0.0);
         seek_target(raw, beat, selected_start, alt_held)
     };
 
-    // ---- 中クリックドラッグでスクロール ----
+    // ---- 中クリックドラッグでスクロール / Ctrl 併用で横ズーム ----
     // egui のドラッグ判定はボタンを問わない (any_down) ため、
-    // パン中はノート編集のドラッグ処理を止める必要がある。
-    let (middle_down, pointer_delta) = ui.input(|i| (i.pointer.middle_down(), i.pointer.delta()));
+    // ここで掴んでいる間はノート編集のドラッグ処理を止める必要がある。
+    let (middle_down, pointer_delta, zoom_modifier) = ui.input(|i| {
+        (
+            i.pointer.middle_down(),
+            i.pointer.delta(),
+            i.modifiers.command,
+        )
+    });
     if middle_down {
-        if !state.middle_panning && response.contains_pointer() {
-            state.middle_panning = true;
+        if state.middle_drag.is_none() && response.contains_pointer() {
+            // 用途は押した瞬間に決める (ドラッグ中に Ctrl を足しても変わらない)
+            state.middle_drag = Some(if zoom_modifier {
+                let anchor_quarters = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .map_or(0.0, |pos| ((pos.x - origin.x) / ppq).max(0.0));
+                MiddleDrag::ZoomHorizontally { anchor_quarters }
+            } else {
+                MiddleDrag::Pan
+            });
             state.drag = None; // ノート編集とは排他
         }
     } else {
-        state.middle_panning = false;
+        state.middle_drag = None;
     }
 
-    if state.middle_panning {
-        // 掴んだ位置がカーソルに追従するよう、アニメーションなしで即時スクロールする
-        ui.scroll_with_delta_animation(pointer_delta, egui::style::ScrollAnimation::none());
-        ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
+    // 横ズームの量 (ピクセル)。実際の反映は描画のあと
+    let mut zoom_pixels = 0.0;
+    match state.middle_drag {
+        Some(MiddleDrag::Pan) => {
+            // 掴んだ位置がカーソルに追従するよう、アニメーションなしで即時スクロールする
+            ui.scroll_with_delta_animation(pointer_delta, egui::style::ScrollAnimation::none());
+            ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
+        }
+        Some(MiddleDrag::ZoomHorizontally { .. }) => {
+            zoom_pixels = pointer_delta.x;
+            ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal);
+        }
+        None => {}
     }
 
     // カーソル形状のフィードバック
-    if state.drag.is_none() && !state.middle_panning {
+    if state.drag.is_none() && state.middle_drag.is_none() {
         if let Some(hover) = response.hover_pos() {
-            match hit_note(&state.editor.notes, &row_offsets, origin, hover, left_resize, row_h) {
+            match hit_note(&state.editor.notes, &row_offsets, origin, hover, left_resize, ppq, row_h) {
                 Some((_, Hit::ResizeRight | Hit::ResizeLeft)) => {
                     ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal)
                 }
@@ -1927,7 +2003,7 @@ fn grid(
     // ドラッグ開始。
     // 注意: interact_pointer_pos はドラッグ判定が成立した時点の位置なので、
     // ノート右端のような狭い領域のヒットテストには「押下位置」を使う。
-    if response.drag_started() && !state.middle_panning {
+    if response.drag_started() && state.middle_drag.is_none() {
         let press_pos = ui
             .input(|i| i.pointer.press_origin())
             .or_else(|| response.interact_pointer_pos());
@@ -1937,10 +2013,10 @@ fn grid(
                     kind: DragKind::Seek,
                     targets: Vec::new(),
                     base_selection: Vec::new(),
-                    origin: to_content_pos(origin, pos, row_h),
+                    origin: to_content_pos(origin, pos, ppq, row_h),
                 });
             } else if let Some((idx, hit)) =
-                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h)
+                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h)
             {
                 // 複数選択中のノートを掴んだら選択全体を操作する (選択は変えない)
                 let bulk = state.selection.len() > 1 && state.is_selected(idx);
@@ -1967,7 +2043,7 @@ fn grid(
                     },
                     targets,
                     base_selection: Vec::new(),
-                    origin: to_content_pos(origin, pos, row_h),
+                    origin: to_content_pos(origin, pos, ppq, row_h),
                 });
             } else {
                 // 空白からのドラッグは範囲選択。Shift 押下なら既存の選択に足す。
@@ -1980,20 +2056,20 @@ fn grid(
                     kind: DragKind::Marquee,
                     targets: Vec::new(),
                     base_selection,
-                    origin: to_content_pos(origin, pos, row_h),
+                    origin: to_content_pos(origin, pos, ppq, row_h),
                 });
             }
         }
     }
 
     // ドラッグ中
-    if response.dragged() && !state.middle_panning {
+    if response.dragged() && state.middle_drag.is_none() {
         // 範囲選択の結果は借用が終わってから反映する
         let mut marquee_selection = None;
 
         if let (Some(drag), Some(pos)) = (&state.drag, response.interact_pointer_pos()) {
             // 掴んだ位置も現在位置も楽譜座標で扱う (自動スクロール中の追従のため)
-            let content = to_content_pos(origin, pos, row_h);
+            let content = to_content_pos(origin, pos, ppq, row_h);
 
             match drag.kind {
                 DragKind::Seek => {
@@ -2053,10 +2129,10 @@ fn grid(
                     }
                 }
                 DragKind::Marquee => {
-                    let rect = Rect::from_two_pos(to_screen_pos(origin, drag.origin, row_h), pos);
+                    let rect = Rect::from_two_pos(to_screen_pos(origin, drag.origin, ppq, row_h), pos);
                     let mut selection = drag.base_selection.clone();
                     for (idx, note) in state.editor.notes.iter().enumerate() {
-                        if rect.intersects(note_rect(origin, note_row(&row_offsets, note), note, row_h))
+                        if rect.intersects(note_rect(origin, note_row(&row_offsets, note), note, ppq, row_h))
                             && !selection.contains(&idx)
                         {
                             selection.push(idx);
@@ -2116,7 +2192,7 @@ fn grid(
                     quarters: seek_quarters(pos.x),
                 });
             } else {
-                match hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h) {
+                match hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h) {
                     // Shift+クリックは選択に追加 / 解除
                     Some((idx, _)) if ui.input(|i| i.modifiers.shift) => {
                         let mut selection = state.selection_sorted();
@@ -2139,7 +2215,7 @@ fn grid(
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if is_inside_lanes(origin, pos, content_h)
-                && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h).is_none()
+                && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h).is_none()
             {
                 // 最後に選択・編集したノートの設定を引き継ぐ。
                 // (ダブルクリックの1打目で選択が解除されるため state.selected は使えない)
@@ -2147,7 +2223,7 @@ fn grid(
                 let row = (((pos.y - origin.y - RULER_H) / row_h).floor() as i32)
                     .clamp(0, display_rows as i32 - 1) as usize;
                 let (track, lane) = row_to_track_lane(&row_offsets, &state.editor, row);
-                let start = snap_floor((pos.x - origin.x) / PPQ).max(0.0);
+                let start = snap_floor((pos.x - origin.x) / ppq).max(0.0);
                 state.history.record(EditGroup::Once);
                 // 連符モード中は連符1音分で置く (直前のノートの音価は引き継がない)
                 let duration = if state.tuplet > 1 {
@@ -2174,7 +2250,7 @@ fn grid(
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some((idx, _)) =
-                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, row_h)
+                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h)
             {
                 state.history.record(EditGroup::Once);
                 if state.is_selected(idx) {
@@ -2205,7 +2281,7 @@ fn grid(
         // カーソルの下にある段。ズームしてもここが動かないようスクロールを合わせる
         let anchor_row = ui
             .input(|i| i.pointer.hover_pos())
-            .map_or(0.0, |pos| to_content_pos(origin, pos, row_h).y);
+            .map_or(0.0, |pos| to_content_pos(origin, pos, ppq, row_h).y);
         let grew = state.set_row_h(row_h * ROW_ZOOM_STEP.powf(zoom_notches));
 
         // ScrollArea は offset -= delta で動くので、伸びた分だけ負の値を渡す。
@@ -2215,6 +2291,24 @@ fn grid(
                 vec2(0.0, -anchor_row * grew),
                 egui::style::ScrollAnimation::none(),
             );
+        }
+    }
+
+    // ---- 横ズームの反映 ----
+    // 縦ズームと同じく、1フレーム分の ppq で描き終えてから変える。
+    if let Some(MiddleDrag::ZoomHorizontally { anchor_quarters }) = state.middle_drag {
+        if zoom_pixels != 0.0 {
+            // 左へ動かすと拡大したいので、x の変化量の符号を反転して指数に使う
+            let grew = state.set_ppq(ppq * PPQ_ZOOM_PER_PIXEL.powf(-zoom_pixels));
+
+            // 掴んだ位置が画面上で動かないようスクロールを合わせる
+            // (縦と同じく、ScrollArea は offset -= delta で動く)
+            if grew != 0.0 && anchor_quarters > 0.0 {
+                ui.scroll_with_delta_animation(
+                    vec2(-anchor_quarters * grew, 0.0),
+                    egui::style::ScrollAnimation::none(),
+                );
+            }
         }
     }
 }
@@ -2594,14 +2688,14 @@ fn velocity_fill_rect(rect: Rect, velocity: u8) -> Rect {
 ///
 /// 段の上下に空ける余白は高さの 1/12 (既定の 24px で従来どおり上下2px)。
 /// 固定値にすると、縮めたときに矩形が潰れ、広げたときに隙間が目立たなくなる。
-fn note_rect(origin: Pos2, row: usize, note: &Note, row_h: f32) -> Rect {
+fn note_rect(origin: Pos2, row: usize, note: &Note, ppq: f32, row_h: f32) -> Rect {
     let margin = row_h / 12.0;
     Rect::from_min_size(
         Pos2::new(
-            origin.x + note.start_tick * PPQ,
+            origin.x + note.start_tick * ppq,
             origin.y + RULER_H + row as f32 * row_h + margin,
         ),
-        vec2((note.duration * PPQ - 1.0).max(4.0), row_h - margin * 2.0),
+        vec2((note.duration * ppq - 1.0).max(4.0), row_h - margin * 2.0),
     )
 }
 
@@ -2627,10 +2721,11 @@ fn hit_note(
     origin: Pos2,
     pos: Pos2,
     left_resize: bool,
+    ppq: f32,
     row_h: f32,
 ) -> Option<(usize, Hit)> {
     for (idx, note) in notes.iter().enumerate().rev() {
-        let rect = note_rect(origin, note_row(offsets, note), note, row_h);
+        let rect = note_rect(origin, note_row(offsets, note), note, ppq, row_h);
         let split = rect.center().x;
 
         let right_from = if left_resize {
@@ -2994,6 +3089,42 @@ mod tests {
         assert_eq!(state.set_row_h(-100.0), 0.0);
     }
 
+    /// 横ズームは上下限で頭打ちになり、実際に変わった量を返すこと
+    #[test]
+    fn horizontal_zoom_is_clamped() {
+        let mut state = EditorState::default();
+        assert_eq!(state.ppq, PPQ, "既定は従来の横幅");
+
+        assert_eq!(state.set_ppq(PPQ * 2.0), PPQ, "変わった量を返すこと");
+        assert_eq!(state.ppq, PPQ * 2.0);
+
+        // 上限・下限を越えたら丸める
+        state.set_ppq(MAX_PPQ * 10.0);
+        assert_eq!(state.ppq, MAX_PPQ);
+        state.set_ppq(0.0);
+        assert_eq!(state.ppq, MIN_PPQ);
+        // 頭打ちのあとは何も変わらない (スクロール補正を打たないため)
+        assert_eq!(state.set_ppq(-100.0), 0.0);
+    }
+
+    /// Ctrl+中ドラッグ 1px あたりの倍率が、実用的な速さになっていること。
+    ///
+    /// 小さすぎると下限から上限まで何往復も必要になり、大きすぎると
+    /// 少し動かしただけで飛ぶ。画面幅ぶん動かして全域を通り抜けるくらいが目安。
+    #[test]
+    fn horizontal_zoom_speed_covers_the_range_in_one_sweep() {
+        // 900px は 1100px 幅のウィンドウでグリッドに使える程度の距離
+        let sweep = PPQ_ZOOM_PER_PIXEL.powf(900.0);
+        let full_range = MAX_PPQ / MIN_PPQ;
+        assert!(
+            sweep > full_range,
+            "画面幅ぶん動かしても全域を通れない (倍率 {sweep:.0} / 必要 {full_range:.0})"
+        );
+        // 逆に速すぎないこと。少し動かしただけで飛ぶと、狙った倍率で止められない
+        let nudge = PPQ_ZOOM_PER_PIXEL.powf(10.0);
+        assert!(nudge < 1.5, "10px で {nudge:.2} 倍は速すぎる");
+    }
+
     /// ノート矩形が段の高さに追従し、上下の余白も一緒に伸び縮みすること
     #[test]
     fn note_rect_follows_the_row_height() {
@@ -3001,18 +3132,41 @@ mod tests {
         let note = placed(0.0, 1); // 2段目
 
         // 既定の 24px では従来どおり上下2px の余白
-        let normal = note_rect(origin, 1, &note, ROW_H);
+        let normal = note_rect(origin, 1, &note, PPQ, ROW_H);
         assert_eq!(normal.top(), RULER_H + ROW_H + 2.0);
         assert_eq!(normal.height(), ROW_H - 4.0);
 
         // 倍に広げれば位置も高さも倍 (余白も倍なので比率は変わらない)
-        let zoomed = note_rect(origin, 1, &note, ROW_H * 2.0);
+        let zoomed = note_rect(origin, 1, &note, PPQ, ROW_H * 2.0);
         assert_eq!(zoomed.top(), RULER_H + ROW_H * 2.0 + 4.0);
         assert_eq!(zoomed.height(), (ROW_H - 4.0) * 2.0);
-        assert_eq!(zoomed.width(), normal.width(), "横幅はズームしないこと");
+        assert_eq!(
+            zoomed.width(),
+            normal.width(),
+            "縦ズームでは横幅が変わらないこと"
+        );
 
         // 下限まで縮めても矩形は残ること (固定余白だと潰れてしまう)
-        assert!(note_rect(origin, 0, &note, MIN_ROW_H).height() > 0.0);
+        assert!(note_rect(origin, 0, &note, PPQ, MIN_ROW_H).height() > 0.0);
+    }
+
+    /// ノート矩形が横ズームに追従し、縦は変わらないこと
+    #[test]
+    fn note_rect_follows_the_horizontal_zoom() {
+        let origin = Pos2::new(0.0, 0.0);
+        let note = placed(2.0, 0); // 2拍目から
+
+        let normal = note_rect(origin, 0, &note, PPQ, ROW_H);
+        let zoomed = note_rect(origin, 0, &note, PPQ * 2.0, ROW_H);
+
+        assert_eq!(zoomed.left(), normal.left() * 2.0, "位置も倍になること");
+        // 幅は「音価 × ppq − 1px」なので、倍にすると 1px 分だけ端数が出る
+        assert_eq!(zoomed.width(), normal.width() * 2.0 + 1.0);
+        assert_eq!(zoomed.top(), normal.top(), "縦位置は変わらないこと");
+        assert_eq!(zoomed.height(), normal.height(), "高さは変わらないこと");
+
+        // 下限まで縮めても矩形は残ること
+        assert!(note_rect(origin, 0, &note, MIN_PPQ, ROW_H).width() > 0.0);
     }
 
     /// 当たり判定も段の高さに追従すること (広げた段の中央で掴めること)
@@ -3025,9 +3179,9 @@ mod tests {
 
         // 広げた2段目の中央
         let inside = Pos2::new(4.0, RULER_H + tall * 1.5);
-        assert_eq!(hit_note(&notes, &rows, origin, inside, false, tall), Some((0, Hit::Body)));
+        assert_eq!(hit_note(&notes, &rows, origin, inside, false, PPQ, tall), Some((0, Hit::Body)));
         // 同じ点も、既定の高さでは2段目の外なので当たらない
-        assert_eq!(hit_note(&notes, &rows, origin, inside, false, ROW_H), None);
+        assert_eq!(hit_note(&notes, &rows, origin, inside, false, PPQ, ROW_H), None);
     }
 
     /// 左端音価が ON でも、右端は従来どおりリサイズ領域であること。
@@ -3045,19 +3199,19 @@ mod tests {
         let right_pos = Pos2::new(17.0, y);
 
         // OFF: 左端は本体扱い (移動)、右端はリサイズ
-        assert_eq!(hit_note(&notes, &single_track_rows(), origin, left_pos, false, ROW_H), Some((0, Hit::Body)));
+        assert_eq!(hit_note(&notes, &single_track_rows(), origin, left_pos, false, PPQ, ROW_H), Some((0, Hit::Body)));
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, right_pos, false, ROW_H),
+            hit_note(&notes, &single_track_rows(), origin, right_pos, false, PPQ, ROW_H),
             Some((0, Hit::ResizeRight))
         );
 
         // ON: 左端が左リサイズになり、右端は引き続き右リサイズ
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, left_pos, true, ROW_H),
+            hit_note(&notes, &single_track_rows(), origin, left_pos, true, PPQ, ROW_H),
             Some((0, Hit::ResizeLeft))
         );
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, right_pos, true, ROW_H),
+            hit_note(&notes, &single_track_rows(), origin, right_pos, true, PPQ, ROW_H),
             Some((0, Hit::ResizeRight))
         );
     }
