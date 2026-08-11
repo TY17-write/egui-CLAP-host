@@ -373,6 +373,46 @@ impl MidiEditor {
         true
     }
 
+    /// 2つの段の中身を入れ替える。入れ替えたら true。
+    ///
+    /// **同じ種別どうしでしか入れ替えない。** 音符段と CC 段を入れ替えると、
+    /// 音符が CC として送られたり、その逆が起きたりする。どちらも見た目では
+    /// 気付きにくいので、そもそも行わない。
+    ///
+    /// CC 段どうしのときは**番号も一緒に動かす**。段ごと入れ替える操作なので、
+    /// ブロックが書かれた当時の CC のまま付いていくほうが筋が通る。
+    pub fn swap_lanes(&mut self, a: (usize, usize), b: (usize, usize)) -> bool {
+        if a == b {
+            return false;
+        }
+        let (a_track, a_lane) = a;
+        let (b_track, b_lane) = b;
+        if a_lane >= self.lanes(a_track) || b_lane >= self.lanes(b_track) {
+            return false;
+        }
+        let a_cc = self.lane_cc(a_track, a_lane);
+        let b_cc = self.lane_cc(b_track, b_lane);
+        if a_cc.is_some() != b_cc.is_some() {
+            return false;
+        }
+
+        for note in &mut self.notes {
+            if (note.track, note.lane) == a {
+                note.track = b_track;
+                note.lane = b_lane;
+            } else if (note.track, note.lane) == b {
+                note.track = a_track;
+                note.lane = a_lane;
+            }
+        }
+
+        if a_cc.is_some() {
+            self.tracks[a_track].set_lane_cc(a_lane, b_cc);
+            self.tracks[b_track].set_lane_cc(b_lane, a_cc);
+        }
+        true
+    }
+
     /// 今あるノートが全部収まるようにトラック数と段数を広げる。
     /// 読み込みや貼り付けの直後に呼ぶ (画面外にノートが隠れるのを防ぐ)。
     pub fn ensure_capacity_for_notes(&mut self) {
@@ -1200,6 +1240,66 @@ mod tests {
         assert_eq!(editor.lane_cc(0, 2), None, "足した段は音符段");
         assert_eq!(editor.lane_cc(0, 3), Some(64), "CC 段は1つ下へ繰り下がる");
         assert_eq!(editor.notes[0].lane, 3, "CC 段のブロックも付いていくこと");
+    }
+
+    /// 段の入れ替え: 中身が互いの段へ移ること (トラックをまたいでも)
+    #[test]
+    fn swapping_lanes_moves_the_notes_both_ways() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 2;
+        editor.add_track();
+        editor.tracks[1].lanes = 2;
+        editor.notes = vec![
+            Note {
+                track: 0,
+                lane: 1,
+                ..note(0.0, 1.0, 0, 4)
+            },
+            Note {
+                track: 1,
+                lane: 0,
+                ..note(2.0, 1.0, 4, 4)
+            },
+        ];
+
+        assert!(editor.swap_lanes((0, 1), (1, 0)));
+        assert_eq!((editor.notes[0].track, editor.notes[0].lane), (1, 0));
+        assert_eq!((editor.notes[1].track, editor.notes[1].lane), (0, 1));
+    }
+
+    /// 音符段と CC 段は入れ替えないこと。
+    ///
+    /// **入れ替わると音符が CC として送られる** (逆も同じ)。見た目では気付きにくい。
+    #[test]
+    fn swapping_refuses_to_mix_note_and_cc_lanes() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        editor.add_cc_lane(0, 64); // 段1 が CC
+        editor.notes = vec![note(0.0, 1.0, 0, 4)]; // 段0 の音符
+
+        assert!(!editor.swap_lanes((0, 0), (0, 1)));
+        assert_eq!(editor.notes[0].lane, 0, "動かないこと");
+        assert_eq!(editor.lane_cc(0, 1), Some(64), "段の種別も変わらないこと");
+    }
+
+    /// CC 段どうしの入れ替えでは、番号も一緒に動くこと。
+    ///
+    /// ブロックだけ動かすと、書いた当時と違う CC を送ることになる。
+    #[test]
+    fn swapping_cc_lanes_carries_the_numbers() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        editor.add_cc_lane(0, 64);
+        editor.add_cc_lane(0, 1);
+        editor.notes = vec![Note {
+            lane: 1,
+            ..note(0.0, 1.0, 0, 4)
+        }];
+
+        assert!(editor.swap_lanes((0, 1), (0, 2)));
+        assert_eq!(editor.notes[0].lane, 2, "ブロックが移ること");
+        assert_eq!(editor.lane_cc(0, 2), Some(64), "番号も付いていくこと");
+        assert_eq!(editor.lane_cc(0, 1), Some(1));
     }
 
     /// 通常段を消しても CC 段は残ること。

@@ -34,6 +34,8 @@ const MIN_ROW_H: f32 = 12.0;
 const LANE_BUTTON_ROW_Y: f32 = 22.0;
 /// 2段目の高さ。これが入らなければ1段目へ回す
 const LANE_BUTTON_ROW_H: f32 = 18.0;
+/// 段の帯 (全選択・入れ替え) の幅。トラック欄の右端に置く
+const LANE_STRIP_W: f32 = 10.0;
 /// 段の高さの上限
 const MAX_ROW_H: f32 = 96.0;
 /// Ctrl+ホイール1ノッチあたりの倍率 (段の高さ)
@@ -284,6 +286,10 @@ pub struct EditorState {
     scroll_to_quarters: Option<f64>,
     /// 段の種別を設定する一覧を開いているトラック (閉じていれば None)
     lane_config_track: Option<usize>,
+    /// 入れ替えの相手待ちになっている段 (track, lane)。
+    ///
+    /// 段の帯を押すとここに入り (帯が赤くなる)、次に別の段の帯を押すと入れ替わる。
+    lane_swap_source: Option<(usize, usize)>,
     /// コピー・カットしたノートの控え (先頭を 0 とした相対位置)。
     ///
     /// **OS のクリップボードは使わない。** 使うと、ノートをコピーするたびに
@@ -337,6 +343,7 @@ impl Default for EditorState {
             pending_scroll_x: None,
             scroll_to_quarters: None,
             lane_config_track: None,
+            lane_swap_source: None,
             note_clipboard: Vec::new(),
         }
     }
@@ -526,19 +533,47 @@ impl EditorState {
         self.selection.push(idx);
         self.selected = Some(idx);
         self.track_last_note = true;
+        self.lane_swap_source = None;
+    }
+
+    /// その段のノートを全部選ぶ。
+    ///
+    /// 段の帯を押したときの選択。ユーザーが個々のノートを指したわけではないので、
+    /// 新規ノートの設定 (`last_note`) には引き継がない。
+    fn select_lane(&mut self, track: usize, lane: usize) {
+        let idxs = self
+            .editor
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| note.track == track && note.lane == lane)
+            .map(|(idx, _)| idx)
+            .collect();
+        self.select_many(idxs);
     }
 
     /// 範囲選択・ペーストによる選択。last_note は更新しない。
+    ///
+    /// **入れ替えの相手待ちは解除する** ([`clear_selection`](Self::clear_selection) を参照)。
+    /// 段の帯を押した直後だけは待ち状態にしたいので、**呼び出し側がこれを呼んだ
+    /// あとに** `lane_swap_source` を立てること。
     fn select_many(&mut self, idxs: Vec<usize>) {
         self.selected = if idxs.len() == 1 { Some(idxs[0]) } else { None };
         self.selection = idxs;
         self.track_last_note = false;
+        self.lane_swap_source = None;
     }
 
+    /// 選択を解除する。
+    ///
+    /// **段の入れ替えの相手待ちも一緒に解く。** 帯の赤は「その段を選んでいる」印
+    /// なので、選択が消えたのに赤いままだと、何もない場所を押したあとに別の段を
+    /// 押しただけで入れ替わってしまう。
     fn clear_selection(&mut self) {
         self.selection.clear();
         self.selected = None;
         self.track_last_note = false;
+        self.lane_swap_source = None;
     }
 
     /// 選択中のノートを昇順・重複なしで返す
@@ -1164,6 +1199,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ),
                     ("Alt+ホイール", "選択中ノートのベロシティを増減"),
                     ("Ctrl+ホイール", "段の縦幅を拡大 / 縮小 (カーソルの下の段は動きません)"),
+                    ("段の帯 (トラック欄の右端)", "その段を全選択。続けて別の段を押すと入れ替え"),
                     ("ルーラーをクリック", "再生ヘッドを移動 (拍にスナップ / Alt で自由)"),
                 ],
             );
@@ -2765,12 +2801,16 @@ fn track_gutter_content(
             Stroke::new(1.5, palette::FG_DIM),
         );
 
+        // 段の帯 (トラック欄といちばん左の小節の間)。段ごとに1本ずつ。
+        lane_strips(ui, state, track, rect);
+
         // 段が1つ (高さ = 段1つ分) でも収まるよう、名前とボタンは1行に並べる。
         // 縦に縮めたときは余白から先に削る (ボタンの高さは変えられないため)
         let pad_y = (rect.height() * 0.1).min(2.0);
         let mut content = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(rect.shrink2(vec2(6.0, pad_y)))
+                // 右端は段の帯にあけておく
+                .max_rect(rect.shrink2(vec2(6.0, pad_y)).with_max_x(rect.right() - LANE_STRIP_W - 4.0))
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         content.set_clip_rect(rect);
@@ -2893,6 +2933,84 @@ fn track_gutter_content(
         } else {
             lane_buttons(&mut content, state, track, true);
         }
+    }
+}
+
+/// 段ごとの帯。押すとその段のノートを全選択し、続けて別の段を押すと入れ替える。
+///
+/// トラック欄の右端 (= いちばん左の小節との境) に縦棒として並べる。グリッドの
+/// 段と同じ高さなので、行の位置がそのまま揃う。
+///
+/// **押した段は赤くなる (相手待ち)。** そこで別の段を押すと入れ替わり、同じ段を
+/// もう一度押すと取り消す。入れ替えは種別が同じ段どうしでしかできないので、
+/// 選べない相手はその場で分かるよう暗く描く。
+fn lane_strips(ui: &mut egui::Ui, state: &mut EditorState, track: usize, track_rect: Rect) {
+    let row_h = state.row_h;
+    let painter = ui.painter_at(track_rect);
+
+    for lane in 0..state.editor.lanes(track) {
+        let rect = Rect::from_min_size(
+            Pos2::new(
+                track_rect.right() - LANE_STRIP_W,
+                track_rect.top() + lane as f32 * row_h,
+            ),
+            vec2(LANE_STRIP_W, row_h),
+        );
+        let response = ui.interact(
+            rect,
+            ui.id().with(("lane_strip", track, lane)),
+            Sense::click(),
+        );
+
+        let armed = state.lane_swap_source == Some((track, lane));
+        // 相手待ちの段があるとき、種別が違えば入れ替えられない
+        let selectable = match state.lane_swap_source {
+            Some((source_track, source_lane)) => {
+                state.editor.lane_cc(source_track, source_lane).is_some()
+                    == state.editor.lane_cc(track, lane).is_some()
+            }
+            None => true,
+        };
+
+        let color = if armed {
+            palette::RED
+        } else if !selectable {
+            palette::FG_DIM.gamma_multiply(0.4)
+        } else if response.hovered() {
+            palette::GREEN
+        } else {
+            palette::GREEN.gamma_multiply(0.55)
+        };
+        painter.rect_filled(rect.shrink2(vec2(2.0, 1.0)), CornerRadius::same(2), color);
+
+        // 選択を変えると相手待ちは解除される (`select_many` を参照) ので、
+        // **待ち状態にするのは選択したあと**。
+        if response.clicked() {
+            match state.lane_swap_source {
+                // もう一度押したら取り消す
+                Some(source) if source == (track, lane) => state.lane_swap_source = None,
+                Some(source) => {
+                    state.history.record(EditGroup::Once);
+                    if state.editor.swap_lanes(source, (track, lane)) {
+                        state.dirty = true;
+                    }
+                    state.select_lane(track, lane);
+                    state.lane_swap_source = None;
+                }
+                None => {
+                    state.select_lane(track, lane);
+                    state.lane_swap_source = Some((track, lane));
+                }
+            }
+        }
+
+        response.on_hover_text(if armed {
+            "入れ替える相手の段を押してください (もう一度押すと取り消し)"
+        } else if selectable {
+            "この段のノートを全選択 (続けて別の段を押すと入れ替え)"
+        } else {
+            "音符段と CC 段は入れ替えられません"
+        });
     }
 }
 
@@ -3320,6 +3438,32 @@ mod tests {
         let (dx, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.6, 1, 0.25, 16);
         assert_eq!(dx, 0.5, "掴んだノートが 1.5 に来るようスナップされること");
         assert_eq!(d_lane, 1);
+    }
+
+    /// 選択が変わったら、段の入れ替えの相手待ちも解けること。
+    ///
+    /// **解けないと、何もない場所を押したあとに別の段の帯を押しただけで
+    /// 入れ替わってしまう** (帯は赤く残ったままなので気付けない)。
+    #[test]
+    fn changing_the_selection_disarms_the_lane_swap() {
+        let mut state = EditorState::default();
+        state.editor.notes = vec![placed(0.0, 0)];
+
+        for change in [
+            "clear_selection",
+            "select_single",
+            "select_many",
+            "select_lane",
+        ] {
+            state.lane_swap_source = Some((0, 0));
+            match change {
+                "clear_selection" => state.clear_selection(),
+                "select_single" => state.select_single(0),
+                "select_many" => state.select_many(vec![0]),
+                _ => state.select_lane(0, 0),
+            }
+            assert_eq!(state.lane_swap_source, None, "{change} で解けること");
+        }
     }
 
     /// CC 段のブロックをコピーして貼り付けられること。
