@@ -694,7 +694,7 @@ pub enum EditorCommand {
     ExportWav,
     /// 1トラック目を CeVIO のプロジェクトファイル (CCS) に書き出す
     ExportCcs,
-    /// 指定トラックに音源 (.clap) を読み込む
+    /// 指定トラックに音源 (.clap / .vst3) を読み込む
     LoadPlugin { track: usize },
 }
 
@@ -930,7 +930,7 @@ fn help_window(ctx: &egui::Context, open: &mut bool) {
                     ("M", "ミュート (このトラックを鳴らさない)"),
                     ("S", "ソロ (どれか1つでもソロなら、それ以外は鳴らない)"),
                     ("W", "スウィング (N/4 拍子のときだけ。深さはツールバーで設定)"),
-                    ("♪", "音源 (.clap) を読み込む / 差し替える"),
+                    ("♪", "音源 (.clap / .vst3) を読み込む / 差し替える"),
                     ("+ / −", "そのトラックの段を増減する (ノートのある段は消せません)"),
                     ("上の + / −", "トラックを増減する"),
                 ],
@@ -2404,7 +2404,7 @@ fn track_gutter_content(
             );
         });
 
-        // 音源 (.clap) の読み込み。載っていればボタンを色付きにして名前を出す
+        // 音源 (.clap / .vst3) の読み込み。載っていればボタンを色付きにして名前を出す
         let plugin = state
             .track_plugins
             .get(track)
@@ -2420,7 +2420,7 @@ fn track_gutter_content(
         }
         response.on_hover_text(match &plugin {
             Some(name) => format!("音源: {name} (クリックで差し替え)"),
-            None => "音源 (.clap) を読み込む".to_string(),
+            None => "音源 (.clap / .vst3) を読み込む".to_string(),
         });
 
         if content

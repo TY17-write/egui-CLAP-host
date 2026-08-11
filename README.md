@@ -41,8 +41,13 @@ MIT のまま VST3 対応にできています (`vst3-host` → `vst3` → SDK �
 
 | クレート | 内容 |
 |---|---|
-| `host` | ミニホスト本体 (egui GUI + cpal オーディオ出力 + clack-host) |
+| `host` | ミニホスト本体 (egui GUI + cpal オーディオ出力 + clack-host + vst3-host) |
 | `test-plugin` | テスト用のサイン波シンセ CLAP プラグイン (16ボイス、Volume パラメータ、ベロシティ対応) |
+| `spike/vst3` | VST3 に進めるかを確かめた実験用クレート (親のワークスペースからは切り離してある) |
+
+`test-plugin` は **CLAP 専用**です。VST3 側の検証には実物の .vst3 が要ります
+(手元では Surge XT を使っています)。同じ音源の CLAP 版と VST3 版を突き合わせるには
+clap-wrapper でのビルドが要り、そこには CMake が必要です。
 
 ## ビルドと実行
 
@@ -73,6 +78,9 @@ cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap #
 
 # VST3 バックエンドの検証 (実物の .vst3 が要る。test-plugin は CLAP 専用のため)
 cargo run -p clap-host-test --bin vst3_smoke -- "C:\Program Files\Common Files\VST3\Surge Synth Team\Surge XT.vst3"
+
+# CLAP と VST3 を別トラックに載せた同時再生の検証
+cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap "C:\Program Files\Common Files\VST3\Surge Synth Team\Surge XT.vst3"
 
 # ユニットテスト
 cargo test -p clap-host-test --lib
