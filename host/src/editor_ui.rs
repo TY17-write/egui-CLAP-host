@@ -43,12 +43,36 @@ const MAX_OCTAVE: i32 = 8;
 /// 0 にするとノートが痩せて見えるので、色相と輪郭が残る程度に薄く塗る。
 const VELOCITY_GHOST_ALPHA: f32 = 0.3;
 
-/// ノートの色相 (度)。低い音から高い音へ、シアン → 青 → 紫 → マゼンタ → 赤 と上げていく。
+/// ノートの色相 (Oklch, 度)。低い音から高い音へ、シアン → 青 → 紫 → マゼンタ → 赤。
 ///
-/// 色相環を逆回り (215° → 0°) にすると緑と黄の帯を通る。そちらは常用域が
-/// 緑〜黄に集まって隣同士の差が出にくかったので、こちら回りにしている。
-const NOTE_HUE_LOW: f32 = 180.0;
-const NOTE_HUE_HIGH: f32 = 360.0;
+/// **Oklch の色相角**なので、HSV の角度とは対応しない。おおよそ
+/// シアン 195°・青 264°・マゼンタ 328°・赤 389° (= 29°) で、この順に増える。
+/// Oklch は色相を**知覚的に等間隔**に並べるので、HSV でやったときのように
+/// 青〜紫が「どれも青っぽい」と潰れることがない。
+const NOTE_HUE_LOW: f32 = 195.0;
+const NOTE_HUE_HIGH: f32 = 389.0;
+
+/// ノートの明度 (Oklch)。低い音ほど暗く、高い音ほど明るい。
+///
+/// 色相に加えて明度も動かす。人の目は色相より明度の差をよく見分けるので、
+/// これが**いちばん効く手がかり**になる。「高い音ほど明るい」という向きは
+/// 直感とも合う。
+///
+/// 下限は、ノート名のラベルから決まっている。塗りが届いた部分のラベルは
+/// [`palette::BG`] (ほぼ黒) で抜いているので、暗くしすぎると読めなくなる。
+/// 0.64 で本文と背景のコントラスト比がおよそ 5:1 ある。
+///
+/// ベロシティ (塗りの高さ) と選択 (輪郭線) はどちらも色と別の手段で
+/// 表しているので、明度を動かしても competing しない。
+const NOTE_LIGHTNESS_LOW: f32 = 0.64;
+const NOTE_LIGHTNESS_HIGH: f32 = 0.86;
+
+/// ノートの彩度 (Oklch のクロマ)。
+///
+/// sRGB に収まらない組み合わせは色相と明度を保ったままクロマを削るので、
+/// ここは「出せるだけ出す」ための要求値でよい。色相ごとに出せる上限が
+/// 違う (シアンは低く、マゼンタは高い) ため、一律の値は取れない。
+const NOTE_CHROMA: f32 = 0.16;
 
 /// 色を割り当てる音域。この外は端の色で頭打ちにする。
 ///
@@ -58,15 +82,6 @@ const NOTE_HUE_HIGH: f32 = 360.0;
 /// 代償として、極端に高い音どうし・低い音どうしは同じ色になる。
 const NOTE_COLOR_MIN_OCTAVE: i32 = 1;
 const NOTE_COLOR_MAX_OCTAVE: i32 = 7;
-
-/// 彩度と明度は音高によらず一定にする。
-///
-/// 色相だけを動かすので「色が違う = 音高が違う」と読める。彩度や明度まで
-/// 動かすと、暗いノートが選択やゴーストと紛らわしくなる。
-/// 値は vim-hybrid のアクセント色に寄せてある (この彩度・明度で色相 360° にすると
-/// `palette::RED` とほぼ同じ色になる)。
-const NOTE_SATURATION: f32 = 0.45;
-const NOTE_VALUE: f32 = 0.80;
 
 /// ノートの塗り色。
 ///
@@ -78,6 +93,9 @@ const NOTE_VALUE: f32 = 0.80;
 ///
 /// オクターブ内も半音で連続的に変える。オクターブ境界で色が飛ばないので、
 /// 隣り合う音の高低が色の変化として読める。
+///
+/// 色相と明度の両方を動かす。手がかりが2つあるほうが差を見つけやすく、
+/// 明度のほうは色覚特性によらず効く。
 fn note_fill(note: &Note, scale: ScaleMode) -> Color32 {
     let steps = scale.steps_per_octave().max(1);
     // オクターブ + オクターブ内の位置。BP 音律なら13ステップで割る
@@ -86,36 +104,82 @@ fn note_fill(note: &Note, scale: ScaleMode) -> Color32 {
     let span = (NOTE_COLOR_MAX_OCTAVE - NOTE_COLOR_MIN_OCTAVE + 1) as f32;
     let t = ((position - NOTE_COLOR_MIN_OCTAVE as f32) / span).clamp(0.0, 1.0);
 
-    let hue = NOTE_HUE_LOW + (NOTE_HUE_HIGH - NOTE_HUE_LOW) * t;
-    hsv_to_color(hue, NOTE_SATURATION, NOTE_VALUE)
+    let lerp = |from: f32, to: f32| from + (to - from) * t;
+    oklch_to_color(
+        lerp(NOTE_LIGHTNESS_LOW, NOTE_LIGHTNESS_HIGH),
+        NOTE_CHROMA,
+        lerp(NOTE_HUE_LOW, NOTE_HUE_HIGH),
+    )
 }
 
-/// HSV から sRGB へ。`hue` は度、`saturation` と `value` は 0.0〜1.0。
+/// Oklch (明度・クロマ・色相) から sRGB へ。`hue` は度。
 ///
-/// egui にも変換はあるが、あちらは線形色空間を経由するため、パレットの
-/// 16進値と同じ土俵で色を選べない。ここは目で合わせたいので自前で持つ。
-fn hsv_to_color(hue: f32, saturation: f32, value: f32) -> Color32 {
-    let hue = hue.rem_euclid(360.0);
-    let saturation = saturation.clamp(0.0, 1.0);
+/// Oklch を使うのは、**色相を知覚的に等間隔に並べたい**のと、`lightness` が
+/// 見た目の明るさそのものになるため。HSV の `value` は明るさではなく
+/// (シアンの V=0.62 はピンクの V=0.95 より明るく見える)、色相の間隔も
+/// 知覚と合わない。
+///
+/// 指定した色が sRGB に収まらないときは、**色相と明度を保ったままクロマを削る**。
+/// RGB を切り詰めると色相と明度がずれるので、そちらは採らない。
+fn oklch_to_color(lightness: f32, chroma: f32, hue: f32) -> Color32 {
+    let radians = hue.to_radians();
+    let (sin, cos) = radians.sin_cos();
+
+    // sRGB に収まる最大のクロマを二分探索で詰める。
+    // 収まるなら1回で終わり、外れていても十数回で十分な精度になる。
+    let mut low = 0.0f32;
+    let mut high = chroma.max(0.0);
+    if !fits_in_srgb(lightness, high, cos, sin) {
+        for _ in 0..16 {
+            let middle = (low + high) * 0.5;
+            if fits_in_srgb(lightness, middle, cos, sin) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+    } else {
+        low = high;
+    }
+
+    let (r, g, b) = oklab_to_linear_srgb(lightness, low * cos, low * sin);
+    Color32::from_rgb(linear_to_byte(r), linear_to_byte(g), linear_to_byte(b))
+}
+
+/// この明度・クロマ・色相が sRGB の範囲に収まるか
+fn fits_in_srgb(lightness: f32, chroma: f32, cos: f32, sin: f32) -> bool {
+    let (r, g, b) = oklab_to_linear_srgb(lightness, chroma * cos, chroma * sin);
+    // 丸めで境界を割る分の余裕を見る
+    let inside = |x: f32| (-1e-4..=1.0 + 1e-4).contains(&x);
+    inside(r) && inside(g) && inside(b)
+}
+
+/// Oklab から線形 sRGB へ (Björn Ottosson の定義そのまま)
+fn oklab_to_linear_srgb(lightness: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    let l_ = lightness + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = lightness - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = lightness - 0.089_484_18 * a - 1.291_485_5 * b;
+
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+
+    (
+        4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s,
+        -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s,
+        -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s,
+    )
+}
+
+/// 線形値に sRGB のガンマをかけてバイトにする
+fn linear_to_byte(value: f32) -> u8 {
     let value = value.clamp(0.0, 1.0);
-
-    let chroma = value * saturation;
-    let sector = hue / 60.0;
-    // 色相環の各60度区間で、いちばん弱い成分から立ち上がる量
-    let second = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
-    let floor = value - chroma;
-
-    let (r, g, b) = match sector as u32 {
-        0 => (chroma, second, 0.0),
-        1 => (second, chroma, 0.0),
-        2 => (0.0, chroma, second),
-        3 => (0.0, second, chroma),
-        4 => (second, 0.0, chroma),
-        _ => (chroma, 0.0, second),
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
     };
-
-    let to_byte = |x: f32| ((x + floor) * 255.0).round().clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(to_byte(r), to_byte(g), to_byte(b))
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// 新規ノートに引き継ぐ設定。
@@ -2676,36 +2740,31 @@ mod tests {
 
     /// 音高が上がるほど暖色へ進み、途中で寒色へ戻らないこと。
     ///
-    /// 「赤 − 青」は単調に増えるが、**途中で平らになる区間がある**。
-    /// シアンから青へ向かう間 (色相 180°〜240°) は赤も青も動かず緑だけが減るため。
-    /// なので単調性は「減らないこと」で見て、色が動いていることは
-    /// 「隣り合うオクターブの色が必ず違う」ほうで担保する。
+    /// 色を割り当てた音域では、隣り合うオクターブが必ず別の色になること。
+    ///
+    /// 「赤 − 青」のような一方向の指標では単調性を見られない。
+    /// シアンから青へ向かう区間は**赤から遠ざかる**ためで、これは経路として
+    /// 正しい (寒色→暖色は端どうしの関係であって、途中まで単調ではない)。
+    /// 音高との単調な対応は明度が担っている
+    /// ([`note_fill_gets_lighter_as_pitch_rises`] を参照)。
     #[test]
-    fn note_fill_shifts_warmer_as_pitch_rises() {
+    fn note_fill_changes_every_octave() {
         let scale = ScaleMode::Equal12;
-        let color = |semitone: i32, octave: i32| note_fill(&pitched(semitone, octave), scale);
-        let warmth = |semitone: i32, octave: i32| {
-            let c = color(semitone, octave);
-            c.r() as i32 - c.b() as i32
-        };
+        let color = |octave: i32| note_fill(&pitched(0, octave), scale);
 
         for octave in (NOTE_COLOR_MIN_OCTAVE + 1)..=NOTE_COLOR_MAX_OCTAVE {
+            let (previous, current) = (color(octave - 1), color(octave));
+            assert_ne!(current, previous, "オクターブ {octave} で色が変わっていない");
+
+            // 隣り合うオクターブは、目で見て分かるだけ離れていること
+            let distance = (current.r() as i32 - previous.r() as i32).abs()
+                + (current.g() as i32 - previous.g() as i32).abs()
+                + (current.b() as i32 - previous.b() as i32).abs();
             assert!(
-                warmth(0, octave) >= warmth(0, octave - 1),
-                "オクターブ {octave} で寒色へ戻っている ({} → {})",
-                warmth(0, octave - 1),
-                warmth(0, octave)
-            );
-            assert_ne!(
-                color(0, octave),
-                color(0, octave - 1),
-                "オクターブ {octave} で色が変わっていない"
+                distance > 30,
+                "オクターブ {octave} の色差が小さすぎる (差 {distance}): {previous:?} → {current:?}"
             );
         }
-
-        // 色を割り当てた音域の端から端まででは、はっきり分かるだけ動くこと
-        let span = warmth(11, NOTE_COLOR_MAX_OCTAVE) - warmth(0, NOTE_COLOR_MIN_OCTAVE);
-        assert!(span > 150, "常用域での色の振れ幅が小さすぎる ({span})");
     }
 
     /// オクターブ境界で色が飛ばないこと。
@@ -2727,33 +2786,75 @@ mod tests {
         assert_ne!(top, next_bottom, "半音が変われば色も変わること");
     }
 
-    /// 彩度と明度は音高によらず一定 (色相だけで音高を表す)
-    #[test]
-    fn note_fill_keeps_brightness_steady() {
-        let scale = ScaleMode::Equal12;
-        // HSV の value は最大成分に出る。どの音高でも同じはず
-        let brightest = |octave: i32| {
-            let c = note_fill(&pitched(0, octave), scale);
-            c.r().max(c.g()).max(c.b())
+    /// sRGB の相対輝度 (WCAG の定義)。見た目の明るさの目安に使う。
+    fn relative_luminance(color: Color32) -> f32 {
+        let channel = |byte: u8| {
+            let value = byte as f32 / 255.0;
+            if value <= 0.040_45 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
         };
-        let expected = brightest(MIN_OCTAVE);
-        for octave in MIN_OCTAVE..=MAX_OCTAVE {
-            assert_eq!(
-                brightest(octave),
-                expected,
-                "オクターブ {octave} で明度が変わっている"
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    /// 音高が上がるほど明るくなること。
+    ///
+    /// 色相より明度のほうが差を見分けやすいので、ここが単調でないと
+    /// 「色は違うのにどちらが高いか分からない」状態になる。
+    #[test]
+    fn note_fill_gets_lighter_as_pitch_rises() {
+        let scale = ScaleMode::Equal12;
+        let luminance =
+            |octave: i32| relative_luminance(note_fill(&pitched(0, octave), scale));
+
+        for octave in (NOTE_COLOR_MIN_OCTAVE + 1)..=NOTE_COLOR_MAX_OCTAVE {
+            assert!(
+                luminance(octave) > luminance(octave - 1),
+                "オクターブ {octave} で明るくなっていない ({:.4} → {:.4})",
+                luminance(octave - 1),
+                luminance(octave)
             );
         }
     }
 
-    /// 上端の色相は vim-hybrid の RED に近い色になること (テーマから浮かないこと)
+    /// いちばん暗いノートでも、その上に抜くラベルが読めること。
+    ///
+    /// 塗りが届いた部分のラベルは [`palette::BG`] で抜いている。
+    /// 明度の下限はこの条件から決めた。
     #[test]
-    fn note_hue_matches_the_theme_palette() {
-        let red = hsv_to_color(NOTE_HUE_HIGH, NOTE_SATURATION, NOTE_VALUE);
-        let dist = (red.r() as i32 - palette::RED.r() as i32).abs()
-            + (red.g() as i32 - palette::RED.g() as i32).abs()
-            + (red.b() as i32 - palette::RED.b() as i32).abs();
-        assert!(dist < 40, "パレットの赤から離れすぎ: {red:?} (差 {dist})");
+    fn darkest_note_keeps_its_label_readable() {
+        let darkest = note_fill(&pitched(0, MIN_OCTAVE), ScaleMode::Equal12);
+        let contrast = (relative_luminance(darkest) + 0.05)
+            / (relative_luminance(palette::BG) + 0.05);
+        assert!(
+            contrast >= 4.5,
+            "ラベルのコントラストが不足: {contrast:.2}:1 ({darkest:?})"
+        );
+    }
+
+    /// どの音高でも sRGB からはみ出さないこと。
+    ///
+    /// はみ出したまま切り詰めると、色相と明度が指定からずれる。
+    /// クロマを削って収める処理が効いているかを見る。
+    #[test]
+    fn note_colors_stay_inside_srgb() {
+        let scale = ScaleMode::Equal12;
+        for octave in MIN_OCTAVE..=MAX_OCTAVE {
+            for semitone in 0..12 {
+                let color = note_fill(&pitched(semitone, octave), scale);
+                // 3チャンネルとも振り切れていたら、削り切れずに潰れている
+                let clipped = [color.r(), color.g(), color.b()]
+                    .iter()
+                    .filter(|byte| **byte == 0 || **byte == 255)
+                    .count();
+                assert!(
+                    clipped < 3,
+                    "オクターブ {octave} 半音 {semitone} で色が潰れている: {color:?}"
+                );
+            }
+        }
     }
 
     fn placed(start: f32, lane: usize) -> Note {
