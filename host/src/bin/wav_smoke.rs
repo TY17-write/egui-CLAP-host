@@ -104,7 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 使い終わった処理器はメインスレッドで停止・解放する
     for ((_, processor), mut instance) in processors.into_iter().zip(instances) {
-        instance.deactivate(processor.into_stopped());
+        let clap_host_test::audio::RetiredProcessor::Clap(stopped) = processor.into_retired();
+        instance.deactivate(stopped);
     }
 
     // ---- 区間ごとのピークを測る ----

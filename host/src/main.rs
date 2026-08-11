@@ -701,7 +701,9 @@ impl App {
             return;
         };
         while let Ok((track, processor)) = engine.retired.pop() {
-            let stopped = processor.into_stopped();
+            // 形式ごとに返し方が違う。VST3 を足すとこのパターンが尽きなくなり、
+            // ここで必ずコンパイルエラーになる (処理漏れを型で防ぐ)
+            let audio::RetiredProcessor::Clap(stopped) = processor.into_retired();
             let waiting = self.retiring.iter().position(|(index, _)| *index == track);
 
             match waiting {

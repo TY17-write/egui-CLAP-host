@@ -10,7 +10,6 @@
 use super::transport::{self, Transport, TransportMsg, TransportShared};
 use super::TrackProcessor;
 use crate::sequencer::SeqEvent;
-use clack_host::prelude::OutputEvents;
 
 /// 終端のあと、残響やリリースを録り切るために余分に回す長さ (秒)。
 /// clap.tail 拡張が未対応なので、実際の減衰時間は分からない。長めに回して
@@ -118,7 +117,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
     // このブロックの出力は捨てる。
     for (_, processor) in processors.iter_mut() {
         processor.events.clear();
-        transport::push_choke(&mut processor.events, processor.note_port, 0);
+        transport::push_choke(&mut processor.events, 0);
     }
     process_block(processors, 0, &mut mix, &mut failures);
 
@@ -131,7 +130,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
         for (track, processor) in processors.iter_mut() {
             processor.events.clear();
             if !plan.is_empty() {
-                transport.emit_track(*track, &plan, &mut processor.events, processor.note_port);
+                transport.emit_track(*track, &plan, &mut processor.events);
             }
         }
 
@@ -166,23 +165,11 @@ fn process_block(
     mix.fill(0.0);
 
     for (track, processor) in processors.iter_mut() {
-        processor.buffers.ensure_buffer_size_matches(mix.len());
-        let events = processor.events.as_input();
-        let (ins, mut outs) = processor.buffers.prepare_plugin_buffers(mix.len());
-
-        match processor.audio_processor.process(
-            &ins,
-            &mut outs,
-            &events,
-            &mut OutputEvents::void(),
-            Some(steady),
-            None,
-        ) {
-            // 失敗したトラックはこのブロックが無音のまま混ざる。
-            // 黙って進めると中身の欠けたファイルが「成功」として出てしまうので、
-            // 呼び出し側へ持ち帰って知らせる。
-            Ok(_) => processor.buffers.mix_into(mix),
-            Err(e) => failures.record(*track, e),
+        // 失敗したトラックはこのブロックが無音のまま混ざる。
+        // 黙って進めると中身の欠けたファイルが「成功」として出てしまうので、
+        // 呼び出し側へ持ち帰って知らせる。
+        if let Err(e) = processor.process(steady, mix) {
+            failures.record(*track, e);
         }
     }
 }

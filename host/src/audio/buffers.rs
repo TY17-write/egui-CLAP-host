@@ -1,5 +1,11 @@
-//! オーディオバッファの管理と CPAL バッファへの書き出し。
+//! CLAP のオーディオバッファの管理と、インターリーブ形式への変換。
 //! clack リポジトリの cpal サンプル (MIT OR Apache-2.0) をほぼそのまま利用。
+//!
+//! ここは CLAP バックエンド専用 (`audio::clap` からのみ使う)。
+//! チャンネル変換 (`mux` / `mix_mono` / `mono_to_multi`) は素のスライスを扱うので
+//! 共有できそうに見えるが、CLAP はポートごとに連続した配置 (`[l,l,l,r,r,r]`)、
+//! VST3 はチャンネルごとの `Vec` と元の形が違う。共通化は VST3 側の要求が
+//! はっきりしてから判断する。
 
 use crate::audio::config::FullAudioConfig;
 use clack_host::prelude::{

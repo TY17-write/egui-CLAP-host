@@ -1,10 +1,8 @@
 //! シーケンス再生のトランスポート (オーディオスレッド上で動く)。
 //! サンプル精度でノートイベントをブロック内オフセット付きで発行する。
 
+use crate::audio::events::{BlockEvent, BlockEvents};
 use crate::sequencer::SeqEvent;
-use clack_host::events::event_types::{MidiEvent, NoteChokeEvent, NoteOffEvent, NoteOnEvent};
-use clack_host::events::{EventFlags, Match, Pckn};
-use clack_host::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -214,13 +212,7 @@ impl Transport {
     }
 
     /// 1トラック分のイベントを、計画した区間に沿って発行する
-    pub fn emit_track(
-        &mut self,
-        track: usize,
-        plan: &BlockPlan,
-        buffer: &mut EventBuffer,
-        note_port: Option<(u16, bool)>,
-    ) {
+    pub fn emit_track(&mut self, track: usize, plan: &BlockPlan, events: &mut BlockEvents) {
         let end_sample = self.end_sample;
         let Some(sequence) = self.tracks.get_mut(track) else {
             return;
@@ -232,7 +224,7 @@ impl Transport {
                     break;
                 }
                 let offset = (span.block_offset + (event.sample_time - span.start)) as u32;
-                push_note_event(buffer, note_port, offset, event);
+                events.push(note_event(offset, event));
                 sequence.next_event += 1;
             }
 
@@ -241,7 +233,7 @@ impl Transport {
                     if event.sample_time > end_sample {
                         break;
                     }
-                    push_note_event(buffer, note_port, span.flush_offset, event);
+                    events.push(note_event(span.flush_offset, event));
                     sequence.next_event += 1;
                 }
                 if span.rewind {
@@ -303,23 +295,13 @@ impl BlockPlan {
 }
 
 /// 全ノート消音イベントを積む
-pub fn push_choke(buffer: &mut EventBuffer, note_port: Option<(u16, bool)>, time: u32) {
-    let Some((port, prefers_midi)) = note_port else {
-        return;
-    };
-    if prefers_midi {
-        // CC 123 (All Notes Off)
-        buffer.push(&MidiEvent::new(time, port, [0xB0, 123, 0]).with_flags(EventFlags::IS_LIVE));
-    } else {
-        buffer.push(&NoteChokeEvent::new(time, Pckn::match_all()).with_flags(EventFlags::IS_LIVE));
-    }
+pub fn push_choke(events: &mut BlockEvents, offset: u32) {
+    events.push(BlockEvent::Choke { offset });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const PORT: Option<(u16, bool)> = Some((0u16, false));
 
     fn make_transport(events: Vec<SeqEvent>, end_sample: u64) -> (Transport, TransportShared) {
         let shared = TransportShared::new();
@@ -333,9 +315,9 @@ mod tests {
     }
 
     /// トラック1本ぶんのブロック処理 (テスト用の短縮形)
-    fn process_block(transport: &mut Transport, buffer: &mut EventBuffer, sample_count: u64) {
+    fn process_block(transport: &mut Transport, events: &mut BlockEvents, sample_count: u64) {
         let plan = transport.plan_block(sample_count);
-        transport.emit_track(0, &plan, buffer, PORT);
+        transport.emit_track(0, &plan, events);
     }
 
     fn on(sample_time: u64) -> SeqEvent {
@@ -360,25 +342,24 @@ mod tests {
     #[test]
     fn final_note_off_at_end_boundary_is_emitted() {
         let (mut transport, shared) = make_transport(vec![on(0), off(200)], 200);
-        let mut buffer = EventBuffer::with_capacity(16);
+        let mut events = BlockEvents::with_capacity(16);
         let _ = transport.handle_msg(TransportMsg::Play);
 
-        buffer.clear();
-        process_block(&mut transport, &mut buffer, 100); // [0,100)
-        assert_eq!(buffer.as_input().len(), 1); // ノートオンのみ
+        events.clear();
+        process_block(&mut transport, &mut events, 100); // [0,100)
+        assert_eq!(events.len(), 1); // ノートオンのみ
 
-        buffer.clear();
-        process_block(&mut transport, &mut buffer, 100); // [100,200) + 終端フラッシュ
-        assert_eq!(buffer.as_input().len(), 1); // ノートオフが欠落しないこと
+        events.clear();
+        process_block(&mut transport, &mut events, 100); // [100,200) + 終端フラッシュ
+        assert_eq!(events.len(), 1); // ノートオフが欠落しないこと
 
         assert!(!shared.playing.load(Ordering::Relaxed)); // 自動停止していること
     }
 
-    /// エディタで設定したベロシティが NoteOn イベントまで届くこと
+    /// エディタで設定したベロシティが発行イベントまで届くこと
     #[test]
     fn note_on_carries_velocity() {
         use crate::sequencer::{MidiEditor, Note};
-        use clack_host::events::spaces::CoreEventSpace;
 
         let mut editor = MidiEditor::default();
         editor.notes = vec![Note {
@@ -391,19 +372,18 @@ mod tests {
             lane: 0,
         }];
 
-        let events = editor.to_events(44100.0);
-        let (mut transport, _shared) = make_transport(events, 44100);
-        let mut buffer = EventBuffer::with_capacity(16);
+        let sequence = editor.to_events(44100.0);
+        let (mut transport, _shared) = make_transport(sequence, 44100);
+        let mut events = BlockEvents::with_capacity(16);
         let _ = transport.handle_msg(TransportMsg::Play);
 
-        buffer.clear();
-        process_block(&mut transport, &mut buffer, 64);
+        events.clear();
+        process_block(&mut transport, &mut events, 64);
 
-        let velocities: Vec<f64> = buffer
-            .as_input()
-            .into_iter()
-            .filter_map(|e| match e.as_core_event() {
-                Some(CoreEventSpace::NoteOn(on)) => Some(on.velocity()),
+        let velocities: Vec<f64> = events
+            .iter()
+            .filter_map(|event| match event {
+                BlockEvent::NoteOn { velocity, .. } => Some(*velocity),
                 _ => None,
             })
             .collect();
@@ -421,58 +401,44 @@ mod tests {
     #[test]
     fn loop_wrap_emits_final_note_off() {
         let (mut transport, _shared) = make_transport(vec![on(0), off(200)], 200);
-        let mut buffer = EventBuffer::with_capacity(16);
+        let mut events = BlockEvents::with_capacity(16);
         let _ = transport.handle_msg(TransportMsg::SetLoop { enabled: true });
         let _ = transport.handle_msg(TransportMsg::Play);
 
-        buffer.clear();
-        process_block(&mut transport, &mut buffer, 100); // [0,100)
-        buffer.clear();
+        events.clear();
+        process_block(&mut transport, &mut events, 100); // [0,100)
+        events.clear();
         // [100,200) + 終端フラッシュ + 巻き戻して [0,100) → オフ1 + オン1
-        process_block(&mut transport, &mut buffer, 200);
-        assert_eq!(buffer.as_input().len(), 2);
+        process_block(&mut transport, &mut events, 200);
+        assert_eq!(events.len(), 2);
+    }
+
+    /// 消音イベントが中立の形で積まれること (バックエンドが自分の形へ移す)
+    #[test]
+    fn choke_is_emitted_as_a_neutral_event() {
+        let mut events = BlockEvents::with_capacity(4);
+        push_choke(&mut events, 32);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.iter().next(),
+            Some(&BlockEvent::Choke { offset: 32 })
+        );
     }
 }
 
-/// シーケンスイベント1つをノートオン/オフとして積む
-fn push_note_event(
-    buffer: &mut EventBuffer,
-    note_port: Option<(u16, bool)>,
-    time: u32,
-    event: &SeqEvent,
-) {
-    let Some((port, prefers_midi)) = note_port else {
-        return;
-    };
-
+/// シーケンスイベント1つをブロックイベントにする
+fn note_event(offset: u32, event: &SeqEvent) -> BlockEvent {
     if event.is_on {
-        if prefers_midi {
-            let vel = (event.velocity * 127.0).round().clamp(1.0, 127.0) as u8;
-            buffer.push(
-                &MidiEvent::new(time, port, [0x90, event.key, vel]).with_flags(EventFlags::IS_LIVE),
-            );
-        } else {
-            buffer.push(
-                &NoteOnEvent::new(
-                    time,
-                    Pckn::new(port, 0u16, event.key as u16, Match::All),
-                    event.velocity,
-                )
-                .with_flags(EventFlags::IS_LIVE),
-            );
+        BlockEvent::NoteOn {
+            offset,
+            key: event.key,
+            velocity: event.velocity,
         }
-    } else if prefers_midi {
-        buffer.push(
-            &MidiEvent::new(time, port, [0x80, event.key, 0]).with_flags(EventFlags::IS_LIVE),
-        );
     } else {
-        buffer.push(
-            &NoteOffEvent::new(
-                time,
-                Pckn::new(port, 0u16, event.key as u16, Match::All),
-                0.0,
-            )
-            .with_flags(EventFlags::IS_LIVE),
-        );
+        BlockEvent::NoteOff {
+            offset,
+            key: event.key,
+        }
     }
 }

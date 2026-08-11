@@ -10,7 +10,9 @@
 //! 使い方: cargo run -p clap-host-test --bin choke_smoke -- <path\to\plugin.clap>
 
 use clack_host::prelude::*;
+use clap_host_test::audio::config::StreamAudioConfig;
 use clap_host_test::audio::transport::{self, Transport, TransportMsg, TransportShared};
+use clap_host_test::audio::{self, TrackProcessor};
 use clap_host_test::discovery;
 use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use clap_host_test::sequencer::{MidiEditor, Note};
@@ -20,6 +22,7 @@ use std::path::Path;
 
 const SAMPLE_RATE: f64 = 44_100.0;
 const BLOCK_SIZE: usize = 512;
+const CHANNELS: usize = 2;
 
 /// 無音とみなす上限 / 鳴っているとみなす下限
 const SILENT: f32 = 0.001;
@@ -51,16 +54,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         &host_info,
     )?;
 
-    let mut processor = instance
-        .activate(
-            |_, _| (),
-            PluginAudioConfiguration {
-                sample_rate: SAMPLE_RATE,
-                min_frames_count: 1,
-                max_frames_count: BLOCK_SIZE as u32,
-            },
-        )?
-        .start_processing()?;
+    // バッファやイベントの組み立ては本体と同じ経路を通す
+    let stream_config = StreamAudioConfig {
+        output_channel_count: CHANNELS,
+        min_buffer_size: 1,
+        max_likely_buffer_size: BLOCK_SIZE as u32,
+        sample_rate: SAMPLE_RATE as u32,
+        sample_format: cpal::SampleFormat::F32,
+    };
+    let mut processor: Box<TrackProcessor> = audio::activate_track(&mut instance, &stream_config)?;
 
     // ---- シーケンス: C4 のロングトーン1本 (4拍) ----
     // 途中で止めるためのものなので、検証の間ずっと鳴り続ける長さにする。
@@ -80,7 +82,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
 
     let mut transport = Transport::new(TransportShared::new());
-    let note_port = Some((0u16, false)); // テストプラグインは CLAP ダイアレクト
 
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
@@ -90,18 +91,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _ = transport.handle_msg(TransportMsg::Play);
 
     // ---- オフライン処理 ----
-    let mut event_buffer = EventBuffer::with_capacity(512);
-    let mut input_buffers = [vec![0.0f32; BLOCK_SIZE]];
-    let mut output_buffers = [vec![0.0f32; BLOCK_SIZE]];
-    let mut input_ports = AudioPorts::with_capacity(1, 1);
-    let mut output_ports = AudioPorts::with_capacity(1, 1);
+    let mut mix = vec![0.0f32; BLOCK_SIZE * CHANNELS];
 
     // 各区間のピーク [再生中, 停止後, シーク後]
     let mut peaks = [0.0f32; 3];
     let mut pos = 0u64;
 
     for block in 0..TOTAL_BLOCKS {
-        event_buffer.clear();
+        processor.events_mut().clear();
 
         // 本体と同じ手順: トランスポートを操作し、要求されたら消音イベントを積む
         let msg = match block {
@@ -112,7 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         if let Some(msg) = msg {
             if transport.handle_msg(msg) {
-                transport::push_choke(&mut event_buffer, note_port, 0);
+                transport::push_choke(processor.events_mut(), 0);
             }
         }
         if block == SEEK_AT {
@@ -120,35 +117,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let plan = transport.plan_block(BLOCK_SIZE as u64);
-        transport.emit_track(0, &plan, &mut event_buffer, note_port);
-        let events_in = event_buffer.as_input();
+        transport.emit_track(0, &plan, processor.events_mut());
 
-        let inputs = input_ports.with_input_buffers([AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_input_only(input_buffers.iter_mut().map(|b| {
-                InputChannel {
-                    buffer: b.as_mut_slice(),
-                    is_constant: true,
-                }
-            })),
-        }]);
-        let mut outputs = output_ports.with_output_buffers([AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_output_only(
-                output_buffers.iter_mut().map(|b| b.as_mut_slice()),
-            ),
-        }]);
+        mix.fill(0.0);
+        processor.process(pos, &mut mix)?;
 
-        processor.process(
-            &inputs,
-            &mut outputs,
-            &events_in,
-            &mut OutputEvents::void(),
-            Some(pos),
-            None,
-        )?;
-
-        let peak = output_buffers[0].iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+        let peak = mix.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
         // 操作したブロック自体は境界なので、どの区間にも数えない
         match block {
             b if b < STOP_AT => peaks[0] = peaks[0].max(peak),
@@ -159,6 +133,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         pos += BLOCK_SIZE as u64;
     }
+
+    // 使い終わった処理器はメインスレッドで停止・解放する
+    let audio::RetiredProcessor::Clap(stopped) = processor.into_retired();
+    instance.deactivate(stopped);
 
     println!(
         "ピーク値: 再生中={:.4} 停止後={:.4} シーク後={:.4}",

@@ -2,10 +2,16 @@
 //! C4(0〜1拍) → 休符(1〜2拍) → E4(2〜3拍) のシーケンスを再生し、
 //! 「音が鳴るべき区間で音が出て、休符区間は無音」をサンプル位置で検証する。
 //!
+//! バッファやイベントの組み立ては本体と同じ経路 (`activate_track` →
+//! `TrackProcessor`) を通す。手組みの並行実装を持つと、抽象化を変えたときに
+//! ここだけ古い形のまま通ってしまう。
+//!
 //! 使い方: cargo run -p clap-host-test --bin seq_smoke -- <path\to\plugin.clap>
 
 use clack_host::prelude::*;
+use clap_host_test::audio::config::StreamAudioConfig;
 use clap_host_test::audio::transport::{Transport, TransportMsg, TransportShared};
+use clap_host_test::audio::{self, TrackProcessor};
 use clap_host_test::discovery;
 use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use clap_host_test::sequencer::{MidiEditor, Note};
@@ -39,12 +45,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         &host_info,
     )?;
 
-    let config = PluginAudioConfiguration {
-        sample_rate: SAMPLE_RATE,
-        min_frames_count: 1,
-        max_frames_count: BLOCK_SIZE as u32,
+    // デバイスを開かずに構成を作る (本体が使うものと同じ形)
+    let stream_config = StreamAudioConfig {
+        output_channel_count: CHANNELS,
+        min_buffer_size: 1,
+        max_likely_buffer_size: BLOCK_SIZE as u32,
+        sample_rate: SAMPLE_RATE as u32,
+        sample_format: cpal::SampleFormat::F32,
     };
-    let mut processor = instance.activate(|_, _| (), config)?.start_processing()?;
+    let mut processor: Box<TrackProcessor> = audio::activate_track(&mut instance, &stream_config)?;
 
     // ---- シーケンス: C4 [0,1拍) / 休符 [1,2拍) / E4 [2,3拍) @ 120bpm ----
     // 2音目はベロシティを半分にして、音量差が出ることも確認する。
@@ -78,22 +87,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let shared = TransportShared::new();
     let mut transport = Transport::new(shared.clone());
-    let mut event_buffer = EventBuffer::with_capacity(512);
-    let note_port = Some((0u16, false)); // テストプラグインは CLAP ダイアレクト
-
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
         events,
         end_sample,
     });
     let _ = transport.handle_msg(TransportMsg::Play);
-    event_buffer.clear();
 
     // ---- オフライン処理 ----
-    let mut input_buffers = [vec![0.0f32; BLOCK_SIZE], vec![0.0f32; BLOCK_SIZE]];
-    let mut output_buffers = [vec![0.0f32; BLOCK_SIZE], vec![0.0f32; BLOCK_SIZE]];
-    let mut input_ports = AudioPorts::with_capacity(CHANNELS, 1);
-    let mut output_ports = AudioPorts::with_capacity(CHANNELS, 1);
+    let mut mix = vec![0.0f32; BLOCK_SIZE * CHANNELS];
 
     // 各区間のピーク値 [C4区間, 休符区間, E4区間, 終端後]
     let mut region_peaks = [0.0f32; 4];
@@ -104,35 +106,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut pos = 0u64;
 
     for _ in 0..total_blocks {
-        event_buffer.clear();
         let plan = transport.plan_block(BLOCK_SIZE as u64);
-        transport.emit_track(0, &plan, &mut event_buffer, note_port);
-        let events_in = event_buffer.as_input();
+        processor.events_mut().clear();
+        transport.emit_track(0, &plan, processor.events_mut());
 
-        let inputs = input_ports.with_input_buffers([AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_input_only(input_buffers.iter_mut().map(|b| {
-                InputChannel {
-                    buffer: b.as_mut_slice(),
-                    is_constant: true,
-                }
-            })),
-        }]);
-        let mut outputs = output_ports.with_output_buffers([AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_output_only(
-                output_buffers.iter_mut().map(|b| b.as_mut_slice()),
-            ),
-        }]);
-
-        processor.process(
-            &inputs,
-            &mut outputs,
-            &events_in,
-            &mut OutputEvents::void(),
-            Some(pos),
-            None,
-        )?;
+        mix.fill(0.0);
+        processor.process(pos, &mut mix)?;
 
         // このブロックがどの区間に完全に収まるかを判定してピークを記録
         let block_start = pos;
@@ -141,16 +120,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             let lo = boundaries[region] + margin;
             let hi = boundaries[region + 1].saturating_sub(margin);
             if block_start >= lo && block_end <= hi {
-                let peak = output_buffers
-                    .iter()
-                    .flat_map(|b| b.iter())
-                    .fold(0.0f32, |acc, s| acc.max(s.abs()));
+                let peak = mix.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
                 region_peaks[region] = region_peaks[region].max(peak);
             }
         }
 
         pos += BLOCK_SIZE as u64;
     }
+
+    // 使い終わった処理器はメインスレッドで停止・解放する
+    let audio::RetiredProcessor::Clap(stopped) = processor.into_retired();
+    instance.deactivate(stopped);
 
     println!(
         "ピーク値: C4区間={:.4} 休符区間={:.4} E4区間={:.4} 終端後={:.4}",

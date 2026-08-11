@@ -1,10 +1,11 @@
 //! プラグインのアクティベートと CPAL ストリームへの接続。
 //! GUI からのノート/パラメータイベントはリングバッファ経由でオーディオスレッドに渡す。
+//!
+//! プラグイン形式に依存する部分は [`clap`] へ切り出してある。ここから上は
+//! 中立の [`events::BlockEvents`] だけを扱う。バックエンドの分岐は trait ではなく
+//! enum にしている (停止・解放の経路が形式ごとに違うため、型で追える形にしたい)。
 
 use crate::host::MiniHost;
-use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNotePorts};
-use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
-use clack_host::events::{EventFlags, Match};
 use clack_host::prelude::*;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -14,12 +15,15 @@ use rtrb::Consumer;
 use std::error::Error;
 
 pub mod buffers;
+pub mod clap;
 pub mod config;
+pub mod events;
 pub mod offline;
 pub mod transport;
 
-use buffers::*;
+use clap::ClapProcessor;
 use config::*;
+use events::{BlockEvent, BlockEvents};
 use transport::{Transport, TransportMsg, TransportShared};
 
 /// GUI スレッドからオーディオスレッドへ送るメッセージ
@@ -35,7 +39,7 @@ pub enum GuiMsg {
     },
     ParamValue {
         track: usize,
-        id: ClapId,
+        id: u32,
         value: f64,
     },
     Transport(TransportMsg),
@@ -50,32 +54,52 @@ pub enum GuiMsg {
     },
 }
 
+/// 音源の形式ごとの処理器。
+///
+/// trait オブジェクトにしないのは、停止して解放する経路が形式ごとに違うため。
+/// `dyn` にするとダウンキャストが要り、リングバッファ越しの受け渡しが
+/// 型で守れなくなる。
+pub enum Backend {
+    Clap(ClapProcessor),
+}
+
 /// オーディオスレッドが持つトラック1本ぶんの処理器一式
 pub struct TrackProcessor {
-    audio_processor: StartedPluginAudioProcessor<MiniHost>,
-    buffers: HostAudioBuffers,
-    events: EventBuffer,
-    /// (ノートポートのインデックス, MIDI ダイアレクト優先か)。ノート入力がなければ None。
-    note_port: Option<(u16, bool)>,
+    /// このブロックで送るイベント (バックエンドに依らない形)
+    events: BlockEvents,
+    backend: Backend,
+}
+
+/// 停止済みの処理器。メインスレッドでインスタンスへ返すために形式を保つ。
+pub enum RetiredProcessor {
+    Clap(StoppedPluginAudioProcessor<MiniHost>),
 }
 
 impl TrackProcessor {
-    pub fn new(
-        audio_processor: StartedPluginAudioProcessor<MiniHost>,
-        config: FullAudioConfig,
-        note_port: Option<(u16, bool)>,
-    ) -> Self {
+    pub fn new(backend: Backend) -> Self {
         Self {
-            audio_processor,
-            buffers: HostAudioBuffers::from_config(config),
-            events: EventBuffer::with_capacity(128),
-            note_port,
+            events: BlockEvents::with_capacity(128),
+            backend,
         }
     }
 
-    /// 停止させてプラグインインスタンスへ返せる形にする
-    pub fn into_stopped(self) -> StoppedPluginAudioProcessor<MiniHost> {
-        self.audio_processor.stop_processing()
+    /// 停止させてメインスレッドへ返せる形にする
+    pub fn into_retired(self) -> RetiredProcessor {
+        match self.backend {
+            Backend::Clap(processor) => RetiredProcessor::Clap(processor.into_stopped()),
+        }
+    }
+
+    /// このブロックで送るイベント (呼び出し側が積む)
+    pub fn events_mut(&mut self) -> &mut BlockEvents {
+        &mut self.events
+    }
+
+    /// 1ブロック処理して `mix` に足し込む
+    pub fn process(&mut self, steady: u64, mix: &mut [f32]) -> Result<(), PluginInstanceError> {
+        match &mut self.backend {
+            Backend::Clap(processor) => processor.process(&self.events, steady, mix),
+        }
     }
 }
 
@@ -119,14 +143,14 @@ pub fn start_engine(
     Ok((stream, stream_config))
 }
 
-/// プラグインを指定のストリーム構成でアクティベートし、トラック処理器にする
+/// CLAP プラグインを指定のストリーム構成でアクティベートし、トラック処理器にする
 pub fn activate_track(
     instance: &mut PluginInstance<MiniHost>,
     stream_config: &StreamAudioConfig,
 ) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
     let audio_config = FullAudioConfig::for_plugin(stream_config, instance);
 
-    let note_port = find_main_note_port(instance);
+    let note_port = clap::find_main_note_port(instance);
     if note_port.is_none() {
         println!("このプラグインにはノート入力ポートがありません。");
     }
@@ -135,11 +159,9 @@ pub fn activate_track(
         .activate(|_, _| (), stream_config.as_clack_plugin_config())?
         .start_processing()?;
 
-    Ok(Box::new(TrackProcessor::new(
-        processor,
-        audio_config,
-        note_port,
-    )))
+    Ok(Box::new(TrackProcessor::new(Backend::Clap(
+        ClapProcessor::new(processor, audio_config, note_port),
+    ))))
 }
 
 /// サンプル形式に応じた CPAL 出力ストリームを構築する
@@ -192,37 +214,6 @@ fn make_stream_runner<S: FromSample<f32>>(
     move |data, _info| audio_processor.process(data)
 }
 
-/// プラグインのメインノート入力ポートを探す。
-/// 戻り値は (ポートインデックス, MIDI ダイアレクトを優先するか)。
-fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<(u16, bool)> {
-    let mut handle = instance.plugin_handle();
-    let plugin_note_ports = handle.get_extension::<PluginNotePorts>()?;
-
-    let mut buffer = NotePortInfoBuffer::new();
-
-    let ports_count = plugin_note_ports
-        .count(&mut handle, true)
-        .min(u16::MAX as u32);
-
-    for i in 0..ports_count {
-        let Some(port_info) = plugin_note_ports.get(&mut handle, i, true, &mut buffer) else {
-            continue;
-        };
-
-        if !port_info
-            .supported_dialects
-            .intersects(NoteDialects::CLAP | NoteDialects::MIDI)
-        {
-            continue;
-        }
-
-        let prefers_midi = !port_info.supported_dialects.intersects(NoteDialects::CLAP);
-        return Some((i as u16, prefers_midi));
-    }
-
-    None
-}
-
 /// オーディオスレッド上で動くデータ一式
 struct StreamAudioProcessor {
     /// トラックごとの音源。None は音源未ロードのトラック。
@@ -271,7 +262,7 @@ impl StreamAudioProcessor {
         }
     }
 
-    /// GUI からのメッセージをすべて取り出し、トラックごとの CLAP イベントに変換する。
+    /// GUI からのメッセージをすべて取り出し、トラックごとのイベントに変換する。
     /// その後、再生中ならシーケンスのイベントを sample_count 分発行する。
     fn collect_gui_events(&mut self, sample_count: u64) {
         for track in self.tracks.iter_mut().flatten() {
@@ -285,56 +276,36 @@ impl StreamAudioProcessor {
                     key,
                     velocity,
                 } => {
-                    let Some(Some(target)) = self.tracks.get_mut(track) else {
-                        continue;
-                    };
-                    let Some((port, prefers_midi)) = target.note_port else {
-                        continue;
-                    };
-                    if prefers_midi {
-                        target.events.push(
-                            &MidiEvent::new(0, port, [0x90, key as u8, 100])
-                                .with_flags(EventFlags::IS_LIVE),
-                        );
-                    } else {
-                        target.events.push(
-                            &NoteOnEvent::new(0, Pckn::new(port, 0u16, key, Match::All), velocity)
-                                .with_flags(EventFlags::IS_LIVE),
-                        );
+                    if let Some(Some(target)) = self.tracks.get_mut(track) {
+                        target.events.push(BlockEvent::NoteOn {
+                            offset: 0,
+                            key: key.min(127) as u8,
+                            velocity,
+                        });
                     }
                 }
                 GuiMsg::NoteOff { track, key } => {
-                    let Some(Some(target)) = self.tracks.get_mut(track) else {
-                        continue;
-                    };
-                    let Some((port, prefers_midi)) = target.note_port else {
-                        continue;
-                    };
-                    if prefers_midi {
-                        target.events.push(
-                            &MidiEvent::new(0, port, [0x80, key as u8, 0])
-                                .with_flags(EventFlags::IS_LIVE),
-                        );
-                    } else {
-                        target.events.push(
-                            &NoteOffEvent::new(0, Pckn::new(port, 0u16, key, Match::All), 0.0)
-                                .with_flags(EventFlags::IS_LIVE),
-                        );
+                    if let Some(Some(target)) = self.tracks.get_mut(track) {
+                        target.events.push(BlockEvent::NoteOff {
+                            offset: 0,
+                            key: key.min(127) as u8,
+                        });
                     }
                 }
                 GuiMsg::ParamValue { track, id, value } => {
-                    let Some(Some(target)) = self.tracks.get_mut(track) else {
-                        continue;
-                    };
-                    target
-                        .events
-                        .push(&ParamValueEvent::new(0, id, Pckn::match_all(), value));
+                    if let Some(Some(target)) = self.tracks.get_mut(track) {
+                        target.events.push(BlockEvent::Param {
+                            offset: 0,
+                            id,
+                            value,
+                        });
+                    }
                 }
                 GuiMsg::Transport(msg) => {
                     // 状態の更新は1回。消音が要るときは全トラックへ配る
                     if self.transport.handle_msg(msg) {
                         for track in self.tracks.iter_mut().flatten() {
-                            transport::push_choke(&mut track.events, track.note_port, 0);
+                            transport::push_choke(&mut track.events, 0);
                         }
                     }
                 }
@@ -358,8 +329,7 @@ impl StreamAudioProcessor {
         if !plan.is_empty() {
             for (index, slot) in self.tracks.iter_mut().enumerate() {
                 if let Some(track) = slot {
-                    self.transport
-                        .emit_track(index, &plan, &mut track.events, track.note_port);
+                    self.transport.emit_track(index, &plan, &mut track.events);
                 }
             }
         }
@@ -381,20 +351,8 @@ impl StreamAudioProcessor {
 
         let steady = self.steady_counter;
         for track in self.tracks.iter_mut().flatten() {
-            track.buffers.ensure_buffer_size_matches(data.len());
-            let events = track.events.as_input();
-            let (ins, mut outs) = track.buffers.prepare_plugin_buffers(data.len());
-
-            match track.audio_processor.process(
-                &ins,
-                &mut outs,
-                &events,
-                &mut OutputEvents::void(),
-                Some(steady),
-                None,
-            ) {
-                Ok(_) => track.buffers.mix_into(mix),
-                Err(e) => eprintln!("{e}"),
+            if let Err(e) = track.process(steady, mix) {
+                eprintln!("{e}");
             }
         }
 
