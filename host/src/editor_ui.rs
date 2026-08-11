@@ -43,26 +43,38 @@ const MAX_OCTAVE: i32 = 8;
 /// 0 にするとノートが痩せて見えるので、色相と輪郭が残る程度に薄く塗る。
 const VELOCITY_GHOST_ALPHA: f32 = 0.3;
 
-/// ノートの色相 (度)。低い音から高い音へ、青 → シアン → 緑 → 黄 → 赤 と下げていく。
-/// 寒色から暖色への並びなので、ぱっと見で音域の高さが分かる。
-const NOTE_HUE_LOW: f32 = 215.0;
-const NOTE_HUE_HIGH: f32 = 0.0;
+/// ノートの色相 (度)。低い音から高い音へ、シアン → 青 → 紫 → マゼンタ → 赤 と上げていく。
+///
+/// 色相環を逆回り (215° → 0°) にすると緑と黄の帯を通る。そちらは常用域が
+/// 緑〜黄に集まって隣同士の差が出にくかったので、こちら回りにしている。
+const NOTE_HUE_LOW: f32 = 180.0;
+const NOTE_HUE_HIGH: f32 = 360.0;
+
+/// 色を割り当てる音域。この外は端の色で頭打ちにする。
+///
+/// 指定できる範囲 ([`MIN_OCTAVE`]〜[`MAX_OCTAVE`]) 全体に広げると、実際に
+/// よく使う音域が色相のごく一部に収まって隣同士の差が出ない。常用域に寄せて、
+/// そこで色が大きく動くようにしてある。
+/// 代償として、極端に高い音どうし・低い音どうしは同じ色になる。
+const NOTE_COLOR_MIN_OCTAVE: i32 = 1;
+const NOTE_COLOR_MAX_OCTAVE: i32 = 7;
 
 /// 彩度と明度は音高によらず一定にする。
 ///
 /// 色相だけを動かすので「色が違う = 音高が違う」と読める。彩度や明度まで
 /// 動かすと、暗いノートが選択やゴーストと紛らわしくなる。
-/// 値は vim-hybrid のアクセント色に寄せてある (この彩度・明度で色相 0 にすると
+/// 値は vim-hybrid のアクセント色に寄せてある (この彩度・明度で色相 360° にすると
 /// `palette::RED` とほぼ同じ色になる)。
 const NOTE_SATURATION: f32 = 0.45;
 const NOTE_VALUE: f32 = 0.80;
 
 /// ノートの塗り色。
 ///
-/// **音高が上がるほど青から赤へ変わる連続的なグラデーション**にしてある。
-/// 指定できるオクターブの全域 ([`MIN_OCTAVE`], [`MAX_OCTAVE`]) を色相の幅に
-/// 割り当てるので、同じ音高なら常に同じ色になる (画面に出ている範囲で
-/// 正規化すると、スクロールしただけで色が変わってしまう)。
+/// **音高が上がるほど寒色から暖色へ変わる連続的なグラデーション**にしてある。
+/// [`NOTE_COLOR_MIN_OCTAVE`]〜[`NOTE_COLOR_MAX_OCTAVE`] を色相の幅に割り当て、
+/// その外は端の色で頭打ちにする。割り当ては音高そのものに紐づくので、
+/// 同じ音なら常に同じ色になる (画面に出ている範囲で正規化すると、
+/// スクロールしただけで色が変わってしまう)。
 ///
 /// オクターブ内も半音で連続的に変える。オクターブ境界で色が飛ばないので、
 /// 隣り合う音の高低が色の変化として読める。
@@ -71,8 +83,8 @@ fn note_fill(note: &Note, scale: ScaleMode) -> Color32 {
     // オクターブ + オクターブ内の位置。BP 音律なら13ステップで割る
     let position = note.octave as f32 + note.semitone.clamp(0, steps) as f32 / steps as f32;
 
-    let span = (MAX_OCTAVE - MIN_OCTAVE + 1) as f32;
-    let t = ((position - MIN_OCTAVE as f32) / span).clamp(0.0, 1.0);
+    let span = (NOTE_COLOR_MAX_OCTAVE - NOTE_COLOR_MIN_OCTAVE + 1) as f32;
+    let t = ((position - NOTE_COLOR_MIN_OCTAVE as f32) / span).clamp(0.0, 1.0);
 
     let hue = NOTE_HUE_LOW + (NOTE_HUE_HIGH - NOTE_HUE_LOW) * t;
     hsv_to_color(hue, NOTE_SATURATION, NOTE_VALUE)
@@ -2615,7 +2627,7 @@ mod tests {
         vec![0]
     }
 
-    /// いちばん低い音は青く、いちばん高い音は赤い
+    /// いちばん低い音は寒色、いちばん高い音は赤い
     #[test]
     fn note_fill_runs_from_blue_to_red() {
         let scale = ScaleMode::Equal12;
@@ -2632,40 +2644,68 @@ mod tests {
         );
     }
 
+    /// 色を割り当てた音域の外は、端の色で頭打ちになること。
+    ///
+    /// 上端に届くのは「最上位オクターブの次の頭」= `NOTE_COLOR_MAX_OCTAVE + 1` の
+    /// 半音0。最上位オクターブの最上位半音はまだ1半音ぶん手前にある。
+    #[test]
+    fn note_fill_clamps_outside_the_colored_range() {
+        let scale = ScaleMode::Equal12;
+        let bottom = note_fill(&pitched(0, NOTE_COLOR_MIN_OCTAVE), scale);
+        let top = note_fill(&pitched(0, NOTE_COLOR_MAX_OCTAVE + 1), scale);
+
+        for octave in MIN_OCTAVE..NOTE_COLOR_MIN_OCTAVE {
+            for semitone in [0, 11] {
+                assert_eq!(
+                    note_fill(&pitched(semitone, octave), scale),
+                    bottom,
+                    "オクターブ {octave} 半音 {semitone} が下端の色で止まっていない"
+                );
+            }
+        }
+        for octave in (NOTE_COLOR_MAX_OCTAVE + 1)..=MAX_OCTAVE {
+            for semitone in [0, 11] {
+                assert_eq!(
+                    note_fill(&pitched(semitone, octave), scale),
+                    top,
+                    "オクターブ {octave} 半音 {semitone} が上端の色で止まっていない"
+                );
+            }
+        }
+    }
+
     /// 音高が上がるほど暖色へ進み、途中で寒色へ戻らないこと。
     ///
     /// 「赤 − 青」は単調に増えるが、**途中で平らになる区間がある**。
-    /// 青からシアンへ向かう間 (色相 215°〜180°) は赤が 0 のまま緑だけが増えるため。
+    /// シアンから青へ向かう間 (色相 180°〜240°) は赤も青も動かず緑だけが減るため。
     /// なので単調性は「減らないこと」で見て、色が動いていることは
     /// 「隣り合うオクターブの色が必ず違う」ほうで担保する。
     #[test]
     fn note_fill_shifts_warmer_as_pitch_rises() {
         let scale = ScaleMode::Equal12;
-        let color = |octave: i32| note_fill(&pitched(0, octave), scale);
-        let warmth = |octave: i32| {
-            let c = color(octave);
+        let color = |semitone: i32, octave: i32| note_fill(&pitched(semitone, octave), scale);
+        let warmth = |semitone: i32, octave: i32| {
+            let c = color(semitone, octave);
             c.r() as i32 - c.b() as i32
         };
 
-        for octave in (MIN_OCTAVE + 1)..=MAX_OCTAVE {
+        for octave in (NOTE_COLOR_MIN_OCTAVE + 1)..=NOTE_COLOR_MAX_OCTAVE {
             assert!(
-                warmth(octave) >= warmth(octave - 1),
+                warmth(0, octave) >= warmth(0, octave - 1),
                 "オクターブ {octave} で寒色へ戻っている ({} → {})",
-                warmth(octave - 1),
-                warmth(octave)
+                warmth(0, octave - 1),
+                warmth(0, octave)
             );
             assert_ne!(
-                color(octave),
-                color(octave - 1),
+                color(0, octave),
+                color(0, octave - 1),
                 "オクターブ {octave} で色が変わっていない"
             );
         }
 
-        // 端から端まででは、はっきり分かるだけ動くこと
-        assert!(
-            warmth(MAX_OCTAVE) - warmth(MIN_OCTAVE) > 150,
-            "全域での色の振れ幅が小さすぎる"
-        );
+        // 色を割り当てた音域の端から端まででは、はっきり分かるだけ動くこと
+        let span = warmth(11, NOTE_COLOR_MAX_OCTAVE) - warmth(0, NOTE_COLOR_MIN_OCTAVE);
+        assert!(span > 150, "常用域での色の振れ幅が小さすぎる ({span})");
     }
 
     /// オクターブ境界で色が飛ばないこと。
@@ -2706,10 +2746,10 @@ mod tests {
         }
     }
 
-    /// 色相 0 度は vim-hybrid の RED に近い色になること (テーマから浮かないこと)
+    /// 上端の色相は vim-hybrid の RED に近い色になること (テーマから浮かないこと)
     #[test]
     fn note_hue_matches_the_theme_palette() {
-        let red = hsv_to_color(0.0, NOTE_SATURATION, NOTE_VALUE);
+        let red = hsv_to_color(NOTE_HUE_HIGH, NOTE_SATURATION, NOTE_VALUE);
         let dist = (red.r() as i32 - palette::RED.r() as i32).abs()
             + (red.g() as i32 - palette::RED.g() as i32).abs()
             + (red.b() as i32 - palette::RED.b() as i32).abs();
@@ -3359,8 +3399,9 @@ mod tests {
     /// 音階モードでステップ数が変わっても、オクターブ内の相対位置で色が決まること
     #[test]
     fn note_fill_uses_scale_steps() {
-        let eq = note_fill(&pitched(6, 4), ScaleMode::Equal12); // 6/12 = 0.5
-        let bp = note_fill(&pitched(6, 4), ScaleMode::BohlenPierce13); // 6/13 ≈ 0.46
+        // 差が丸めに埋もれないよう、オクターブ内で高い位置を見る
+        let eq = note_fill(&pitched(11, 4), ScaleMode::Equal12); // 11/12 ≈ 0.92
+        let bp = note_fill(&pitched(11, 4), ScaleMode::BohlenPierce13); // 11/13 ≈ 0.85
         assert_ne!(eq, bp, "ステップ数の違いが色に反映されること");
     }
 
