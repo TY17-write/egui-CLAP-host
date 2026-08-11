@@ -1,7 +1,8 @@
 # clap-host-test
 
-Rust + egui で CLAP (CLever Audio Plug-in) をロードして鳴らす、マルチトラックのミニホスト。
-トラックごとに別々の CLAP 音源を読み込み、1つの再生ヘッドで同期して再生できる。
+Rust + egui で CLAP (CLever Audio Plug-in) と VST3 をロードして鳴らす、マルチトラックのミニホスト。
+トラックごとに別々の音源を読み込み、1つの再生ヘッドで同期して再生できる。
+CLAP と VST3 はトラック単位で混在できる (VST3 は音のみ。エディタは未対応)。
 
 > **このリポジトリのコードは Claude Opus 5 (Anthropic) が作成しました。**
 > 設計方針の決定・仕様の判断・動作確認は人間が行い、実装とドキュメントは対話しながら生成しています。
@@ -17,6 +18,7 @@ CLAP の C API を安全な Rust API で包み、**main-thread / audio-thread �
 | クレート | 用途 | ライセンス |
 |---|---|---|
 | [clack](https://github.com/prokopyl/clack) | CLAP ホスト/プラグイン実装 | MIT OR Apache-2.0 |
+| [vst3-host](https://crates.io/crates/vst3-host) | VST3 ホスト実装 | MIT |
 | cpal | オーディオ出力 | Apache-2.0 |
 | eframe / egui | GUI | MIT OR Apache-2.0 |
 | midly | 標準 MIDI ファイルの読み書き | Unlicense |
@@ -30,6 +32,10 @@ CLAP の C API を安全な Rust API で包み、**main-thread / audio-thread �
 
 `host/src/audio/buffers.rs` は clack リポジトリの cpal サンプルをほぼそのまま利用しています
 (MIT OR Apache-2.0)。
+
+VST3 は **2025年10月20日に SDK 3.8.0 が MIT ライセンスで公開された**ため、このプロジェクトを
+MIT のまま VST3 対応にできています (`vst3-host` → `vst3` → SDK の連鎖がすべて MIT 系)。
+残るのは商標の扱いのみで、コードのライセンスとは別の話です。
 
 ## 構成
 
@@ -65,13 +71,17 @@ cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap  # 
 cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
 cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
 
+# VST3 バックエンドの検証 (実物の .vst3 が要る。test-plugin は CLAP 専用のため)
+cargo run -p clap-host-test --bin vst3_smoke -- "C:\Program Files\Common Files\VST3\Surge Synth Team\Surge XT.vst3"
+
 # ユニットテスト
 cargo test -p clap-host-test --lib
 ```
 
 ## 使い方
 
-1. 左のトラック欄の **「♪」** で音源 (.clap) を読み込む
+1. 左のトラック欄の **「♪」** で音源を読み込む (形式を選ぶと、.clap はファイル選択、
+   .vst3 はフォルダ選択のダイアログが開く。Windows の .vst3 はバンドルディレクトリのため)
 2. **「+」** でトラックや段を増やし、グリッドをダブルクリックしてノートを置く
 3. **Space** で再生ヘッドの位置から再生 (Shift+Space で先頭から)
 

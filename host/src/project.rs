@@ -23,11 +23,14 @@ use std::path::PathBuf;
 /// 1: シーケンスと設定のみ / 2: 音源 (`plugins`) を追加
 const VERSION: u32 = 2;
 
-/// 音源の種別。VST3 対応時にここへ選択肢が増える。
+/// 音源の種別。
+///
+/// 既定を `Clap` にしてあるので、種別を持たないバージョン1 のファイルも読める。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum PluginKind {
     #[default]
     Clap,
+    Vst3,
 }
 
 /// 保存する音源1つぶん。
@@ -38,7 +41,8 @@ pub enum PluginKind {
 pub struct PluginSnapshot {
     pub kind: PluginKind,
     pub path: PathBuf,
-    /// CLAP のプラグイン ID。1つのファイルに複数入りうるので、パスだけでは足りない。
+    /// CLAP のプラグイン ID、または VST3 のクラス UID。
+    /// 1つのファイルに複数入りうるので、パスだけでは足りない。
     pub id: String,
     /// 音源が書き出した状態。中身は不透明なバイト列。
     pub state: Vec<u8>,

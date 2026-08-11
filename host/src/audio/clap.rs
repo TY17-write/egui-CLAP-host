@@ -8,6 +8,7 @@
 use crate::audio::buffers::HostAudioBuffers;
 use crate::audio::config::FullAudioConfig;
 use crate::audio::events::{BlockEvent, BlockEvents};
+use crate::audio::ProcessError;
 use crate::host::MiniHost;
 use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNotePorts};
 use clack_host::events::event_types::{
@@ -52,7 +53,7 @@ impl ClapProcessor {
         events: &BlockEvents,
         steady: u64,
         mix: &mut [f32],
-    ) -> Result<(), PluginInstanceError> {
+    ) -> Result<(), ProcessError> {
         self.translate(events);
 
         self.buffers.ensure_buffer_size_matches(mix.len());

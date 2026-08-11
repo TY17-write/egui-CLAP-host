@@ -20,11 +20,50 @@ pub mod config;
 pub mod events;
 pub mod offline;
 pub mod transport;
+pub mod vst3;
 
 use clap::ClapProcessor;
 use config::*;
 use events::{BlockEvent, BlockEvents};
 use transport::{Transport, TransportMsg, TransportShared};
+use vst3::{SharedPlugin, Vst3Processor};
+
+/// 1ブロックの処理が失敗した理由 (形式に依らない形)。
+///
+/// オーディオスレッドで作るので、確保しない形にしてある
+/// (どちらのバックエンドのエラーも、処理経路のものは確保せずに作られる)。
+#[derive(Debug)]
+pub enum ProcessError {
+    Clap(PluginInstanceError),
+    Vst3(vst3_host::error::Error),
+    /// 音源をメインスレッドが使っていて、このブロックを飛ばした (VST3 のみ)。
+    /// イベントは持ち越されるので、音が消えるだけで崩れはしない。
+    Busy,
+}
+
+impl std::fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Clap(e) => write!(f, "{e}"),
+            Self::Vst3(e) => write!(f, "{e}"),
+            Self::Busy => write!(f, "音源が別の処理に使われていました"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessError {}
+
+impl From<PluginInstanceError> for ProcessError {
+    fn from(error: PluginInstanceError) -> Self {
+        Self::Clap(error)
+    }
+}
+
+impl From<vst3_host::error::Error> for ProcessError {
+    fn from(error: vst3_host::error::Error) -> Self {
+        Self::Vst3(error)
+    }
+}
 
 /// GUI スレッドからオーディオスレッドへ送るメッセージ
 pub enum GuiMsg {
@@ -61,6 +100,7 @@ pub enum GuiMsg {
 /// 型で守れなくなる。
 pub enum Backend {
     Clap(ClapProcessor),
+    Vst3(Vst3Processor),
 }
 
 /// オーディオスレッドが持つトラック1本ぶんの処理器一式
@@ -70,9 +110,13 @@ pub struct TrackProcessor {
     backend: Backend,
 }
 
-/// 停止済みの処理器。メインスレッドでインスタンスへ返すために形式を保つ。
+/// オーディオスレッドから外した処理器。メインスレッドで始末するために形式を保つ。
 pub enum RetiredProcessor {
+    /// 停止済み。あとはインスタンスへ返すだけ。
     Clap(StoppedPluginAudioProcessor<MiniHost>),
+    /// **まだ止まっていない。** `setProcessing(false)` はリアルタイム安全でないので、
+    /// 受け取った側 (メインスレッド) が止める。
+    Vst3(SharedPlugin),
 }
 
 impl TrackProcessor {
@@ -83,10 +127,11 @@ impl TrackProcessor {
         }
     }
 
-    /// 停止させてメインスレッドへ返せる形にする
+    /// メインスレッドへ返せる形にする (このメソッド自体もメインスレッドで呼ぶ)
     pub fn into_retired(self) -> RetiredProcessor {
         match self.backend {
             Backend::Clap(processor) => RetiredProcessor::Clap(processor.into_stopped()),
+            Backend::Vst3(processor) => RetiredProcessor::Vst3(processor.into_shared()),
         }
     }
 
@@ -95,10 +140,14 @@ impl TrackProcessor {
         &mut self.events
     }
 
-    /// 1ブロック処理して `mix` に足し込む
-    pub fn process(&mut self, steady: u64, mix: &mut [f32]) -> Result<(), PluginInstanceError> {
+    /// 1ブロック処理して `mix` に足し込む。
+    ///
+    /// `steady` は再生開始からの通し時間 (サンプル)。CLAP はこれを受け取るが、
+    /// VST3 は `ProcessContext` を自前で組み立てる作りなので使わない。
+    pub fn process(&mut self, steady: u64, mix: &mut [f32]) -> Result<(), ProcessError> {
         match &mut self.backend {
             Backend::Clap(processor) => processor.process(&self.events, steady, mix),
+            Backend::Vst3(processor) => processor.process(&self.events, mix),
         }
     }
 }
@@ -162,6 +211,44 @@ pub fn activate_track(
     Ok(Box::new(TrackProcessor::new(Backend::Clap(
         ClapProcessor::new(processor, audio_config, note_port),
     ))))
+}
+
+/// VST3 プラグインを指定のストリーム構成で読み込み、トラック処理器にする。
+///
+/// CLAP の `activate_track` は「既にあるインスタンスを起こす」形だが、こちらは
+/// 読み込みも含める。`vst3-host` では音源の生成と処理器が同じ型なので、
+/// 分ける意味がないため。
+///
+/// 戻り値の [`SharedPlugin`] はメインスレッド側 (エディタ・状態の保存) が持つ。
+/// 処理器と同じ音源を指しているので、片方を捨てても音源は生き残る。
+pub fn activate_vst3_track(
+    path: &std::path::Path,
+    class_id: &str,
+    stream_config: &StreamAudioConfig,
+) -> Result<(SharedPlugin, Box<TrackProcessor>), Box<dyn Error>> {
+    // ホストはインスタンス化のための入口でしかないので、ここで作って捨ててよい
+    // (`Plugin` がモジュールを自分で抱える)。
+    let mut vst3_host = vst3_host::host::Vst3Host::builder()
+        .sample_rate(stream_config.sample_rate as f64)
+        // CPAL が一度に渡してくる最大長。これを超えるブロックは
+        // `vst3-host` 側が分割して処理する。
+        .block_size(stream_config.max_likely_buffer_size as usize)
+        // 音源として使うだけなので入力は要らない
+        .input_channels(0)
+        .output_channels(stream_config.output_channel_count)
+        .build()?;
+
+    let mut plugin = vst3_host.load_plugin_class(path, class_id)?;
+    let plugin_channels = plugin.output_channel_count();
+    plugin.start_processing()?;
+
+    let shared = SharedPlugin::new(plugin);
+    let processor = Vst3Processor::new(shared.clone(), plugin_channels, stream_config);
+
+    Ok((
+        shared,
+        Box::new(TrackProcessor::new(Backend::Vst3(processor))),
+    ))
 }
 
 /// サンプル形式に応じた CPAL 出力ストリームを構築する

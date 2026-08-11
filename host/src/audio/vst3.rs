@@ -1,0 +1,356 @@
+//! VST3 バックエンド。
+//!
+//! 中立の [`BlockEvents`] を VST3 のイベントへ移し、プラグインを1ブロック処理して、
+//! 出力をインターリーブで足し込むところまでを受け持つ。
+//!
+//! ここより上 (トランスポート・ミキサ・オフラインレンダラ) は VST3 を知らない。
+//!
+//! CLAP との差が3つあり、いずれもこのファイルの中で吸収する。
+//!
+//! - **消音イベントが無い。** CLAP の `NoteChoke` に当たるものが VST3 には無いので、
+//!   鳴らしたキーを自前で覚えておき、choke ではそれを1つずつ note-off する
+//!   (詳しくは [`Vst3Processor::active`])
+//! - **音源をメインスレッドと共有する。** [`SharedPlugin`] を参照
+//! - **バッファがチャンネルごとの `Vec`。** CLAP のポート連続配置とは別物なので、
+//!   インターリーブへの変換をここに持つ
+
+use crate::audio::config::StreamAudioConfig;
+use crate::audio::events::{BlockEvent, BlockEvents};
+use crate::audio::ProcessError;
+use std::sync::{Arc, Mutex, MutexGuard};
+use vst3_host::audio::AudioBuffers;
+use vst3_host::midi::{MidiChannel, MidiEvent};
+use vst3_host::plugin::Plugin;
+
+/// 音源を取れずに送り損ねたイベントを溜めておく上限。
+///
+/// 1ブロックに数十件しか出ないので、これだけあれば数ブロック分の取りこぼしを
+/// 吸収できる。溢れるのは異常事態なので、そのときは捨てる。
+const MAX_DEFERRED: usize = 512;
+
+/// メインスレッドとオーディオスレッドで1つの音源を共有する入れ物。
+///
+/// CLAP では音源本体がメインスレッドに残り、切り離した処理器だけを
+/// オーディオスレッドへ渡せる。`vst3-host` の [`Plugin`] は処理器と
+/// エディットコントローラを1つの型にまとめているため、この分け方ができない。
+/// エディタの表示 (`open_editor`) も状態の保存・復元 (`save_state` / `load_state`) も
+/// メインスレッドから `&mut Plugin` を要求するので、値でオーディオスレッドへ
+/// 渡してしまうと二度と届かなくなる。
+///
+/// そこで `Arc<Mutex<..>>` で共有する。**オーディオスレッド側は必ず
+/// [`try_lock`](Self::try_lock) を使い、取れなければそのブロックを飛ばす。**
+/// 待たないので締め切りは落とさない。取り合いになるのはエディタの開閉と
+/// 状態の保存・復元のときだけで、どれもユーザー操作の頻度でしか起きない。
+///
+/// 破棄はメインスレッドで行われる。オーディオスレッドが持つ複製は
+/// `retired` 経由でメインスレッドへ戻り、そこで落ちるため。
+#[derive(Clone)]
+pub struct SharedPlugin(Arc<Mutex<Plugin>>);
+
+impl SharedPlugin {
+    pub fn new(plugin: Plugin) -> Self {
+        Self(Arc::new(Mutex::new(plugin)))
+    }
+
+    /// メインスレッド用。相手 (オーディオスレッド) は1ブロックぶんしか握らないので待ってよい。
+    ///
+    /// 毒された (ロック中にパニックした) 場合も中身は取り出す。VST3 の音源は
+    /// COM オブジェクトで、ここで諦めると破棄する手立てが無くなる。
+    pub fn lock(&self) -> MutexGuard<'_, Plugin> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// オーディオスレッド用。待たない。
+    fn try_lock(&self) -> Option<MutexGuard<'_, Plugin>> {
+        match self.0.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+/// VST3 の音源1つぶんの処理器
+pub struct Vst3Processor {
+    plugin: SharedPlugin,
+    /// プラグインに渡すチャンネルごとのバッファ。長さが1ブロックのフレーム数になる。
+    buffers: AudioBuffers,
+    /// CPAL 側の出力チャンネル数 (1 か 2)
+    output_channels: usize,
+    /// 鳴らしているキー。ビット位置がキー番号 (0〜127)。
+    ///
+    /// VST3 には消音イベントが無いので、choke ではここに立っているキーを
+    /// 1つずつ note-off する。128ビットなのでオーディオスレッドでも確保は起きない。
+    active: u128,
+    /// 音源を取れずに送れなかったイベント。次に取れたブロックの先頭で送り直す。
+    ///
+    /// 捨ててしまうと note-off が失われて音が鳴りっぱなしになる。
+    /// 位置は失われるが、鳴り続けるよりはるかにましと判断した。
+    deferred: Vec<BlockEvent>,
+}
+
+impl Vst3Processor {
+    /// `plugin_channels` はプラグインの出力チャンネル数 (CPAL 側とは違ってよい)。
+    pub fn new(
+        plugin: SharedPlugin,
+        plugin_channels: usize,
+        stream_config: &StreamAudioConfig,
+    ) -> Self {
+        Self {
+            plugin,
+            buffers: AudioBuffers::new(
+                0,
+                plugin_channels.max(1),
+                stream_config.max_likely_buffer_size as usize,
+                stream_config.sample_rate as f64,
+            ),
+            output_channels: stream_config.output_channel_count.max(1),
+            active: 0,
+            deferred: Vec::with_capacity(MAX_DEFERRED),
+        }
+    }
+
+    /// メインスレッドへ返せる形にする。
+    ///
+    /// CLAP と違って停止はここで行わない。`setProcessing(false)` はリアルタイム安全でなく、
+    /// 呼ぶ相手もメインスレッドなので、受け取った側で止める。
+    pub fn into_shared(self) -> SharedPlugin {
+        self.plugin
+    }
+
+    /// 1ブロック処理して `mix` に足し込む。
+    /// `mix` の長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
+    pub fn process(&mut self, events: &BlockEvents, mix: &mut [f32]) -> Result<(), ProcessError> {
+        let Some(mut plugin) = self.plugin.try_lock() else {
+            // メインスレッドが音源を使っている。このブロックは無音のまま返し、
+            // イベントは取っておいて次に送る。
+            self.defer(events);
+            return Err(ProcessError::Busy);
+        };
+
+        let frames = mix.len() / self.output_channels;
+        if frames == 0 {
+            return Ok(());
+        }
+        resize_buffers(&mut self.buffers, frames);
+
+        // 溜めておいたぶんを先に送る (順序は保つ)
+        for index in 0..self.deferred.len() {
+            let event = self.deferred[index];
+            send(&mut plugin, &mut self.active, event, frames);
+        }
+        self.deferred.clear();
+        for event in events {
+            send(&mut plugin, &mut self.active, *event, frames);
+        }
+
+        self.buffers.clear();
+        plugin.process_audio(&mut self.buffers)?;
+        drop(plugin);
+
+        self.mix_into(mix, frames);
+        Ok(())
+    }
+
+    /// 送れなかったイベントを取っておく。上限を超えたぶんは捨てる。
+    fn defer(&mut self, events: &BlockEvents) {
+        for event in events {
+            if self.deferred.len() >= MAX_DEFERRED {
+                return;
+            }
+            // 次のブロックで送るので、ブロック内の位置は先頭に潰す
+            self.deferred.push(at_block_start(*event));
+        }
+    }
+
+    /// プラグインの出力を CPAL のインターリーブ形式へ移して**加算**する。
+    /// チャンネル数が食い違うときは複製・平均で合わせる (`buffers.rs` と同じ方針)。
+    fn mix_into(&self, mix: &mut [f32], frames: usize) {
+        let outputs = &self.buffers.outputs;
+        let channels = self.output_channels;
+
+        match outputs.len() {
+            0 => {}
+            // モノラル出力は全チャンネルへ複製する
+            1 => {
+                let source = &outputs[0];
+                for (frame, samples) in mix.chunks_exact_mut(channels).take(frames).enumerate() {
+                    let value = source[frame];
+                    for sample in samples {
+                        *sample += value;
+                    }
+                }
+            }
+            // モノラル出力へはダウンミックスする
+            count if channels == 1 => {
+                let scale = 1.0 / count as f32;
+                for (frame, sample) in mix.iter_mut().take(frames).enumerate() {
+                    let total: f32 = outputs.iter().map(|channel| channel[frame]).sum();
+                    *sample += total * scale;
+                }
+            }
+            // 足りないチャンネルは最後のもので埋める (2ch 出力に 1ch 音源は上で処理済み)
+            count => {
+                for (frame, samples) in mix.chunks_exact_mut(channels).take(frames).enumerate() {
+                    for (channel, sample) in samples.iter_mut().enumerate() {
+                        *sample += outputs[channel.min(count - 1)][frame];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 中立のイベント1件を VST3 の形で送り、鳴っているキーの記録を更新する。
+///
+/// 送信に失敗しても続ける。1件の取りこぼしでブロック全体を落とすより、
+/// 残りを届けたほうが被害が小さい。
+fn send(plugin: &mut Plugin, active: &mut u128, event: BlockEvent, frames: usize) {
+    // ブロックの外を指す位置は端に寄せる (VST3 側の扱いが実装依存のため)
+    let clamp = |offset: u32| offset.min(frames as u32 - 1) as i32;
+
+    match event {
+        BlockEvent::NoteOn {
+            offset,
+            key,
+            velocity,
+        } => {
+            let key = key.min(127);
+            let velocity = (velocity * 127.0).round().clamp(1.0, 127.0) as u8;
+            if plugin
+                .send_midi_event_at(
+                    MidiEvent::NoteOn {
+                        channel: MidiChannel::Ch1,
+                        note: key,
+                        velocity,
+                    },
+                    clamp(offset),
+                )
+                .is_ok()
+            {
+                *active |= 1u128 << key;
+            }
+        }
+        BlockEvent::NoteOff { offset, key } => {
+            let key = key.min(127);
+            let _ = plugin.send_midi_event_at(note_off(key), clamp(offset));
+            *active &= !(1u128 << key);
+        }
+        BlockEvent::Choke { offset } => {
+            let offset = clamp(offset);
+            let mut remaining = *active;
+            while remaining != 0 {
+                let key = remaining.trailing_zeros() as u8;
+                remaining &= remaining - 1; // 最下位の立っているビットを落とす
+                let _ = plugin.send_midi_event_at(note_off(key), offset);
+            }
+            *active = 0;
+        }
+        BlockEvent::Param { offset, id, value } => {
+            // パラメータ UI は現在無効なので、ここを通るのは鍵盤 UI 経由のときだけ。
+            // VST3 の値域は 0.0〜1.0 に正規化されている。
+            let _ = plugin.set_parameter_at(id, value.clamp(0.0, 1.0), clamp(offset));
+        }
+    }
+}
+
+fn note_off(key: u8) -> MidiEvent {
+    MidiEvent::NoteOff {
+        channel: MidiChannel::Ch1,
+        note: key,
+        velocity: 0,
+    }
+}
+
+/// ブロック内の位置を先頭へ潰す (持ち越したイベント用)
+fn at_block_start(event: BlockEvent) -> BlockEvent {
+    match event {
+        BlockEvent::NoteOn { key, velocity, .. } => BlockEvent::NoteOn {
+            offset: 0,
+            key,
+            velocity,
+        },
+        BlockEvent::NoteOff { key, .. } => BlockEvent::NoteOff { offset: 0, key },
+        BlockEvent::Choke { .. } => BlockEvent::Choke { offset: 0 },
+        BlockEvent::Param { id, value, .. } => BlockEvent::Param {
+            offset: 0,
+            id,
+            value,
+        },
+    }
+}
+
+/// バッファの長さを今回のブロックに合わせる。
+///
+/// `AudioBuffers` は各チャンネルの `Vec` の長さがそのままフレーム数になる仕様。
+/// 生成時に上限ぶん確保してあるので、縮める・戻すだけなら確保は起きない
+/// (上限を超えるブロックが来たときだけ伸びる)。
+fn resize_buffers(buffers: &mut AudioBuffers, frames: usize) {
+    let current = buffers.outputs.first().map_or(0, Vec::len);
+    if current == frames {
+        return;
+    }
+    for channel in buffers.outputs.iter_mut().chain(buffers.inputs.iter_mut()) {
+        channel.resize(frames, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 持ち越したイベントはブロックの先頭へ寄せること。
+    /// (次のブロックで送るので、元の位置は意味を持たない)
+    #[test]
+    fn deferred_events_move_to_the_block_start() {
+        let moved = at_block_start(BlockEvent::NoteOn {
+            offset: 300,
+            key: 60,
+            velocity: 0.5,
+        });
+        assert_eq!(
+            moved,
+            BlockEvent::NoteOn {
+                offset: 0,
+                key: 60,
+                velocity: 0.5
+            }
+        );
+
+        let moved = at_block_start(BlockEvent::Choke { offset: 128 });
+        assert_eq!(moved, BlockEvent::Choke { offset: 0 });
+    }
+
+    /// バッファの長さがフレーム数に追随し、縮めても容量が残ること。
+    /// (容量が減ると次のブロックでオーディオスレッドが確保することになる)
+    #[test]
+    fn buffers_follow_the_frame_count_without_shrinking_capacity() {
+        let mut buffers = AudioBuffers::new(0, 2, 512, 48_000.0);
+
+        resize_buffers(&mut buffers, 128);
+        assert_eq!(buffers.outputs[0].len(), 128);
+        assert!(buffers.outputs[0].capacity() >= 512, "容量は減らないこと");
+
+        resize_buffers(&mut buffers, 512);
+        assert_eq!(buffers.outputs[1].len(), 512);
+    }
+
+    /// choke は鳴っているキーだけを消し、記録を空にすること
+    #[test]
+    fn choke_clears_every_sounding_key() {
+        // 実際の送信はプラグインが要るので、ビット演算の部分だけを確かめる
+        let mut active: u128 = 0;
+        active |= 1u128 << 60;
+        active |= 1u128 << 64;
+        active |= 1u128 << 127;
+
+        let mut keys = Vec::new();
+        let mut remaining = active;
+        while remaining != 0 {
+            keys.push(remaining.trailing_zeros() as u8);
+            remaining &= remaining - 1;
+        }
+
+        assert_eq!(keys, vec![60, 64, 127], "立っているキーだけを昇順で拾うこと");
+    }
+}

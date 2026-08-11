@@ -13,6 +13,7 @@ use clap_host_test::{
 use audio::config::StreamAudioConfig;
 use audio::offline::{RenderSetup, TAIL_SECONDS};
 use audio::transport::{TransportMsg, TransportShared};
+use audio::vst3::SharedPlugin;
 use audio::GuiMsg;
 use clack_host::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
@@ -103,8 +104,10 @@ fn setup_japanese_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// ロード済みの .clap ファイル (プラグイン選択待ち)
+/// 中身を数え上げた音源ファイル (プラグイン選択待ち)。
+/// .clap でも .vst3 でも同じ形になる。
 struct Candidates {
+    kind: project::PluginKind,
     path: PathBuf,
     plugins: Vec<discovery::FoundPlugin>,
     /// この候補から選んだプラグインを載せるトラック
@@ -125,29 +128,106 @@ struct Engine {
     config: StreamAudioConfig,
 }
 
-/// トラック1本にロードされた音源
+/// トラック1本にロードされた音源。
+/// 形式に依らない情報だけをここに持ち、中身は [`TrackPlugin`] が形式ごとに抱える。
 struct TrackAudio {
     name: String,
-    /// この音源の .clap のパス。プロジェクトに保存して読み直すために持つ。
+    /// この音源のファイルのパス。プロジェクトに保存して読み直すために持つ。
     path: PathBuf,
-    /// プラグイン ID。1つの .clap に複数入りうるので、パスだけでは足りない。
+    /// CLAP のプラグイン ID / VST3 のクラス UID。
+    /// 1つのファイルに複数入りうるので、パスだけでは足りない。
     id: String,
+    #[allow(dead_code)] // 鍵盤 UI 無効化中
+    pressed_keys: HashSet<u16>,
+    plugin: TrackPlugin,
+}
+
+/// 音源のうち、メインスレッドに残る側。
+///
+/// CLAP と VST3 でここの形が大きく違う。CLAP はインスタンスがメインスレッドに
+/// 残り、切り離した処理器だけがオーディオスレッドへ行く。VST3 は音源そのものを
+/// 共有する (`audio::vst3::SharedPlugin` の説明を参照)。
+enum TrackPlugin {
+    Clap(ClapTrack),
+    Vst3(Vst3Track),
+}
+
+struct ClapTrack {
     instance: PluginInstance<MiniHost>,
     receiver: Receiver<MainThreadMessage>,
     sender: Sender<MainThreadMessage>,
     #[allow(dead_code)] // パラメータ UI 無効化中
     params: Vec<ParamUi>,
-    #[allow(dead_code)] // 鍵盤 UI 無効化中
-    pressed_keys: HashSet<u16>,
     /// プラグイン独自 GUI の管理 (gui 拡張がない場合は None)
     gui: Option<PluginGuiManager>,
+}
+
+struct Vst3Track {
+    /// オーディオスレッドの処理器と同じ音源を指す。
+    /// 触るときは必ず `lock()` する (相手は1ブロックしか握らない)。
+    plugin: SharedPlugin,
+}
+
+impl TrackAudio {
+    fn kind(&self) -> project::PluginKind {
+        match self.plugin {
+            TrackPlugin::Clap(_) => project::PluginKind::Clap,
+            TrackPlugin::Vst3(_) => project::PluginKind::Vst3,
+        }
+    }
+
+    /// 音源の今の状態を取り出す。取れない・失敗したときは空。
+    ///
+    /// 空でもパスと ID は保存するので、次に開いたとき音源自体は載る。
+    fn capture_state(&mut self) -> Vec<u8> {
+        match &mut self.plugin {
+            TrackPlugin::Clap(clap) => {
+                let Some(extension) = clap.instance.access_handler(|mt| mt.state.get()) else {
+                    return Vec::new(); // state 拡張を持たない音源
+                };
+                let mut buffer = Vec::new();
+                if extension
+                    .save(&mut clap.instance.plugin_handle(), &mut buffer)
+                    .is_err()
+                {
+                    buffer.clear();
+                }
+                buffer
+            }
+            TrackPlugin::Vst3(vst3) => vst3.plugin.lock().save_state().unwrap_or_default(),
+        }
+    }
+
+    /// 保存しておいた状態を音源へ戻す。戻せたら true。
+    ///
+    /// 失敗しても音源自体は使えるので、呼び出し側は続行してよい
+    /// (音作りだけ初期値になる)。
+    fn restore_state(&mut self, state: &[u8]) -> bool {
+        if state.is_empty() {
+            return true;
+        }
+        match &mut self.plugin {
+            TrackPlugin::Clap(clap) => {
+                let Some(extension) = clap.instance.access_handler(|mt| mt.state.get()) else {
+                    return false;
+                };
+                let mut reader = std::io::Cursor::new(state);
+                extension
+                    .load(&mut clap.instance.plugin_handle(), &mut reader)
+                    .is_ok()
+            }
+            TrackPlugin::Vst3(vst3) => vst3.plugin.lock().load_state(state).is_ok(),
+        }
+    }
 }
 
 impl Drop for TrackAudio {
     fn drop(&mut self) {
         // インスタンス破棄前にプラグイン GUI を確実に閉じる
-        if let Some(gui) = &mut self.gui {
-            gui.close(&mut self.instance.plugin_handle());
+        if let TrackPlugin::Clap(clap) = &mut self.plugin {
+            if let Some(gui) = &mut clap.gui {
+                gui.close(&mut clap.instance.plugin_handle());
+            }
         }
     }
 }
@@ -228,6 +308,9 @@ fn notice_window(ctx: &egui::Context, notice: &mut Option<Notice>) {
     }
 }
 
+/// Windows で VST3 が置かれる標準の場所 (ダイアログの初期位置に使う)
+const VST3_STANDARD_DIRECTORY: &str = r"C:\Program Files\Common Files\VST3";
+
 /// 表示用のファイル名 (取れなければパス全体)
 fn file_label(path: &std::path::Path) -> String {
     path.file_name()
@@ -237,6 +320,9 @@ fn file_label(path: &std::path::Path) -> String {
 
 #[derive(Default)]
 struct App {
+    /// 「♪」を押したあと、音源の形式を選んでもらっている最中のトラック。
+    /// .clap はファイル、.vst3 はフォルダを選ばせるので、先に形式を決める必要がある。
+    pending_load: Option<usize>,
     candidates: Option<Candidates>,
     // 宣言順にドロップされるため、ストリームをインスタンスより先に止める
     engine: Option<Engine>,
@@ -269,7 +355,7 @@ impl App {
     /// .clap を選ばせて候補を読み込む。
     /// 戻り値は「候補を新しく読み込めたか」。キャンセルや失敗では false を返し、
     /// 前回の候補には触れない (キャンセルで前のプラグインが載らないようにするため)。
-    fn open_file_dialog(&mut self, target_track: usize) -> bool {
+    fn open_clap_dialog(&mut self, target_track: usize) -> bool {
         let picked = rfd::FileDialog::new()
             .add_filter("CLAP プラグイン", &["clap"])
             .pick_file();
@@ -277,12 +363,45 @@ impl App {
         // キャンセルされたら何もしない (前回の候補もそのまま残す)
         let Some(path) = picked else { return false };
 
-        match discovery::load_clap_file(&path) {
-            // entry はここでは持たない。clack が PluginInstance の中で
-            // DLL を生かしておくので、載せるときに開き直せばよい。
-            Ok((_entry, plugins)) => {
+        // entry はここでは持たない。clack が PluginInstance の中で
+        // DLL を生かしておくので、載せるときに開き直せばよい。
+        let found = discovery::load_clap_file(&path).map(|(_entry, plugins)| plugins);
+        self.accept_candidates(project::PluginKind::Clap, path, target_track, found)
+    }
+
+    /// .vst3 を選ばせて候補を読み込む。
+    ///
+    /// Windows の .vst3 は**バンドルディレクトリ**なので、ファイル選択では掴めない。
+    /// フォルダ選択で開かせる (素の DLL 形式は今のところ選べない)。
+    fn open_vst3_dialog(&mut self, target_track: usize) -> bool {
+        let mut dialog = rfd::FileDialog::new();
+        // 標準の置き場から始める。無ければダイアログの既定に任せる
+        let standard = std::path::Path::new(VST3_STANDARD_DIRECTORY);
+        if standard.is_dir() {
+            dialog = dialog.set_directory(standard);
+        }
+
+        let Some(path) = dialog.pick_folder() else {
+            return false;
+        };
+
+        let found = discovery::load_vst3_file(&path);
+        self.accept_candidates(project::PluginKind::Vst3, path, target_track, found)
+    }
+
+    /// 数え上げた結果を候補として受け取る (形式によらず共通)
+    fn accept_candidates(
+        &mut self,
+        kind: project::PluginKind,
+        path: PathBuf,
+        target_track: usize,
+        found: Result<Vec<discovery::FoundPlugin>, Box<dyn Error>>,
+    ) -> bool {
+        match found {
+            Ok(plugins) => {
                 self.error = None;
                 self.candidates = Some(Candidates {
+                    kind,
                     path,
                     plugins,
                     target_track,
@@ -701,24 +820,33 @@ impl App {
             return;
         };
         while let Ok((track, processor)) = engine.retired.pop() {
-            // 形式ごとに返し方が違う。VST3 を足すとこのパターンが尽きなくなり、
-            // ここで必ずコンパイルエラーになる (処理漏れを型で防ぐ)
-            let audio::RetiredProcessor::Clap(stopped) = processor.into_retired();
+            // 差し替えで外したインスタンスが待っていればそちらへ返す。
+            // 待っていない場合 (書き出しの借り出しが時間切れになったときなど) は
+            // 今そのトラックに載っているものが当人なので、欄から降ろして始末する
+            // (止めた音源を載ったままにすると、鳴らないトラックが残る)。
             let waiting = self.retiring.iter().position(|(index, _)| *index == track);
+            let mut owner = match waiting {
+                Some(at) => self.retiring.remove(at).map(|(_, old)| old),
+                None => self.tracks.get_mut(track).and_then(|slot| slot.take()),
+            };
 
-            match waiting {
-                Some(at) => {
-                    if let Some((_, mut old)) = self.retiring.remove(at) {
-                        old.instance.deactivate(stopped);
-                        // old はここで破棄される (GUI も閉じられる)
+            // 形式ごとに始末の仕方が違う
+            match processor.into_retired() {
+                audio::RetiredProcessor::Clap(stopped) => {
+                    // CLAP は処理器をインスタンスへ返して初めて解放できる
+                    if let Some(TrackPlugin::Clap(clap)) =
+                        owner.as_mut().map(|track| &mut track.plugin)
+                    {
+                        clap.instance.deactivate(stopped);
                     }
                 }
-                None => {
-                    if let Some(Some(current)) = self.tracks.get_mut(track) {
-                        current.instance.deactivate(stopped);
-                    }
+                audio::RetiredProcessor::Vst3(shared) => {
+                    // VST3 はオーディオスレッドで止められない (`setProcessing` が
+                    // リアルタイム安全でない) ので、ここで止める
+                    let _ = shared.lock().stop_processing();
                 }
             }
+            // owner はここで破棄される (CLAP は GUI も閉じられる)
         }
     }
 
@@ -744,10 +872,11 @@ impl App {
         let Some(candidates) = &self.candidates else {
             return;
         };
+        let kind = candidates.kind;
         let path = candidates.path.clone();
         let id = candidates.plugins[plugin_index].id.clone();
 
-        match self.load_plugin(track, &path, &id, None) {
+        match self.load_plugin(track, kind, &path, &id, None) {
             Ok(_) => self.error = None,
             Err(e) => self.error = Some(e),
         }
@@ -760,6 +889,7 @@ impl App {
     fn load_plugin(
         &mut self,
         track: usize,
+        kind: project::PluginKind,
         path: &std::path::Path,
         id: &str,
         state: Option<&[u8]>,
@@ -771,7 +901,15 @@ impl App {
             self.engine = Some(engine);
         }
 
-        let (entry, found) = discovery::load_clap_file(path).map_err(|e| e.to_string())?;
+        // 名前は選択 UI に出したものと同じにしたいので、ここでも数え上げる
+        let found = match kind {
+            project::PluginKind::Clap => {
+                discovery::load_clap_file(path).map(|(_entry, plugins)| plugins)
+            }
+            project::PluginKind::Vst3 => discovery::load_vst3_file(path),
+        }
+        .map_err(|e| e.to_string())?;
+
         let Some(plugin) = found.iter().find(|plugin| plugin.id == id) else {
             return Err(format!("プラグイン {id} がこのファイルにありません"));
         };
@@ -781,14 +919,16 @@ impl App {
             return Err("オーディオを開始できません".into());
         };
 
-        let (mut audio_track, processor) =
-            instantiate_plugin(&entry, path, id, &name, &engine.config)
-                .map_err(|e| format!("インスタンス化失敗: {e}"))?;
+        let (mut audio_track, processor) = match kind {
+            project::PluginKind::Clap => instantiate_clap(path, id, &name, &engine.config),
+            project::PluginKind::Vst3 => instantiate_vst3(path, id, &name, &engine.config),
+        }
+        .map_err(|e| format!("インスタンス化失敗: {e}"))?;
 
         // 状態の復元は、処理器をオーディオスレッドへ渡す前に済ませる
         // (初期値のまま鳴り始めるのを避けるため)
         let restored = match state {
-            Some(bytes) => restore_state(&mut audio_track, bytes),
+            Some(bytes) => audio_track.restore_state(bytes),
             None => true,
         };
 
@@ -823,10 +963,10 @@ impl App {
         for track in 0..count {
             let slot = self.tracks.get_mut(track).and_then(|slot| slot.as_mut());
             snapshots.push(slot.map(|audio| PluginSnapshot {
-                kind: project::PluginKind::Clap,
+                kind: audio.kind(),
                 path: audio.path.clone(),
                 id: audio.id.clone(),
-                state: capture_state(audio),
+                state: audio.capture_state(),
             }));
         }
         snapshots
@@ -855,7 +995,13 @@ impl App {
         for (track, slot) in plugins.into_iter().enumerate() {
             let Some(plugin) = slot else { continue };
             let label = file_label(&plugin.path);
-            match self.load_plugin(track, &plugin.path, &plugin.id, Some(&plugin.state)) {
+            match self.load_plugin(
+                track,
+                plugin.kind,
+                &plugin.path,
+                &plugin.id,
+                Some(&plugin.state),
+            ) {
                 Ok(true) => {}
                 Ok(false) => failures.push(format!(
                     "・トラック {}: {label} は読み込めましたが、音作りの復元に失敗しました",
@@ -866,40 +1012,6 @@ impl App {
         }
         failures
     }
-}
-
-/// 保存しておいた状態を音源へ戻す。戻せたら true。
-///
-/// 失敗しても音源自体は使えるので、呼び出し側は続行してよい
-/// (音作りだけ初期値になる)。
-fn restore_state(track: &mut TrackAudio, state: &[u8]) -> bool {
-    if state.is_empty() {
-        return true;
-    }
-    let Some(extension) = track.instance.access_handler(|mt| mt.state.get()) else {
-        return false; // state 拡張を持たない音源
-    };
-    let mut reader = std::io::Cursor::new(state);
-    extension
-        .load(&mut track.instance.plugin_handle(), &mut reader)
-        .is_ok()
-}
-
-/// 音源の今の状態を取り出す。state 拡張が無い、または失敗したときは空。
-///
-/// 空でもパスと ID は保存するので、次に開いたとき音源自体は載る。
-fn capture_state(track: &mut TrackAudio) -> Vec<u8> {
-    let Some(extension) = track.instance.access_handler(|mt| mt.state.get()) else {
-        return Vec::new();
-    };
-    let mut buffer = Vec::new();
-    if extension
-        .save(&mut track.instance.plugin_handle(), &mut buffer)
-        .is_err()
-    {
-        buffer.clear();
-    }
-    buffer
 }
 
 /// `ClearTrack` で外した処理器が返ってくるのを待つ。
@@ -941,15 +1053,17 @@ fn start_engine() -> Result<Engine, Box<dyn Error>> {
     })
 }
 
-/// プラグインをインスタンス化して、指定のストリーム構成で鳴らせる状態にする。
+/// CLAP プラグインをインスタンス化して、指定のストリーム構成で鳴らせる状態にする。
 /// 戻り値の処理器は呼び出し側がエンジンへ送る。
-fn instantiate_plugin(
-    entry: &PluginEntry,
+fn instantiate_clap(
     path: &std::path::Path,
     plugin_id: &str,
     plugin_name: &str,
     stream_config: &StreamAudioConfig,
 ) -> Result<(TrackAudio, Box<audio::TrackProcessor>), Box<dyn Error>> {
+    // clack は PluginInstance の中で DLL を生かすので、ここで開き直してよい
+    let (entry, _) = discovery::load_clap_file(path)?;
+
     let host_info = HostInfo::new(
         "CLAP Mini Host",
         "clap-host-test",
@@ -962,7 +1076,7 @@ fn instantiate_plugin(
     let mut instance = PluginInstance::<MiniHost>::new(
         |_| MiniHostShared::new(sender.clone()),
         |shared| MiniHostMainThread::new(shared),
-        entry,
+        &entry,
         &plugin_id_cstr,
         &host_info,
     )?;
@@ -979,12 +1093,38 @@ fn instantiate_plugin(
             name: plugin_name.to_string(),
             path: path.to_path_buf(),
             id: plugin_id.to_string(),
-            instance,
-            receiver,
-            sender,
-            params,
             pressed_keys: HashSet::new(),
-            gui,
+            plugin: TrackPlugin::Clap(ClapTrack {
+                instance,
+                receiver,
+                sender,
+                params,
+                gui,
+            }),
+        },
+        processor,
+    ))
+}
+
+/// VST3 プラグインを読み込んで、指定のストリーム構成で鳴らせる状態にする。
+///
+/// CLAP と違って音源そのものを処理器と共有する。エディタ (フェーズ3) と
+/// 状態の保存がメインスレッドから音源を要求するため。
+fn instantiate_vst3(
+    path: &std::path::Path,
+    class_id: &str,
+    plugin_name: &str,
+    stream_config: &StreamAudioConfig,
+) -> Result<(TrackAudio, Box<audio::TrackProcessor>), Box<dyn Error>> {
+    let (plugin, processor) = audio::activate_vst3_track(path, class_id, stream_config)?;
+
+    Ok((
+        TrackAudio {
+            name: plugin_name.to_string(),
+            path: path.to_path_buf(),
+            id: class_id.to_string(),
+            pressed_keys: HashSet::new(),
+            plugin: TrackPlugin::Vst3(Vst3Track { plugin }),
         },
         processor,
     ))
@@ -994,9 +1134,22 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 起動時の自動ロード (検証用 CLI)
         if let Some((path, open_gui)) = self.autoload.take() {
-            match discovery::load_clap_file(&path) {
-                Ok((_entry, plugins)) => {
+            // 拡張子で形式を見分ける (CLI なので聞き返す相手がいない)
+            let kind = match path.extension().and_then(|ext| ext.to_str()) {
+                Some(ext) if ext.eq_ignore_ascii_case("vst3") => project::PluginKind::Vst3,
+                _ => project::PluginKind::Clap,
+            };
+            let found = match kind {
+                project::PluginKind::Clap => {
+                    discovery::load_clap_file(&path).map(|(_entry, plugins)| plugins)
+                }
+                project::PluginKind::Vst3 => discovery::load_vst3_file(&path),
+            };
+
+            match found {
+                Ok(plugins) => {
                     self.candidates = Some(Candidates {
+                        kind,
                         path,
                         plugins,
                         target_track: 0,
@@ -1004,13 +1157,16 @@ impl eframe::App for App {
                     self.instantiate(0, 0);
                     if open_gui {
                         if let Some(Some(track)) = self.tracks.get_mut(0) {
-                            if let Some(gui) = &mut track.gui {
-                                if let Err(e) = gui.open(
-                                    &mut track.instance.plugin_handle(),
-                                    &track.name,
-                                    track.sender.clone(),
-                                ) {
-                                    self.error = Some(format!("GUI を開けません: {e}"));
+                            let name = track.name.clone();
+                            if let TrackPlugin::Clap(clap) = &mut track.plugin {
+                                if let Some(gui) = &mut clap.gui {
+                                    if let Err(e) = gui.open(
+                                        &mut clap.instance.plugin_handle(),
+                                        &name,
+                                        clap.sender.clone(),
+                                    ) {
+                                        self.error = Some(format!("GUI を開けません: {e}"));
+                                    }
                                 }
                             }
                         }
@@ -1023,37 +1179,41 @@ impl eframe::App for App {
         // 差し替えで外した音源をここで停止・解放する
         self.drain_retired();
 
-        // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理
+        // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理。
+        // ここは CLAP 固有 (VST3 の GUI はフェーズ3 で足す)。
         for track in self.tracks.iter_mut().flatten() {
-            while let Ok(msg) = track.receiver.try_recv() {
+            let TrackPlugin::Clap(clap) = &mut track.plugin else {
+                continue;
+            };
+            while let Ok(msg) = clap.receiver.try_recv() {
                 match msg {
                     MainThreadMessage::RunOnMainThread => {
-                        track.instance.call_on_main_thread_callback()
+                        clap.instance.call_on_main_thread_callback()
                     }
                     MainThreadMessage::GuiRequestResized { new_size } => {
-                        if let Some(gui) = &mut track.gui {
+                        if let Some(gui) = &mut clap.gui {
                             gui.on_plugin_request_resize(new_size);
                         }
                     }
                     MainThreadMessage::GuiClosed | MainThreadMessage::PluginWindowClosed => {
-                        if let Some(gui) = &mut track.gui {
-                            gui.close(&mut track.instance.plugin_handle());
+                        if let Some(gui) = &mut clap.gui {
+                            gui.close(&mut clap.instance.plugin_handle());
                         }
                     }
                     MainThreadMessage::PluginWindowResized { width, height } => {
-                        if let Some(gui) = &mut track.gui {
-                            gui.on_user_resized(&mut track.instance.plugin_handle(), width, height);
+                        if let Some(gui) = &mut clap.gui {
+                            gui.on_user_resized(&mut clap.instance.plugin_handle(), width, height);
                         }
                     }
                 }
             }
 
             // プラグインが登録したタイマーを駆動する (GUI 描画などに必要)
-            let timer = track
+            let timer = clap
                 .instance
                 .access_handler(|mt| mt.timer_support.get().map(|ext| (mt.timers.clone(), ext)));
             if let Some((timers, timer_ext)) = timer {
-                timers.tick_timers(&timer_ext, &mut track.instance.plugin_handle());
+                timers.tick_timers(&timer_ext, &mut clap.instance.plugin_handle());
             }
         }
 
@@ -1076,6 +1236,24 @@ impl eframe::App for App {
                     ui.weak(status);
                 }
             });
+
+            // 音源の形式の選択。ダイアログの出し方が形式で違うので先に決めてもらう
+            // (.clap はファイル、.vst3 は Windows ではバンドルディレクトリ)。
+            let mut chosen_kind = None;
+            if let Some(track) = self.pending_load {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("トラック {} に読み込む音源の形式:", track + 1));
+                    if ui.button("CLAP (.clap ファイル)").clicked() {
+                        chosen_kind = Some(Some(project::PluginKind::Clap));
+                    }
+                    if ui.button("VST3 (.vst3 フォルダ)").clicked() {
+                        chosen_kind = Some(Some(project::PluginKind::Vst3));
+                    }
+                    if ui.button("やめる").clicked() {
+                        chosen_kind = Some(None);
+                    }
+                });
+            }
 
             // プラグイン選択。1つの .clap に複数入っていて、まだ選んでいないときだけ出す
             // (1つだけのファイルはトラック欄の「♪」でそのまま載るので出さない)。
@@ -1115,27 +1293,36 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label(format!("トラック {}: {}", index + 1, track.name));
 
-                    // プラグイン独自 GUI の開閉ボタン
-                    if let Some(gui) = &mut track.gui {
-                        if gui.supports_gui() {
-                            if !gui.is_open {
-                                let label = if gui.is_floating() {
-                                    "エディタを開く (floating)"
-                                } else {
-                                    "エディタを開く"
-                                };
-                                if ui.button(label).clicked() {
-                                    if let Err(e) = gui.open(
-                                        &mut track.instance.plugin_handle(),
-                                        &track.name,
-                                        track.sender.clone(),
-                                    ) {
-                                        gui_error = Some(format!("GUI を開けません: {e}"));
+                    match &mut track.plugin {
+                        // プラグイン独自 GUI の開閉ボタン
+                        TrackPlugin::Clap(clap) => {
+                            if let Some(gui) = &mut clap.gui {
+                                if gui.supports_gui() {
+                                    if !gui.is_open {
+                                        let label = if gui.is_floating() {
+                                            "エディタを開く (floating)"
+                                        } else {
+                                            "エディタを開く"
+                                        };
+                                        if ui.button(label).clicked() {
+                                            if let Err(e) = gui.open(
+                                                &mut clap.instance.plugin_handle(),
+                                                &track.name,
+                                                clap.sender.clone(),
+                                            ) {
+                                                gui_error =
+                                                    Some(format!("GUI を開けません: {e}"));
+                                            }
+                                        }
+                                    } else if ui.button("エディタを閉じる").clicked() {
+                                        gui.close(&mut clap.instance.plugin_handle());
                                     }
                                 }
-                            } else if ui.button("エディタを閉じる").clicked() {
-                                gui.close(&mut track.instance.plugin_handle());
                             }
+                        }
+                        // VST3 のエディタはフェーズ3。載っていることだけ見せる
+                        TrackPlugin::Vst3(_) => {
+                            ui.weak("VST3 (エディタは未対応)");
                         }
                     }
                 });
@@ -1345,10 +1532,22 @@ impl eframe::App for App {
                 None => {}
             }
 
-            // トラック欄からの音源ロード (ダイアログを開く)。
-            // 新しく読み込めたときだけ装填する (キャンセルでは何もしない)
+            // トラック欄の「♪」。まず形式を聞く行を出す
             if let Some(track) = load_plugin_track {
-                if self.open_file_dialog(track) {
+                self.pending_load = Some(track);
+                self.candidates = None;
+            }
+
+            // 形式が決まったらダイアログを開く。
+            // 新しく読み込めたときだけ装填する (キャンセルでは何もしない)
+            if let Some(chosen) = chosen_kind {
+                let track = self.pending_load.take().unwrap_or(0);
+                let opened = match chosen {
+                    Some(project::PluginKind::Clap) => self.open_clap_dialog(track),
+                    Some(project::PluginKind::Vst3) => self.open_vst3_dialog(track),
+                    None => false,
+                };
+                if opened {
                     // 候補が1つだけならそのまま載せる (選択の手間を省く)
                     let single = self
                         .candidates
@@ -1356,6 +1555,7 @@ impl eframe::App for App {
                         .is_some_and(|candidates| candidates.plugins.len() == 1);
                     if single {
                         self.instantiate(0, track);
+                        self.candidates = None;
                     }
                 }
             }

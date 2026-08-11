@@ -143,12 +143,13 @@ VST3 には `IAudioProcessor` レベルでの「全ノートオフ」が無い�
 | MIDI CC 123 (All Notes Off) | VST3 は CC を `IMidiMapping` 経由でパラメータに割り当てるため、対応が不揃い |
 | `setProcessing(false/true)` | リアルタイム安全でない。オーディオスレッドから呼べない |
 
-**実装**: `TrackSequence` に `u128` のビットマスク（キー0〜127）を持ち、
-`emit_track` で note-on / note-off のたびに更新する。choke 時はビットが立って
-いるキーすべてに note-off を出す。128ビットなのでオーディオスレッドでも確保なし。
+**実装（採用した形）**: `Vst3Processor` に `u128` のビットマスク（キー0〜127）を持ち、
+自分が送った note-on / note-off のたびに更新する。choke 時はビットが立っている
+キーすべてに note-off を出す。128ビットなのでオーディオスレッドでも確保なし。
 
-なお、これは CLAP 側にも入れておくと堅くなる（現状は NoteChoke 頼み）が、
-必須ではない。
+当初は `TrackSequence`（トランスポート側）に置くつもりだったが、そこに置くと
+`BlockEvent::Choke` が個別の note-off に展開され、**CLAP が `NoteChoke` を使えなくなる**。
+バックエンドに置けば CLAP を巻き込まずに済む。
 
 ### (b) スレッド規約が型で守られなくなる
 
@@ -162,6 +163,13 @@ clack は main-thread / audio-thread の区別を**型システムで担保**し
 VST3 側のバインディングが同等の保証を持つかは未確認。**持たない場合は
 自前の newtype で包んで同じ制約を作る**こと。ここを崩すと、上記3つの仕組みが
 静かに壊れる。
+
+**結果（フェーズ2）**: `vst3-host` は同等の保証を持たない（`Plugin` は `Send` なだけ）。
+`SharedPlugin` が newtype としてその役を担っている。メインスレッド用の `lock()` だけを
+公開し、`try_lock()` は `Vst3Processor` からしか呼べない私有メソッドにしてあるので、
+**オーディオスレッドが待つコードは型の上で書けない**。停止 (`setProcessing`) を
+`RetiredProcessor::Vst3` の受け手に押し付けているのも同じ意図で、リアルタイム安全で
+ない呼び出しがオーディオ経路に紛れ込まないようにしている。
 
 ### (c) パラメータモデルが別物
 
@@ -254,12 +262,64 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 | **A** | **音源の保存・復元（CLAP のみ）。`clap.state` の実装を含む** | **完了** |
 | **0** | **VST3 のスパイク（可否判断）** | **完了 — 続行可** |
 | **1** | 抽象化層（CLAP のみ。挙動を変えない） | **完了** |
-| **2** | VST3 バックエンド（音のみ。choke 含む） | |
+| **2** | VST3 バックエンド（音のみ。choke 含む） | **完了** |
 | **3** | VST3 の GUI（自前の Win32 埋め込みを使う） | |
 | **4** | 仕上げ（CLAP と VST3 の混在確認、ドキュメント） | |
 
 **フェーズ A は単体で価値がある。** VST3 に進まない判断をしても無駄にならない
 （「開いたら音源も音作りも戻る」は現状いちばん欠けている機能）。
+
+### フェーズ2 で分かったこと（実装後）
+
+**設計調査の結論を1つ覆した。`Plugin` は値ではなく `Arc<Mutex<Plugin>>` で共有する。**
+
+調査の時点では「`Plugin` を処理器が値で持つ」と決めていたが、それだと**エディタ
+（フェーズ3）と状態の保存・復元がメインスレッドから届かなくなる**。`vst3-host` の
+`Plugin` は `IAudioProcessor` と `IEditController` を1つの型にまとめており、
+`open_editor` / `save_state` / `load_state` がいずれも `&mut Plugin` を要求するため。
+本物の VST3 ホストでは editController は別の COM オブジェクトなので、この制約は
+VST3 由来ではなくクレートの作り由来である。
+
+`vst3-host` 自身もこの組み合わせを解いていない。実時間経路 (`RtAudioHandle` /
+`RtControl`) にはエディタへの入口が無く、エディタを扱う経路
+（`AudioHandle::plugin()` と `EmbeddedEditor`）はどちらも `Arc<Mutex<Plugin>>` を要求する。
+
+そこで `audio/vst3.rs` に `SharedPlugin` を置き、**オーディオスレッドは必ず
+`try_lock`** で触る。待たないので締め切りは落とさない。取れなかったブロックは
+無音になるが、取り合いが起きるのはエディタの開閉と状態の保存・復元のときだけで、
+どれもユーザー操作の頻度でしか起きない。
+
+**取れなかったときイベントを捨ててはいけない。** そのブロックの note-off を落とすと
+音が鳴りっぱなしになる。`Vst3Processor` は送れなかったイベントを持ち越し、
+次に取れたブロックの先頭で送り直す（位置は失われるが、鳴り続けるよりましと判断）。
+`vst3_smoke` の第1段で、音源を握った状態のブロックが `ProcessError::Busy` を返して
+無音になり、次のブロックで発音が届くことを確かめている。
+
+**choke のアクティブノート追跡はトランスポートではなくバックエンドに置いた。**
+計画では `TrackSequence` に `u128` を持たせるつもりだったが、そこに置くと
+`BlockEvent::Choke` が個別の note-off に展開されてしまい、**CLAP 側が `NoteChoke` を
+使えなくなる**。バックエンドは自分が送った note-on / note-off をすべて見ているので、
+`Vst3Processor` 側に `u128` を持たせれば同じことが CLAP を巻き込まずにできる。
+
+**ブロック長は `AudioBuffers` の `Vec` の長さで決まる。** 実装前に残していた
+「`block_size` を毎回書き換えてよいか」は、`internal.process` を読んで解決した。
+フレーム数は `buffers.outputs[0].len()` から取られ、`block_size` は**分割の刻み**として
+しか使われない。したがって短いブロックはそのまま通り、長いブロックは自動で分割される。
+生成時に上限ぶん確保しておけば、毎ブロックの `resize` で確保は起きない。
+
+**その他**
+
+- 処理エラーは形式中立の `audio::ProcessError` にまとめた。`vst3-host` の
+  `ProcessFailed` / `NotProcessing` は確保しない形で作られており（クレート側が
+  オーディオスレッド用に意図している）、CLAP 側と同じ扱いにできる
+- `Vst3Host` はインスタンス化の入口でしかない。`Plugin` がモジュールを自分で
+  抱えるので、読み込みのたびに作って捨ててよい（CLAP の `PluginEntry` と同じ整理）
+- **Windows の `.vst3` はバンドルディレクトリなので、ファイル選択ダイアログでは掴めない。**
+  「♪」を押したら先に形式を聞き、CLAP はファイル選択、VST3 はフォルダ選択を開く形にした。
+  素の DLL 形式の `.vst3`（VST 3.6.10 以降は非推奨）は今のところ選べない
+- 停止 (`setProcessing(false)`) はリアルタイム安全でないので、`RetiredProcessor::Vst3` は
+  **止まっていない状態**でメインスレッドへ渡り、受け取った側が止める。CLAP は
+  オーディオ処理器のまま止められるので、ここだけ非対称になっている
 
 ### フェーズ2 の設計調査（実装前に判明したこと）
 
@@ -268,6 +328,7 @@ pub fn to_string(editor: &MidiEditor, plugins: &[Option<PluginSnapshot>]) -> Res
 設計がそのまま使える。
 
 **`RealtimePluginRunner` は使わず、`Plugin` を直接持つ。**
+（**所有の形だけは実装時に変えた。**上の「フェーズ2 で分かったこと」を参照）
 
 runner は「音源を所有し、指示を SPSC リングで受ける」ものだが、**本体には既に
 同じ役割のリングバッファ (`GuiMsg`) がある**。runner を挟むと
