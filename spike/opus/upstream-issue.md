@@ -1,7 +1,6 @@
-# Upstream issue (restsend/opus-rs)
+# Upstream issue draft (restsend/opus-rs)
 
-`opus-rs` 0.1.26 の不具合として報告した内容。**以下は実際に投稿した本文**
-(草稿から、単なる感想にあたる部分を削ってある)。
+`opus-rs` 0.1.26 の不具合として報告するための本文。**未投稿。**
 
 再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs`。
 測定の経緯と、こちらの対処 (48 / 96kbps に絞った理由) は
@@ -90,6 +89,40 @@ ffmpeg -v error -y -i sine_$k.opus -f f32le -ac 2 -ar 48000 dec_sine_$k.raw
 
 and compare `dec_sine_$k.raw` against the dumped input as above.
 
+### Background: what the table holds
+
+Spelling this out because the rest of my reasoning depends on it, and because I
+had to work it out from scratch — you obviously know this already, but it makes
+the next section readable for anyone else who ends up here.
+
+`V(N,K)` is the size of the PVQ codebook for a band of `N` samples carrying `K`
+pulses: the number of integer vectors of length `N` whose absolute values sum to
+`K`. Upstream describes it as
+
+> the number of combinations, with replacement, of N items, taken K at a time,
+> when a sign bit is added to each item taken at least once
+
+I checked the ported table against a brute-force count of those vectors for small
+`N`/`K`, and they agree exactly:
+
+| N | K | V(N,K) from table | brute force |
+|---|---|---|---|
+| 2 | 1 | 4 | 4 |
+| 2 | 2 | 8 | 8 |
+| 3 | 3 | 38 | 38 |
+| 4 | 3 | 88 | 88 |
+| 5 | 4 | 450 | 450 |
+
+`U(N,K)` is the helper the index arithmetic needs. `V(N,K) = U(N,K) + U(N,K+1)`,
+where (per the upstream comment) `U(N,K+1)` counts the combinations whose first
+element is non-negative and `U(N,K)` those where it is negative — which is what
+lets `icwrs`/`cwrsi` narrow the index down element by element instead of just
+knowing the total. Both satisfy
+`U(N,K) = U(N-1,K) + U(N,K-1) + U(N-1,K-1)`.
+
+The part that matters for this issue: these are counting numbers, so they grow
+very quickly and run past 32 bits at fairly modest `N` and `K`.
+
 ### A separate, smaller thing: panics for large K
 
 `celt_pvq_u(n, k)` and `celt_pvq_v(n, k)` panic with an out-of-bounds index for
@@ -134,8 +167,10 @@ if r >= CELT_PVQ_U_ROW.len() { return compute_u(n, k); }
 if idx >= CELT_PVQ_U_DATA.len() { return compute_u(n, k); }
 ```
 
-As far as I could tell, the default path in libopus does not have an equivalent
-fallback — `CELT_PVQ_U` there looks like a plain table lookup:
+Here is what I found on the reference side, for comparison.
+
+In libopus the default path has no fallback at all: `CELT_PVQ_U` is a bare table
+lookup, with no bounds check and nothing to compute a missing entry.
 
 ```c
 /* celt/cwrs.c */
@@ -143,15 +178,41 @@ fallback — `CELT_PVQ_U` there looks like a plain table lookup:
 # define CELT_PVQ_V(_n,_k) (CELT_PVQ_U(_n,_k)+CELT_PVQ_U(_n,(_k)+1))
 ```
 
-and the table is described as covering *"K=128, or however many fit in 32 bits,
-whichever is smaller"* (comment in `celt/cwrs.c`, above `CELT_PVQ_U_ROW[15]`).
-I read that as upstream keeping the arguments inside the table, and inside 32
-bits, by construction rather than handling out-of-table cases at runtime. The
-only computing path I found upstream is `ncwrs_urow()` under `SMALL_FOOTPRINT`.
+The only computing path I found there is `ncwrs_urow()`, which is compiled only
+under `SMALL_FOOTPRINT`.
+
+The table it indexes is `CELT_PVQ_U_ROW[15]`, so the row index `IMIN(n,k)` can
+only be 0..14 — an out-of-table argument would read out of bounds rather than
+fall back to anything. The accompanying comments say the table is built for the
+`N` values that can actually occur — *"the set of N which can be achieved by
+splitting a band from a standard Opus mode: 176, 144, 96, 88, 72, 64, 48, 44, 36,
+32, 24, 22, 18, 16, 8, 4, 2"* — and covers *"K=128, or however many fit in 32
+bits, whichever is smaller"*.
+
+That bound on K lines up with `celt/rate.h`:
+
+```c
+#define MAX_PSEUDO 40
+#define LOG_MAX_PSEUDO 6
+#define CELT_MAX_PULSES 128
+```
+
+so the pulse count per band is not free: it comes out of the precomputed bit
+cache (`bits2pulses` binary-searches `LOG_MAX_PSEUDO` steps over at most
+`MAX_PSEUDO` entries), capped at `CELT_MAX_PULSES`, while band splitting keeps
+`N` to the listed set. Between the two, the `(N, K)` pairs the encoder can
+produce stay inside the table by construction — which is presumably why a
+fallback was never needed.
+
+This crate ports the same table (15 rows, 1272 entries) and the same
+`CELT_MAX_PULSES`-equivalent (`MAX_PVQ_K = 128`), but adds the runtime fallback
+on top, so out-of-table arguments produce a computed value instead of being
+impossible.
 
 The fallback here uses `wrapping_add`, so if it is reached with arguments outside
-that range the result can wrap silently. `V(N,K)` should come out larger than
-`U(N,K)`, but for some pairs it comes out smaller:
+that range the result can wrap silently. Since `V(N,K) = U(N,K) + U(N,K+1)` and
+both terms are non-negative, `V` can never legitimately be smaller than `U` — but
+for some pairs it is, which means the addition wrapped:
 
 ```
 N= 64 K= 16 : V=955449344  <= U=4033863679
