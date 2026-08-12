@@ -495,15 +495,24 @@ impl App {
         match midi::from_bytes(&bytes, self.editor.editor.scale) {
             Ok(imported) => {
                 let count = imported.notes.len();
+                let cc_lanes = imported.lane_ccs.len();
                 let name = file_label(&path);
-                self.editor
-                    .replace_sequence(imported.notes, imported.tempo, imported.time_signature);
+                self.editor.replace_sequence(
+                    imported.notes,
+                    imported.tempo,
+                    imported.time_signature,
+                    &imported.lane_ccs,
+                );
                 // MIDI をプロジェクトの保存先にはしない
                 // (Ctrl+S が .ron を書くので、読み込み元とは無関係にする)
                 self.project_path = None;
                 self.editor.project_path = None;
                 self.error = None;
-                self.status = Some(format!("{name} から {count} 個のノートを読み込みました"));
+                self.status = Some(if cc_lanes > 0 {
+                    format!("{name} から {count} 個のノートと {cc_lanes} 本の CC 段を読み込みました")
+                } else {
+                    format!("{name} から {count} 個のノートを読み込みました")
+                });
             }
             Err(e) => {
                 self.notice = Some(Notice::error(

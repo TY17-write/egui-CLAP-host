@@ -629,12 +629,19 @@ impl EditorState {
         notes: Vec<Note>,
         tempo: Option<u32>,
         time_signature: Option<(u32, u32)>,
+        lane_ccs: &[(usize, usize, u8)],
     ) {
         self.history.record(EditGroup::Once);
         self.editor.notes = notes;
         // 読み込んだノートが全部見えるようにトラックと段を用意する
         self.editor.tracks.truncate(1);
         self.editor.ensure_capacity_for_notes();
+        // 段が揃ってから種別を付ける (先に付けると段が伸びたときに位置がずれる)
+        for (track, lane, number) in lane_ccs {
+            if let Some(info) = self.editor.tracks.get_mut(*track) {
+                info.set_lane_cc(*lane, Some(*number));
+            }
+        }
         if let Some(tempo) = tempo {
             self.editor.tempo = tempo.clamp(20, 300);
         }
