@@ -2,6 +2,11 @@
 # spike/ は親のワークスペースから切り離してあり、自前の target を持つ
 spike/*/target
 spike/*/Cargo.lock
+# spike が書き出す音声と、検証で復号した生データ
+# (実行するたびに作られるので追跡しない)
+spike/*/*.opus
+spike/*/*.wav
+spike/*/*.raw
 # MIDI エクスポートの動作確認用 (作業データなので追跡しない)
 /saved_midi
 # 手元の起動用スクリプト (パスが環境依存なので追跡しない)

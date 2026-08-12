@@ -7,7 +7,8 @@
 //#![windows_subsystem = "windows"]
 
 use clap_host_test::{
-    audio, ccs, discovery, editor_ui, gui, host, midi, params, project, sequencer, theme, wav,
+    audio, ccs, discovery, editor_ui, gui, host, midi, opus, params, project, sequencer, theme,
+    wav,
 };
 
 use audio::config::StreamAudioConfig;
@@ -252,6 +253,7 @@ enum FileAction {
     SaveProject,
     SaveProjectAs,
     ExportWav,
+    ExportOpus,
     ExportCcs,
 }
 
@@ -654,6 +656,119 @@ impl App {
         self.project_path = Some(path);
     }
 
+    /// 借りた処理器をオーディオスレッドへ返す。
+    ///
+    /// **返さないと音が出なくなる。** 途中で諦めるときも必ず通ること。
+    fn return_processors(&mut self, processors: Vec<(usize, Box<audio::TrackProcessor>)>) {
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        for (track, processor) in processors {
+            let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
+        }
+    }
+
+    /// 書き出し用のレンダリング設定を、指定のストリーム構成で組み立てる
+    fn render_setup(&self, config: &StreamAudioConfig) -> RenderSetup {
+        let sample_rate = config.sample_rate as f64;
+        let spq = self.editor.editor.samples_per_quarter(sample_rate);
+        RenderSetup {
+            // ミュート/ソロで鳴らさないトラックは空にする (再生時と同じ判定)
+            sequences: (0..self.editor.editor.track_count())
+                .map(|track| {
+                    if self.editor.editor.is_audible(track) {
+                        self.editor
+                            .editor
+                            .to_events_for_track(track, sample_rate)
+                            .into_boxed_slice()
+                    } else {
+                        Vec::<SeqEvent>::new().into_boxed_slice()
+                    }
+                })
+                .collect(),
+            end_sample: (self.editor.editor.length_quarters_bar_aligned() as f64 * spq) as u64,
+            tail_samples: (TAIL_SECONDS * sample_rate) as u64,
+            // activate 時に宣言した上限。これを超えるブロックは渡せない。
+            block_frames: config.max_likely_buffer_size as usize,
+            channels: config.output_channel_count,
+            sample_rate: config.sample_rate,
+        }
+    }
+
+    /// 音源を借りて、指定のサンプルレートで最後まで回す。
+    ///
+    /// `target_rate` が今のストリームと違うなら、**音源自体をそのレートで
+    /// 動かし直してから描画し、必ず元へ戻す**。リサンプリングではないので、
+    /// 本当にそのレートで鳴らした音になる (Opus は 48kHz でしか鳴らせないが、
+    /// ストリームはデバイスのレートで開いているため、この仕組みが要る)。
+    ///
+    /// 戻り値は (描画結果, レートの切り替えに失敗して**音源を外した**トラック)。
+    fn render_for_export(
+        &mut self,
+        stream_config: StreamAudioConfig,
+        target_rate: u32,
+    ) -> Result<(audio::offline::Rendered, Vec<usize>), String> {
+        let export_config = StreamAudioConfig {
+            sample_rate: target_rate,
+            ..stream_config
+        };
+        let switching = target_rate != stream_config.sample_rate;
+
+        let loaded: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(track, slot)| slot.as_ref().map(|_| track))
+            .collect();
+
+        // ---- 借りる ----
+        // engine の借用はここで終える (このあと self.tracks を触るため)
+        let mut processors = {
+            let Some(engine) = self.engine.as_mut() else {
+                return Err("音源が未ロードです。".into());
+            };
+            let _ = engine.producer.push(GuiMsg::Transport(TransportMsg::Stop));
+            for track in &loaded {
+                let _ = engine.producer.push(GuiMsg::ClearTrack { track: *track });
+            }
+            collect_processors(engine, loaded.len())
+        };
+        if processors.len() != loaded.len() {
+            self.return_processors(processors);
+            return Err("音源を取り出せませんでした。もう一度実行してください。".into());
+        }
+
+        // ---- 書き出し用のレートへ ----
+        let mut dropped = Vec::new();
+        if switching {
+            let (switched, failed) = self.switch_processors_rate(processors, &export_config);
+            processors = switched;
+            dropped.extend(failed);
+        }
+
+        let setup = self.render_setup(&export_config);
+        let rendered = audio::offline::render(&mut processors, setup);
+
+        // ---- 元のレートへ戻す ----
+        // **ここを飛ばすと、書き出し後に再生できなくなる。**
+        if switching {
+            let (switched, failed) = self.switch_processors_rate(processors, &stream_config);
+            processors = switched;
+            dropped.extend(failed);
+        }
+
+        self.return_processors(processors);
+
+        // 戻せなかったトラックは音源ごと外す。
+        // 載っているのに鳴らない状態で放置するより、消えている方が気付ける。
+        for track in &dropped {
+            if let Some(slot) = self.tracks.get_mut(*track) {
+                *slot = None;
+            }
+        }
+        Ok((rendered, dropped))
+    }
+
     /// シーケンス全体を鳴らして WAV ファイルに書き出す。
     ///
     /// オーディオスレッドから処理器を一旦引き上げ、その場で最後まで回してから戻す。
@@ -696,56 +811,13 @@ impl App {
             return;
         };
 
-        let sample_rate = config.sample_rate as f64;
-        let spq = self.editor.editor.samples_per_quarter(sample_rate);
-        let setup = RenderSetup {
-            // ミュート/ソロで鳴らさないトラックは空にする (再生時と同じ判定)
-            sequences: (0..self.editor.editor.track_count())
-                .map(|track| {
-                    if self.editor.editor.is_audible(track) {
-                        self.editor
-                            .editor
-                            .to_events_for_track(track, sample_rate)
-                            .into_boxed_slice()
-                    } else {
-                        Vec::<SeqEvent>::new().into_boxed_slice()
-                    }
-                })
-                .collect(),
-            end_sample: (self.editor.editor.length_quarters_bar_aligned() as f64 * spq) as u64,
-            tail_samples: (TAIL_SECONDS * sample_rate) as u64,
-            // activate 時に宣言した上限。これを超えるブロックは渡せない。
-            block_frames: config.max_likely_buffer_size as usize,
-            channels: config.output_channel_count,
-            sample_rate: config.sample_rate,
-        };
-
-        let rendered = {
-            let Some(engine) = self.engine.as_mut() else {
+        // WAV はデバイスのレートのまま書く (切り替えの必要がない)
+        let rendered = match self.render_for_export(config, config.sample_rate) {
+            Ok((rendered, _)) => rendered,
+            Err(e) => {
+                self.fail_export(e);
                 return;
-            };
-            let _ = engine.producer.push(GuiMsg::Transport(TransportMsg::Stop));
-            for track in &loaded {
-                let _ = engine.producer.push(GuiMsg::ClearTrack { track: *track });
             }
-
-            let mut processors = collect_processors(engine, loaded.len());
-            let rendered = if processors.len() == loaded.len() {
-                Some(audio::offline::render(&mut processors, setup))
-            } else {
-                None
-            };
-
-            // 借りたものは必ず返す (返さないと音が出なくなる)
-            for (track, processor) in processors {
-                let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
-            }
-            rendered
-        };
-
-        let Some(rendered) = rendered else {
-            self.fail_export("音源を取り出せませんでした。もう一度実行してください。");
-            return;
         };
 
         let bytes = match wav::to_bytes_16bit(
@@ -818,6 +890,144 @@ impl App {
         self.notice = Some(Notice::error("WAV を書き出せません", message));
     }
 
+    /// シーケンス全体を鳴らして Ogg/Opus に書き出す。
+    ///
+    /// **Opus は 48kHz でしか鳴らせない。** ストリームはデバイスのレート
+    /// (多くは 44.1kHz) で開いているので、書き出しの間だけ**音源自体を 48kHz で
+    /// 動かし直す**。リサンプリングではないので、本当に 48kHz で鳴らした音になる。
+    fn export_opus(&mut self) {
+        self.drain_retired();
+        if !self.retiring.is_empty() {
+            self.fail_opus("音源の切り替え中です。少し待ってからもう一度実行してください");
+            return;
+        }
+
+        let Some(config) = self.engine.as_ref().map(|engine| engine.config) else {
+            self.fail_opus(
+                "音源が未ロードです。\n左のトラック欄の「♪」から音源を読み込んでください。",
+            );
+            return;
+        };
+        if self.editor.editor.notes.is_empty() {
+            self.fail_opus("ノートが1つもありません。");
+            return;
+        }
+        if self.tracks.iter().all(Option::is_none) {
+            self.fail_opus("音源が載っているトラックがありません。");
+            return;
+        }
+        // 符号化まで進んでから断ると、レートの切り替えを無駄に往復することになる
+        if config.output_channel_count != 1 && config.output_channel_count != 2 {
+            self.fail_opus(format!(
+                "Opus で書き出せるのはモノラルかステレオだけです ({}ch)",
+                config.output_channel_count
+            ));
+            return;
+        }
+
+        // 時間のかかる処理に入る前に保存先を聞く
+        let Some(path) = self.ask_save_path("Opus ファイル", "opus", "mix.opus") else {
+            return;
+        };
+
+        let bitrate = self.editor.opus_bitrate_kbps;
+        let (rendered, dropped) = match self.render_for_export(config, opus::SAMPLE_RATE) {
+            Ok(result) => result,
+            Err(e) => {
+                self.fail_opus(e);
+                return;
+            }
+        };
+
+        let bytes = match opus::to_bytes(
+            &rendered.samples,
+            rendered.channels as u16,
+            rendered.sample_rate,
+            bitrate,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.fail_opus(e);
+                return;
+            }
+        };
+
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                self.last_directory = path.parent().map(PathBuf::from);
+                self.error = None;
+                self.notice = Some(self.opus_result_notice(&path, &rendered, bitrate, &dropped));
+                self.status = Some(format!("書き出しました: {}", file_label(&path)));
+            }
+            Err(e) => self.fail_opus(format!("保存できません:\n{e}")),
+        }
+    }
+
+    /// 書き出しの結果をまとめる。**欠けたものは伏せない。**
+    fn opus_result_notice(
+        &self,
+        path: &std::path::Path,
+        rendered: &audio::offline::Rendered,
+        bitrate: u32,
+        dropped: &[usize],
+    ) -> Notice {
+        let channels = if rendered.channels == 1 {
+            "モノラル"
+        } else {
+            "ステレオ"
+        };
+        let mut body = format!(
+            "{}\n\n{:.1} 秒 / {} Hz / {} / {} kbps",
+            path.display(),
+            rendered.seconds(),
+            rendered.sample_rate,
+            channels,
+            bitrate,
+        );
+        if rendered.peak > 1.0 {
+            body.push_str(&format!(
+                "\n\n※ ピークが {:.2} (0dBFS 超) だったため、歪まないよう全体の音量を下げました。",
+                rendered.peak
+            ));
+        }
+
+        let mut failed = false;
+        if !rendered.failures.is_empty() {
+            failed = true;
+            body.push_str("\n\n次のトラックは音源の処理に失敗したため、無音になっています。");
+            for failure in &rendered.failures {
+                body.push_str(&format!(
+                    "\n・トラック {}: {} ({} ブロック)",
+                    failure.track + 1,
+                    failure.message,
+                    failure.blocks
+                ));
+            }
+        }
+        // レートを戻せなかったトラックは音源ごと外してある。
+        // 黙っていると「読み込んだはずの音源が消えている」ことになる。
+        if !dropped.is_empty() {
+            failed = true;
+            body.push_str(
+                "\n\n次のトラックは 48kHz への切り替えに失敗したため、音源を外しました。\
+                 \n読み込み直してください。",
+            );
+            for track in dropped {
+                body.push_str(&format!("\n・トラック {}", track + 1));
+            }
+        }
+
+        if failed {
+            Notice::error("Opus を書き出しました (一部に問題あり)", body)
+        } else {
+            Notice::ok("Opus を書き出しました", body)
+        }
+    }
+
+    fn fail_opus(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice::error("Opus を書き出せません", message));
+    }
+
     /// 1トラック目を CeVIO のプロジェクトファイル (.ccs) に書き出す。
     /// 音を鳴らさないデータ変換なので、音源が未ロードでも使える。
     fn export_ccs(&mut self) {
@@ -875,6 +1085,67 @@ impl App {
         } else {
             path
         })
+    }
+
+    /// 借りている処理器を、指定のストリーム構成で動かし直す。
+    ///
+    /// **書き出しを別のサンプルレートで行うためのもの。** Opus は 48kHz でしか
+    /// 鳴らせないが、ストリームはデバイスのレート (多くは 44.1kHz) で開いている。
+    /// リサンプリングではなく**音源自身をそのレートで動かす**ので、本当にその
+    /// レートで鳴らした音になる。
+    ///
+    /// 戻り値は (動かし直せた処理器, 失敗したトラック番号)。
+    ///
+    /// **失敗したトラックの処理器は失われる。** CLAP は deactivate まで進んだあとの
+    /// activate で落ちうるためで、そのトラックは呼び出し側が音源ごと外すこと
+    /// (黙って鳴らないままにしない)。
+    fn switch_processors_rate(
+        &mut self,
+        processors: Vec<(usize, Box<audio::TrackProcessor>)>,
+        config: &StreamAudioConfig,
+    ) -> (Vec<(usize, Box<audio::TrackProcessor>)>, Vec<usize>) {
+        let mut switched = Vec::with_capacity(processors.len());
+        let mut failed = Vec::new();
+
+        for (track, processor) in processors {
+            match self.switch_one_rate(track, processor, config) {
+                Ok(processor) => switched.push((track, processor)),
+                Err(e) => {
+                    eprintln!("トラック {} のレート切り替えに失敗: {e}", track + 1);
+                    failed.push(track);
+                }
+            }
+        }
+        (switched, failed)
+    }
+
+    /// 1トラックぶんの動かし直し。
+    ///
+    /// **どちらの形式も読み込み直さない** (読み直すと音作りが飛ぶ)。CLAP は
+    /// deactivate → activate、VST3 は `reconfigure` で、状態を保ったまま
+    /// `setupProcessing` 相当をやり直す。
+    fn switch_one_rate(
+        &mut self,
+        track: usize,
+        processor: Box<audio::TrackProcessor>,
+        config: &StreamAudioConfig,
+    ) -> Result<Box<audio::TrackProcessor>, Box<dyn Error>> {
+        let Some(audio) = self.tracks.get_mut(track).and_then(|slot| slot.as_mut()) else {
+            return Err("このトラックに音源がありません".into());
+        };
+
+        match (processor.into_retired(), &mut audio.plugin) {
+            (audio::RetiredProcessor::Clap(stopped), TrackPlugin::Clap(clap)) => {
+                clap.instance.deactivate(stopped);
+                audio::activate_track(&mut clap.instance, config)
+            }
+            (audio::RetiredProcessor::Vst3(shared), TrackPlugin::Vst3(_)) => {
+                audio::reconfigure_vst3_track(shared, config)
+            }
+            // 形式が食い違うことは無いはずだが、ここで取り違えると
+            // 処理器を失ったまま気付けないので明示的に落とす
+            _ => Err("処理器と音源の形式が食い違っています".into()),
+        }
     }
 
     /// オーディオスレッドから返ってきた音源をここで停止・解放する
@@ -1597,6 +1868,7 @@ impl eframe::App for App {
                         file_action = Some(FileAction::SaveProjectAs)
                     }
                     EditorCommand::ExportWav => file_action = Some(FileAction::ExportWav),
+                    EditorCommand::ExportOpus => file_action = Some(FileAction::ExportOpus),
                     EditorCommand::ExportCcs => file_action = Some(FileAction::ExportCcs),
                     EditorCommand::LoadPlugin { track } => load_plugin_track = Some(track),
                     // エンジンが無いときは送り先がないので、再生ヘッドの移動だけ
@@ -1652,6 +1924,7 @@ impl eframe::App for App {
                             | EditorCommand::SaveProject
                             | EditorCommand::SaveProjectAs
                             | EditorCommand::ExportWav
+                            | EditorCommand::ExportOpus
                             | EditorCommand::ExportCcs
                             | EditorCommand::LoadPlugin { .. } => continue,
                         };
@@ -1667,6 +1940,7 @@ impl eframe::App for App {
                 Some(FileAction::SaveProject) => self.save_project(false),
                 Some(FileAction::SaveProjectAs) => self.save_project(true),
                 Some(FileAction::ExportWav) => self.export_wav(),
+                Some(FileAction::ExportOpus) => self.export_opus(),
                 Some(FileAction::ExportCcs) => self.export_ccs(),
                 None => {}
             }

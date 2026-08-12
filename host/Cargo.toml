@@ -41,3 +41,7 @@ serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 # 音源の状態 (不透明なバイト列) を .ron に載せるため
 base64 = "0.22"
+# Opus での書き出し。どちらも純 Rust で、C のビルド環境は要らない
+# (libopus を直接使う道は CMake が要るので採らなかった)
+opus-rs = "0.1"
+ogg = "0.9"

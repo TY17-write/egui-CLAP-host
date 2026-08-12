@@ -286,6 +286,8 @@ pub struct EditorState {
     scroll_to_quarters: Option<f64>,
     /// 段の種別を設定する一覧を開いているトラック (閉じていれば None)
     lane_config_track: Option<usize>,
+    /// Opus 書き出しのビットレート (kbps)。メニューで選ぶ
+    pub opus_bitrate_kbps: u32,
     /// 入れ替えの相手待ちになっている段 (track, lane)。
     ///
     /// 段の帯を押すとここに入り (帯が赤くなる)、次に別の段の帯を押すと入れ替わる。
@@ -343,6 +345,7 @@ impl Default for EditorState {
             pending_scroll_x: None,
             scroll_to_quarters: None,
             lane_config_track: None,
+            opus_bitrate_kbps: crate::opus::DEFAULT_BITRATE_KBPS,
             lane_swap_source: None,
             note_clipboard: Vec::new(),
         }
@@ -992,6 +995,8 @@ pub enum EditorCommand {
     SaveProjectAs,
     /// シーケンス全体を音声ファイル (WAV) に書き出す
     ExportWav,
+    /// シーケンス全体を Ogg/Opus に書き出す
+    ExportOpus,
     /// 1トラック目を CeVIO のプロジェクトファイル (CCS) に書き出す
     ExportCcs,
     /// 指定トラックに音源 (.clap / .vst3) を読み込む
@@ -1140,6 +1145,23 @@ pub fn editor_panel(
                 commands.push(EditorCommand::ExportWav);
                 ui.close_menu();
             }
+            // Opus はビットレートを選んでから。48kHz へ切り替えて書き出すので、
+            // WAV より時間がかかることも添える。
+            ui.menu_button("Opus ファイルとして出力", |ui| {
+                ui.weak("48kHz で書き出します (音源を一時的に切り替えます)");
+                for kbps in crate::opus::BITRATES_KBPS {
+                    let label = if kbps == crate::opus::DEFAULT_BITRATE_KBPS {
+                        format!("{kbps} kbps (既定)")
+                    } else {
+                        format!("{kbps} kbps")
+                    };
+                    if ui.selectable_label(state.opus_bitrate_kbps == kbps, label).clicked() {
+                        state.opus_bitrate_kbps = kbps;
+                        commands.push(EditorCommand::ExportOpus);
+                        ui.close_menu();
+                    }
+                }
+            });
             if ui
                 .button("CCS ファイルとして出力")
                 .on_hover_text("CeVIO のプロジェクトファイルに書き出す (1トラック目のみ)")

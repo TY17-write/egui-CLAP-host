@@ -251,6 +251,37 @@ pub fn activate_vst3_track(
     ))
 }
 
+/// 借りている VST3 の処理器を、別のサンプルレートで動かし直す。
+///
+/// **読み込み直さない。** `activate_vst3_track` はファイルから開き直すので
+/// 音作りが飛ぶ。`reconfigure` は「デバイスのレートが変わったときに再ロードの
+/// 代わりに使う」ためのもので、状態を保ったまま `setupProcessing` をやり直す。
+///
+/// 処理器のバッファは生成時のレート・ブロック長で作ってあるので、作り直す。
+///
+/// **失敗しても音源は生きている。** 呼び出し側は元のレートで呼び直して戻すこと
+/// (戻せないとそのトラックが鳴らなくなる)。
+pub fn reconfigure_vst3_track(
+    shared: SharedPlugin,
+    stream_config: &StreamAudioConfig,
+) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
+    let plugin_channels = {
+        let mut plugin = shared.lock();
+        // reconfigure は処理中には呼べない
+        plugin.stop_processing()?;
+        plugin.reconfigure(
+            stream_config.sample_rate as f64,
+            stream_config.max_likely_buffer_size as usize,
+        )?;
+        plugin.start_processing()?;
+        plugin.output_channel_count()
+    };
+
+    Ok(Box::new(TrackProcessor::new(Backend::Vst3(
+        Vst3Processor::new(shared, plugin_channels, stream_config),
+    ))))
+}
+
 /// サンプル形式に応じた CPAL 出力ストリームを構築する
 fn build_output_stream_for_sample_format(
     device: &Device,

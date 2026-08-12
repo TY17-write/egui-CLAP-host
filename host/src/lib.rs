@@ -8,6 +8,7 @@ pub mod editor_ui;
 pub mod gui;
 pub mod host;
 pub mod midi;
+pub mod opus;
 pub mod params;
 pub mod plugin_window;
 pub mod project;

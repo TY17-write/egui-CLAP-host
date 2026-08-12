@@ -1,0 +1,18 @@
+[package]
+name = "opus-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 親のワークスペースから切り離す。
+# フェーズ0 は「Ogg/Opus を組み立てて再生できるか」の可否判断が目的なので、
+# 本体のビルドをこちらの依存で壊さないようにする。
+[workspace]
+
+[dependencies]
+# 純 Rust の Opus 符号化・復号 (C ツールチェーン不要)
+opus-rs = "0.1"
+# Ogg 容器の読み書き
+ogg = "0.9"
+# 実機が 48kHz を出せるかの確認にだけ使う
+cpal = "0.15"
