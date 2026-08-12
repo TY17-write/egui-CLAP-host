@@ -1,10 +1,18 @@
-# Upstream issue draft (restsend/opus-rs)
+# Upstream issue (restsend/opus-rs)
 
-`opus-rs` 0.1.26 の不具合として報告するための本文。**未投稿。**
+`opus-rs` 0.1.26 の不具合として報告した本文。
+
+- **投稿先**: <https://github.com/restsend/opus-rs/issues/11> (2026-08-12)
+- 投稿時のタイトルは
+  *"Encoded stream decodes to out-of-range samples in libopus at higher bitrates
+  with tonal input; `celt_pvq_u`/`celt_pvq_v` also panic for large K"*
 
 再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs`。
 測定の経緯と、こちらの対処 (48 / 96kbps に絞った理由) は
 `docs/export_rate_plan.md` の「高ビットレートは出さない」を参照。
+
+**クレートが直れば、出せるビットレートを増やせる。** 反応があったら
+`host/src/opus.rs` の `BITRATES_KBPS` を見直すこと。
 
 ---
 
