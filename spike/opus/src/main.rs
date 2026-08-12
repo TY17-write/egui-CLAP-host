@@ -8,21 +8,35 @@
 //!
 //! # 高ビットレートで壊れる
 //!
-//! `opus-rs` 0.1.26 は、内容によって**壊れたストリームを吐く**。本家 libopus で
-//! 復号すると範囲外の値が散発し、聴くとクリックノイズになる。
+//! `opus-rs` 0.1.26 は壊れたストリームを吐くことがある。本家 libopus で復号すると
+//! 中身が崩れ、聴くとノイズになる。**176kbps 以上で再現する** (サイン波の場合)。
 //!
 //! ```text
 //! cargo run
 //! for k in 48 96 128 160 176 192; do
 //!   ffmpeg -v error -y -i spike_$k.opus -f f32le -ac 2 -ar 48000 dec_$k.raw
 //! done
-//! # dec_*.raw を f32 として読み、|x| > 1.0 の個数を数える
-//! #   96/128/160 → 0 個 / 176 → 160 個 / 192 → 111 個
 //! ```
 //!
-//! **信号依存**で、和音 + ノイズのような複雑な信号では 192kbps でも出なかった。
-//! `complexity` を変えても改善しない。本体では実測で問題の無かった範囲
-//! (48 / 96kbps) だけを出している。
+//! 復号した `dec_*.raw` を f32 として読み、**元の周波数にエネルギーが集中して
+//! いるか (トーン純度)** を見る。実測値:
+//!
+//! ```text
+//! kbps   トーン純度 (左/右)   |x|>1.0
+//!   48        99.5 / 99.5%        0
+//!   96        99.7 / 99.7%        0
+//!  128        99.9 / 99.9%        0
+//!  160        99.9 / 99.9%        0
+//!  176        28.8 / 18.1%      160
+//!  192        17.5 / 13.1%      111
+//! ```
+//!
+//! **「範囲外サンプル (|x|>1.0) の数」だけで測ってはいけない。** 範囲内に収まった
+//! まま中身が壊れる場合を取りこぼす。今回はたまたま両者が一致したが、指標としては
+//! 純度のほうが聴感と対応する。
+//!
+//! 内容にもよる (実際の曲では 192kbps で発覚した)。`complexity` を変えても
+//! 改善しない。本体では実測で問題の無かった範囲 (48 / 96kbps) だけを出している。
 
 use ogg::writing::{PacketWriteEndInfo, PacketWriter};
 use opus_rs::{Application, OpusEncoder};
@@ -46,7 +60,23 @@ const BITRATES_KBPS: [i32; 6] = [48, 96, 128, 160, 176, 192];
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     report_device_rates();
 
-    // 純音のほうが壊れやすい (複雑な信号では再現しなかった)
+    // **入力もそのまま書き出す。** 復号結果と突き合わせないと、純音以外の信号で
+    // 壊れているかどうかを測れない (純度は純音にしか使えない)。
+    for (label, input) in [("sine", sine_input()), ("complex", complex_input())] {
+        std::fs::write(format!("{label}_input.raw"), as_bytes(&input))?;
+        for kbps in BITRATES_KBPS {
+            let bytes = encode_ogg_opus(&input, kbps * 1000)?;
+            let name = format!("{label}_{kbps}.opus");
+            std::fs::write(&name, &bytes)?;
+            println!("書き出し: {name} ({} バイト)", bytes.len());
+        }
+    }
+    println!("\n復号して入力と突き合わせると壊れ方が分かる (冒頭のコメント参照)");
+    Ok(())
+}
+
+/// 純音 (左 440Hz / 右 660Hz)。いちばん小さく再現できる形
+fn sine_input() -> Vec<f32> {
     let total_frames = SAMPLE_RATE as usize * SECONDS;
     let mut input = Vec::with_capacity(total_frames * CHANNELS);
     for frame in 0..total_frames {
@@ -54,15 +84,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input.push((t * 440.0 * std::f32::consts::TAU).sin() * 0.5);
         input.push((t * 660.0 * std::f32::consts::TAU).sin() * 0.5);
     }
+    input
+}
 
-    for kbps in BITRATES_KBPS {
-        let bytes = encode_ogg_opus(&input, kbps * 1000)?;
-        let name = format!("spike_{kbps}.opus");
-        std::fs::write(&name, &bytes)?;
-        println!("書き出し: {name} ({} バイト)", bytes.len());
+/// 和音 + 微小ノイズ。純音より符号化が難しい信号として比較に使う
+fn complex_input() -> Vec<f32> {
+    let total_frames = SAMPLE_RATE as usize * SECONDS;
+    let mut input = Vec::with_capacity(total_frames * CHANNELS);
+    for frame in 0..total_frames {
+        let t = frame as f32 / SAMPLE_RATE as f32;
+        let noise = ((frame as f32 * 12.9898).sin() * 43758.547).fract() - 0.5;
+        let chord = |f: f32| (t * f * std::f32::consts::TAU).sin();
+        input.push((chord(220.0) + chord(277.2) + chord(329.6)) * 0.15 + noise * 0.05);
+        input.push((chord(261.6) + chord(392.0) + chord(523.3)) * 0.15 + noise * 0.05);
     }
-    println!("\nffmpeg で復号し |x| > 1.0 を数えると壊れ方が分かる (冒頭のコメント参照)");
-    Ok(())
+    input
+}
+
+fn as_bytes(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 /// f32 のインターリーブ列を Ogg/Opus のバイト列にする

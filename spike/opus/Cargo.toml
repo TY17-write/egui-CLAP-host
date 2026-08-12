@@ -3,6 +3,10 @@ name = "opus-spike"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# 検証用の bin が複数あるので、これが無いと `cargo run` が
+# 「どれを実行するか」で失敗する。**失敗に気付かないまま古い .opus を
+# 聴いて誤った結論を出しかけた**ので、既定を明示しておく。
+default-run = "opus-spike"
 
 # 親のワークスペースから切り離す。
 # フェーズ0 は「Ogg/Opus を組み立てて再生できるか」の可否判断が目的なので、
