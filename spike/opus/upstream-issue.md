@@ -7,12 +7,63 @@
   *"Encoded stream decodes to out-of-range samples in libopus at higher bitrates
   with tonal input; `celt_pvq_u`/`celt_pvq_v` also panic for large K"*
 
-再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs`。
-測定の経緯と、こちらの対処 (48 / 96kbps に絞った理由) は
-`docs/export_rate_plan.md` の「高ビットレートは出さない」を参照。
+再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs` /
+`cwrs_check.rs` / `spectral_match.rs`。測定の経緯と、こちらの対処
+(48 / 96kbps に絞った理由) は `docs/export_rate_plan.md` の
+「高ビットレートは出さない」を参照。
 
-**クレートが直れば、出せるビットレートを増やせる。** 反応があったら
-`host/src/opus.rs` の `BITRATES_KBPS` を見直すこと。
+## 0.1.28 で直った (2026-08-17 に確認)
+
+**符号化の破綻は解消している。** 全ビットレートで「上げるほど元に近づく」に
+戻った。以下は同じ物差し (`spectral_match`) での実測。ffmpeg は 9.0
+(報告時は 8.1.1)。数値が大きいほど元に近い。
+
+| 信号 | 版 | 48 | 96 | 128 | 160 | 176 | 192 | 224 | 256 | 320 | 384 | 448 | 510 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| サイン波 | 0.1.26 | 26.3 | 30.9 | 34.0 | 36.9 | **4.5** | **2.5** | **2.3** | **2.3** | **2.5** | **2.5** | **2.7** | 51.8 |
+| サイン波 | 0.1.28 | 26.3 | 30.9 | 34.0 | 36.9 | 35.4 | 37.5 | 38.0 | 37.8 | 37.9 | 43.4 | 48.8 | 51.8 |
+| 和音+ノイズ | 0.1.26 | 10.5 | 11.9 | 12.3 | **5.1** | **5.0** | **4.8** | **4.5** | **4.4** | **4.4** | **4.4** | **4.5** | 11.7 |
+| 和音+ノイズ | 0.1.28 | 10.5 | 11.9 | 12.3 | 12.5 | 12.6 | 12.6 | 12.7 | 12.7 | 12.8 | 12.9 | 12.9 | 12.9 |
+
+**0.1.26 の値は報告時の表と一致する** (測り直しても同じ) ので、物差しは同じもの。
+壊れていた 48〜192kbps の範囲は上の表の左半分がそれで、0.1.28 では崩れが消え、
+**510kbps まで単調に良くなる**。
+
+**0.1.26 / 510kbps の値 (51.8 / 11.7) は信用してはいけない。** 聴くと明らかに
+壊れているのに高く出る。**この指標は「低ければ壊れている」は言えるが、
+「高ければ正常」は言えない。** 詳しくは `src/bin/spectral_match.rs` の冒頭。
+
+PVQ 側も変わった。
+
+| 見たもの | 0.1.26 | 0.1.28 |
+|---|---|---|
+| `celt_pvq_u/v` のパニック (N>=8) | K>=129 でパニック | パニックしない |
+| 表外の `V(N,K)` | `wrapping_add` で巻き戻る | u32 の上限で飽和する |
+| 索引が符号帳の外 (600件中) | 145件 | 0件 |
+| 索引の往復 (600件中) | 124件が失敗 | 失敗なし |
+| `pvq_search` の `sum(|y|)==K` (2280件) | 全て一致 | 全て一致 |
+
+### 残っている点: `cwrsi` が戻ってこない
+
+**パニックが無限ループに変わった箇所がある。** `cwrsi(N=200, K=2)` と
+`(N=200, K=4)` が返らない (0.1.26 では同じ入力でパニックしていた)。
+段階を切り分けたのは `cwrs_hang.rs`。
+
+**符号化から到達する経路ではない。** `N=200` は本家 libopus が帯域分割で作る
+`N` の集合 (176, 144, 96, ...) に無く、実際 `N=176` 以下は 0.1.28 で全て素通り
+する。**書き出しには影響しない**が、失敗の仕方としてはパニックより悪いので、
+上流へ追記するなら**この一点**。
+
+### 本体側 (対応済み)
+
+`host/src/opus.rs` の `BITRATES_KBPS` を **48 / 96 → 48 / 96 / 128 / 192** に
+広げ、**実際の曲を 192kbps で書き出して聴いて確かめた** (ノイズにならない)。
+経緯は `docs/export_rate_plan.md` の「0.1.28 で直った」。
+
+**版を上げるとスタックが足りなくなる。** 0.1.28 は 0.1.26 より大幅に多く
+スタックを使い、**1MiB では debug / release とも符号化の最初で落ちる**。
+書き出しはメインスレッド (Windows の既定で 1MiB) から呼ばれるので、
+`opus::to_bytes` が専用スレッドを立てるようにして塞いだ。
 
 ---
 
@@ -262,3 +313,167 @@ I also did not try other sample rates, mono, or `Application` values other than
   and they all matched.
 - My container/muxing: the same muxer produces files that ffmpeg reports as valid
   and decodes to exactly the expected length at the bitrates that work.
+
+---
+
+## 追記用の本文 (2026-08-17)
+
+以下は**まだ投稿していない**。0.1.28 の検証結果として issue に足す想定の本文。
+日本語版の要約は上の「0.1.28 で直った」を参照。
+
+---
+
+### Follow-up: verified on 0.1.28
+
+**The encoding corruption is fixed.** Thank you. I re-ran the same measurements
+against both versions; below is what I get. There is one thing left that I would
+not have found without the fix, so I am adding it at the end rather than opening
+a new issue — please split it out if you would rather track it separately.
+
+Same caveats as the original report: this was written with AI assistance and I am
+not a codec expert. I have kept what was measured separate from what I am
+guessing at.
+
+#### What I ran
+
+- `opus-rs` 0.1.26 and 0.1.28, selected with `cargo update -p opus-rs --precise`
+- Windows 10 Pro 22H2, x86_64 (AVX2 available), rustc/cargo 1.97.1 — **a
+  different machine from the original report**, which is why the 0.1.26 numbers
+  below are a reproduction on new hardware rather than the same run
+- Encoder settings unchanged: `OpusEncoder::new(48000, 2, Application::Audio)`,
+  20 ms frames (`frame_size = 960`), only `bitrate_bps` varied
+- Decoded with ffmpeg 9.0 (the original report used 8.1.1)
+- Same two 2-second stereo signals as before (**sine**: 440 Hz left / 660 Hz
+  right at 0.5; **complex**: a three-tone chord per channel plus a little noise)
+
+Metric as before: per 20 ms frame, compare magnitude spectra of input and decoded
+output, `10*log10( sum(A²) / sum((A-B)²) )`, averaged over frames and channels.
+Higher is better. I did not keep the original measurement script, so I rewrote it
+(960-point DFT, Hann window). **The 0.1.26 column below reproduces the table in
+the original report** — exactly for the complex signal, and within about 1 dB for
+the sine — so I believe it is the same yardstick. The small differences are
+presumably the ffmpeg version and the windowing detail.
+
+#### 1. The bitrate-dependent corruption is gone
+
+I extended the sweep up to 510 kbps (the stereo maximum) since the point of the
+fix is being able to use those rates.
+
+| bitrate (kbps) | sine 0.1.26 | sine 0.1.28 | complex 0.1.26 | complex 0.1.28 |
+|---|---|---|---|---|
+| 48 | 26.3 | 26.3 | 10.5 | 10.5 |
+| 96 | 30.9 | 30.9 | 11.9 | 11.9 |
+| 128 | 34.0 | 34.0 | 12.3 | 12.3 |
+| 160 | 36.9 | 36.9 | **5.1** | 12.5 |
+| 176 | **4.5** | 35.4 | **5.0** | 12.6 |
+| 192 | **2.5** | 37.5 | **4.8** | 12.6 |
+| 224 | **2.3** | 38.0 | **4.5** | 12.7 |
+| 256 | **2.3** | 37.8 | **4.4** | 12.7 |
+| 320 | **2.5** | 37.9 | **4.4** | 12.8 |
+| 384 | **2.5** | 43.4 | **4.4** | 12.9 |
+| 448 | **2.7** | 48.8 | **4.5** | 12.9 |
+| 510 | 51.8 | 51.8 | 11.7 | 12.9 |
+
+On 0.1.28 the match is non-decreasing across the whole range for both signals,
+which is what I would expect from a working encoder. On 0.1.26 it collapses above
+the content-dependent threshold and stays collapsed.
+
+#### 2. The PVQ-level checks
+
+Over 600 combinations of `N` (2..200) and `K` (1..127) with four input shapes
+each:
+
+| check | 0.1.26 | 0.1.28 |
+|---|---|---|
+| `celt_pvq_u`/`celt_pvq_v` panic (`N >= 8`) | panics for `K >= 129` | no panic for any `K` I tried (up to 299) |
+| out-of-table `V(N,K)` | wraps (`wrapping_add`) | saturates at `u32::MAX` |
+| index outside the codebook (`i >= V`) | 145 | 0 |
+| `icwrs` → `cwrsi` round-trip mismatches | 124 | 0 |
+| `pvq_search` giving `sum(\|y\|) == K` (2280 cases) | all pass | all pass |
+
+A caveat on the two zeros: on 0.1.28, 292 of the 600 pairs now return
+`V == u32::MAX`, and my harness skips the index checks for those, on the grounds
+that a `u32` index cannot address a codebook that large anyway. Another 8 do not
+return (see below). The zeros cover the remaining 300.
+
+The value itself also looks better where I can check it by hand. `V(200,2)`
+should be `2N + 2N(N-1) = 80000`; 0.1.26 returns `26158`, 0.1.28 returns `80000`.
+
+#### 3. Left over: `cwrsi` does not return for `N = 200`
+
+The 8 cases above are `N=200, K=2` and `N=200, K=4`. On 0.1.26 the same calls
+panicked with the out-of-bounds index; on 0.1.28 they do not come back.
+
+```rust
+use opus_rs::pvq::cwrsi;
+
+let mut y = vec![0i32; 200];
+cwrsi(200, 2, 512, &mut y); // does not return
+```
+
+It is not just slow — I let one call run for 120 seconds. Scanning the index
+directly, with `V(200,2) = 80000`:
+
+| `i` | `N = 176` | `N = 200` |
+|---|---|---|
+| 0, 1, 63, 64, 128, 256 | returns | returns |
+| 512, 1024, 2048, 4096, 8192, 16384 | returns | **does not return** |
+
+Note this is not an overflow case: `V(200,2)` is 80000, nowhere near 32 bits.
+
+**I do not think this is reachable from the encoder.** `N = 200` is not in the
+set of `N` that band splitting produces (176, 144, 96, 88, ...); I only had it in
+my harness to see what happens outside the table. `N = 176` is fine at every
+index I tried, and encoding is clean at every bitrate now. So this does not
+affect me. I am mentioning it only because a hang is a worse failure mode than a
+panic for a library — a caller can catch the panic.
+
+#### 4. A regression: `OpusEncoder::new` now needs about a megabyte of stack
+
+This one has bitten me in practice, so it may be worth more attention than the
+hang above.
+
+`OpusEncoder::new` overflows a small thread stack on 0.1.28 where 0.1.26 was
+comfortable. Encoding is not involved — it dies during construction.
+
+```rust
+use opus_rs::{Application, OpusEncoder};
+
+std::thread::Builder::new()
+    .stack_size(832 * 1024)
+    .spawn(|| {
+        // 0.1.26: fine. 0.1.28: stack overflow here.
+        let _ = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+    })
+    .unwrap()
+    .join()
+    .unwrap();
+```
+
+Where the boundary sits, bisecting the thread stack size:
+
+| version | release | debug |
+|---|---|---|
+| 0.1.26 | fits in 64 KiB (smallest I tried) | — |
+| 0.1.28 | 832 KiB overflows, 864 KiB is enough | 1 MiB overflows, 2 MiB is enough |
+
+**Why this hurts: on Windows the main thread gets 1 MiB by default** (the MSVC
+linker default; Rust does not raise it). So an application that encodes on its
+main thread — mine did — sits right on the edge. In my case the same logic
+crashed from one crate and survived from another, presumably because inlining
+moved the frame size slightly either side of the line. That is an unpleasant
+failure mode: it looks like it works until it does not.
+
+I have worked around it by encoding on a thread with an explicit 8 MiB stack.
+
+#### What I did not verify
+
+- Other sample rates, mono, or `Application` values other than `Audio`.
+- That `N = 200` really is unreachable from the encoder — I only checked that
+  `N <= 176` behaves, and that encoding is clean end to end.
+- Where the stack goes in `OpusEncoder::new` — I only bisected the boundary, I
+  did not look at what is allocated.
+
+On the other hand, the bitrate fix does hold up on real material: I exported the
+music that originally showed the problem at 192 kbps and it is clean by ear, with
+no crash.
