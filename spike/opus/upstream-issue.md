@@ -7,6 +7,9 @@
   *"Encoded stream decodes to out-of-range samples in libopus at higher bitrates
   with tonal input; `celt_pvq_u`/`celt_pvq_v` also panic for large K"*
 - **0.1.28 の検証結果は、同じ issue へのコメントとして投稿済み** (2026-08-17)
+- **クローズ済み** (2026-08-17)。書き出しの破綻は 0.1.28 で解消しており、
+  残っている `cwrsi` の N=200 ハングは**こちらの経路に影響しない**ため、
+  追跡はクレート側に委ねる
 
 再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs` /
 `cwrs_check.rs` / `spectral_match.rs`。測定の経緯と、こちらの対処
