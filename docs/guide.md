@@ -410,10 +410,13 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
   [0.1.28 で修正され](https://github.com/restsend/opus-rs/issues/11)、
   128 / 192 を戻してある。測定と経緯は
   [export_rate_plan.md](export_rate_plan.md)
-- **符号化は専用スレッドで行っている。** `opus-rs` 0.1.27 以降は
+- **符号化は専用スレッドで行っている。** `opus-rs` 0.1.27〜0.1.28 は
   `OpusEncoder::new` だけで 1MiB 近いスタックを使い、**Windows のメイン
-  スレッド (既定 1MiB) から呼ぶと落ちる**ため
-  ([issue #12](https://github.com/restsend/opus-rs/issues/12))
+  スレッド (既定 1MiB) から呼ぶと落ちた**ため
+  ([issue #12](https://github.com/restsend/opus-rs/issues/12))。
+  **0.1.29 で上流が直し** (既定で有効な `heap` フィーチャ)、必要量は
+  release で約 0.38MiB まで下がったが、**畳んでも得が無いのでスレッドは
+  残してある**。書き出した `.opus` は 0.1.28 とバイト単位で一致する
 
 `opus-rs` と `ogg` はどちらも純 Rust で、**C のビルド環境 (CMake) は要らない**。
 
