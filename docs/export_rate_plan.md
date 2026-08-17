@@ -149,8 +149,10 @@ A は「Windows のサウンド設定が 48kHz のときだけ成り立つ」も
 **0.1.27 で符号化器の状態がヒープからインラインの固定長へ移った**
 (`Box<SilkEncoderState>` → 直持ち、`Vec<T>` → `FixedVec<T, N>`)。`new` は
 `Self` を値で返すので、**呼ぶだけで 254KB の複製が数回積まれる**。
-`no_std` 向けの意図的な設計変更と思われるので、上流には「戻し方」ではなく
-「この代償」として報告する (`spike/opus/upstream-issue-stack.md`)。
+`no_std` 向けの意図的な設計変更と思われる。**Windows のメインスレッドが
+1MiB しか無いという環境側の事情**で顕在化したもので、Linux では見えない。
+上流へは強い提言ではなく、**「遅くていいのでヒープに置く経路も欲しい」程度の
+お願い**として出す (`spike/opus/upstream-issue-stack.md`)。
 
 これが効くのは、**書き出しが `export_opus` からメインスレッド上で呼ばれる**
 ため。Windows のメインスレッドは既定で 1MiB しか無い (`.cargo/config.toml` も

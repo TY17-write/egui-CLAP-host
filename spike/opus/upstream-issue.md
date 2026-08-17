@@ -429,11 +429,11 @@ panic for a library — a caller can catch the panic.
 
 #### A separate problem, filed on its own
 
-While measuring the above I also found that `OpusEncoder::new` needs about
-0.85 MiB of stack since 0.1.27 (0.1.26 fit in 64 KiB), which is enough to crash
-an application that encodes on the Windows main thread. That is unrelated to the
-codec behaviour discussed here, so I have raised it separately rather than
-lengthening this thread.
+While measuring the above I also noticed that `OpusEncoder::new` needs about
+0.85 MiB of stack since 0.1.27 (0.1.26 fit in 64 KiB), which caught me out on
+Windows, where the main thread only gets 1 MiB by default. That is unrelated to
+the codec behaviour discussed here and specific to my platform, so I have noted
+it separately rather than lengthening this thread.
 
 #### What I did not verify
 
