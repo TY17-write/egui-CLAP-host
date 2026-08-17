@@ -7,8 +7,8 @@
 //! state 拡張が未対応なのでパラメータが初期値に戻ってしまい、ユーザーが
 //! 音作りした結果が書き出しに乗らなくなる。
 
+use super::graph::{self, Graph};
 use super::transport::{self, Transport, TransportMsg, TransportShared};
-use super::TrackProcessor;
 use crate::sequencer::SeqEvent;
 
 /// 終端のあと、残響やリリースを録り切るために余分に回す長さ (秒)。
@@ -21,7 +21,8 @@ const SILENCE: f32 = 3.2e-5;
 
 /// レンダリングの指示
 pub struct RenderSetup {
-    /// トラック番号順のイベント列。鳴らさないトラック (ミュート等) は空にする。
+    /// **打ち込みトラック**番号順のイベント列。鳴らさないトラック (ミュート等) は
+    /// 空にする。どのオーディオトラックが受け取るかはグラフ側が持っている。
     pub sequences: Vec<Box<[SeqEvent]>>,
     /// シーケンスの終端 (サンプル)
     pub end_sample: u64,
@@ -29,7 +30,6 @@ pub struct RenderSetup {
     pub tail_samples: u64,
     /// 1ブロックのフレーム数。activate 時に宣言した上限を超えてはいけない。
     pub block_frames: usize,
-    pub channels: usize,
     pub sample_rate: u32,
 }
 
@@ -48,7 +48,7 @@ pub struct Rendered {
 
 /// 書き出し中に処理が失敗したトラック
 pub struct TrackFailure {
-    /// トラック番号 (0 始まり)
+    /// **オーディオトラック**番号 (0 始まり。0 はマスター)
     pub track: usize,
     /// 失敗したブロック数
     pub blocks: usize,
@@ -89,13 +89,18 @@ impl Rendered {
 
 /// シーケンスを最後まで回して1本のバッファにまとめる。
 ///
-/// `processors` は (トラック番号, 処理器) の組。呼び出し側がオーディオスレッドから
-/// 引き上げてきたものをそのまま渡し、終わったら必ず戻すこと。
-pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetup) -> Rendered {
-    let channels = setup.channels.max(1);
+/// `graph` は呼び出し側が組み立てたもの。オーディオスレッドから引き上げてきた
+/// 処理器を載せて渡し、**終わったら必ず戻すこと**。
+///
+/// **再生と同じ [`Graph`] を通る。** 音の組み立てを2箇所に持つと、
+/// 鳴らした音と書き出した音が食い違う。
+///
+/// 出力は常に [`graph::BUS_CHANNELS`] (2ch)。デバイスのチャンネル数には依らない。
+pub fn render(graph: &mut Graph, setup: RenderSetup) -> Rendered {
+    let channels = graph::BUS_CHANNELS;
     let block_frames = setup.block_frames.max(1);
-    let block_len = block_frames * channels;
     let total_frames = setup.end_sample + setup.tail_samples;
+    graph.reserve(block_frames);
 
     // 再生用の位置表示を巻き込まないよう、共有状態は使い捨てのものを渡す
     let mut transport = Transport::new(TransportShared::new());
@@ -108,19 +113,16 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
     }
     let _ = transport.handle_msg(TransportMsg::Play);
 
-    let mut mix = vec![0.0f32; block_len];
-    // トラック1本分の作業バッファ。理由は `audio::mod` の `scratch` と同じ
-    let mut scratch = vec![0.0f32; block_len];
     let mut samples = Vec::with_capacity((total_frames as usize + block_frames) * channels);
     let mut failures = FailureLog::default();
 
     // 直前まで鳴っていた音を消してから録り始める (無音から始めるため)。
     // このブロックの出力は捨てる。
-    for (_, processor) in processors.iter_mut() {
-        processor.events.clear();
-        transport::push_choke(&mut processor.events, 0);
+    graph.clear_events();
+    for (_, processor) in graph.processors_mut() {
+        transport::push_choke(processor.events_mut(), 0);
     }
-    process_block(processors, 0, &mut mix, &mut scratch, &mut failures);
+    graph.process(0, block_frames, &mut |track, e| failures.record(track, e));
 
     // 端数ブロックを作らず、常に同じ長さで回して最後に切る。
     // min_frames_count を下回るブロックをプラグインへ渡さずに済む。
@@ -128,15 +130,13 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
     let mut rendered_frames = 0u64;
     while rendered_frames < total_frames {
         let plan = transport.plan_block(block_frames as u64);
-        for (track, processor) in processors.iter_mut() {
-            processor.events.clear();
-            if !plan.is_empty() {
-                transport.emit_track(*track, &plan, &mut processor.events);
-            }
-        }
+        graph.clear_events();
+        graph.emit_from(&mut transport, &plan);
 
-        process_block(processors, steady, &mut mix, &mut scratch, &mut failures);
-        samples.extend_from_slice(&mix);
+        graph.process(steady, block_frames, &mut |track, e| {
+            failures.record(track, e)
+        });
+        samples.extend_from_slice(graph.master(block_frames));
 
         steady += block_frames as u64;
         rendered_frames += block_frames as u64;
@@ -151,36 +151,6 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
         sample_rate: setup.sample_rate,
         peak,
         failures: failures.entries,
-    }
-}
-
-/// 1ブロックぶんを全トラック処理して `mix` にまとめる。
-/// `mix` の長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
-/// イベントは呼び出し側が各処理器へ積んでおくこと。
-///
-/// **再生時 (`audio::mod`) と同じ形にしてある。** トラックごとに `scratch` を
-/// 通してから足す。ここだけ違う組み方をすると、書き出しと再生で音が変わる。
-fn process_block(
-    processors: &mut [(usize, Box<TrackProcessor>)],
-    steady: u64,
-    mix: &mut [f32],
-    scratch: &mut [f32],
-    failures: &mut FailureLog,
-) {
-    mix.fill(0.0);
-
-    for (track, processor) in processors.iter_mut() {
-        scratch.fill(0.0);
-        // 失敗したトラックはこのブロックが無音のまま混ざる。
-        // 黙って進めると中身の欠けたファイルが「成功」として出てしまうので、
-        // 呼び出し側へ持ち帰って知らせる。
-        if let Err(e) = processor.process(steady, scratch) {
-            failures.record(*track, e);
-            continue;
-        }
-        for (mixed, sample) in mix.iter_mut().zip(scratch.iter()) {
-            *mixed += *sample;
-        }
     }
 }
 

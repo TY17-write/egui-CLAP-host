@@ -21,8 +21,9 @@ use std::path::PathBuf;
 
 /// 今このビルドが書き出す形式のバージョン。
 ///
-/// 1: シーケンスと設定のみ / 2: 音源 (`plugins`) を追加
-const VERSION: u32 = 2;
+/// 1: シーケンスと設定のみ / 2: 音源 (`plugins`) を追加 /
+/// 3: 音源を**オーディオトラック** (`audio_tracks`) へ移した
+const VERSION: u32 = 3;
 
 /// 音源の種別。
 ///
@@ -49,11 +50,37 @@ pub struct PluginSnapshot {
     pub state: Vec<u8>,
 }
 
+/// 保存するオーディオトラック1本ぶん。
+///
+/// 打ち込み側の「トラック」とは別物 (`audio::graph` を参照)。
+/// 番号は並び順そのもので、**常に [`AUDIO_TRACKS`] 本**ある。
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct AudioTrackSnapshot {
+    pub name: String,
+    /// 上から順に通す音源とエフェクト
+    pub nodes: Vec<PluginSnapshot>,
+    /// MIDI をどの打ち込みトラックから取るか。`None` は入力なし (バス用)
+    pub midi_track: Option<usize>,
+    /// 送り先のオーディオトラック番号。**マスター (0) では常に空**
+    pub sends: Vec<usize>,
+}
+
+/// オーディオトラックの本数 (`audio::graph::AUDIO_TRACKS` と同じ)。
+///
+/// `project` は音を扱わないので、`audio` に依存させずここで持つ。
+/// **食い違うと保存と再生でトラック数が合わなくなる**ので、テストで縛ってある。
+pub const AUDIO_TRACKS: usize = 16;
+
+/// マスターのトラック番号
+pub const MASTER: usize = 0;
+
 /// 読み込んだプロジェクト
 pub struct Loaded {
     pub editor: MidiEditor,
-    /// トラック番号順の音源。載っていないトラックは `None`。
-    pub plugins: Vec<Option<PluginSnapshot>>,
+    /// オーディオトラック。常に [`AUDIO_TRACKS`] 本ある
+    pub audio_tracks: Vec<AudioTrackSnapshot>,
+    /// 16本に収まらず読み込めなかったものの説明。空なら全部載った
+    pub overflow: Vec<String>,
 }
 
 /// テンポの許容範囲
@@ -105,11 +132,41 @@ struct Project {
     tracks: Vec<TrackEntry>,
     #[serde(default)]
     notes: Vec<NoteEntry>,
-    /// トラック番号順の音源。巨大になりうるので**末尾に置く**
-    /// (テンポ・拍子・ノートといった読みたい部分をファイル先頭に残すため)。
-    /// バージョン1 のファイルには無いので `default` で空になる。
-    #[serde(default)]
+    /// **バージョン2 まで**の音源欄 (打ち込みトラック番号順)。
+    /// 読むためだけに残してある。書き出すのは `audio_tracks` のほう。
+    #[serde(default, skip_serializing)]
     plugins: Vec<Option<PluginEntry>>,
+    /// オーディオトラック。巨大になりうるので**末尾に置く**
+    /// (テンポ・拍子・ノートといった読みたい部分をファイル先頭に残すため)。
+    /// バージョン2 以前のファイルには無いので `default` で空になる。
+    #[serde(default)]
+    audio_tracks: Vec<AudioTrackEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AudioTrackEntry {
+    #[serde(default)]
+    name: String,
+    /// `None` は入力なし (バス用)
+    #[serde(default)]
+    midi_track: Option<usize>,
+    /// 送り先。**片側だけ書く。** 両側に書くと「A は→B と言い、B は何も
+    /// 言っていない」という矛盾したファイルが作れてしまう
+    #[serde(default)]
+    sends: Vec<SendEntry>,
+    /// 上から順に通す音源とエフェクト
+    #[serde(default)]
+    nodes: Vec<PluginEntry>,
+}
+
+/// 送り1本。
+///
+/// 1項目でも構造体にしてあるのは、**あとで音量を足すため**
+/// (`usize` の配列から構造体の配列へは移れない)。
+#[derive(Serialize, Deserialize)]
+struct SendEntry {
+    #[serde(default)]
+    to: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,27 +221,41 @@ struct NoteEntry {
     lane: usize,
 }
 
-/// シーケンスと音源を .ron のテキストにする。
+/// シーケンスとオーディオトラックを .ron のテキストにする。
 ///
 /// スウィングは適用しない (記譜位置をそのまま残す)。
-/// `plugins` はトラック番号順で、載っていないトラックは `None`。
+/// `audio_tracks` は番号順で、[`AUDIO_TRACKS`] 本に満たなければ空きで埋める。
 pub fn to_string(
     editor: &MidiEditor,
-    plugins: &[Option<PluginSnapshot>],
+    audio_tracks: &[AudioTrackSnapshot],
 ) -> Result<String, String> {
     let base64 = base64::engine::general_purpose::STANDARD;
+    let node_entry = |plugin: &PluginSnapshot| PluginEntry {
+        kind: plugin.kind,
+        path: plugin.path.to_string_lossy().into_owned(),
+        id: plugin.id.clone(),
+        state: base64.encode(&plugin.state),
+    };
+
     let project = Project {
-        plugins: plugins
-            .iter()
-            .map(|slot| {
-                slot.as_ref().map(|plugin| PluginEntry {
-                    kind: plugin.kind,
-                    path: plugin.path.to_string_lossy().into_owned(),
-                    id: plugin.id.clone(),
-                    state: base64.encode(&plugin.state),
-                })
+        audio_tracks: (0..AUDIO_TRACKS)
+            .map(|index| {
+                let track = audio_tracks.get(index).cloned().unwrap_or_default();
+                AudioTrackEntry {
+                    name: track.name,
+                    midi_track: track.midi_track,
+                    // マスターは送り側にならないので、書いてあっても落とす
+                    sends: if index == MASTER {
+                        Vec::new()
+                    } else {
+                        track.sends.iter().map(|to| SendEntry { to: *to }).collect()
+                    },
+                    nodes: track.nodes.iter().map(node_entry).collect(),
+                }
             })
             .collect(),
+        // 書き出さない (バージョン2 のファイルを読むためだけに残してある)
+        plugins: Vec::new(),
         version: VERSION,
         tempo: editor.tempo,
         beats: editor.beats,
@@ -258,30 +329,67 @@ pub fn from_str(text: &str) -> Result<Loaded, String> {
     Ok(build(project))
 }
 
-/// 検証済みの音源欄をデータへ移す。
+/// 音源欄1つをデータへ移す。
 ///
-/// base64 が壊れているものは**その音源だけ捨てる**（トラックは音源なしになる）。
-/// ノートやトラック構成は無事なので、プロジェクト全体を拒否するのは損が大きい。
-fn build_plugins(entries: Vec<Option<PluginEntry>>, tracks: usize) -> Vec<Option<PluginSnapshot>> {
+/// base64 が壊れているものは**状態だけ捨てる**。ノートやトラック構成は
+/// 無事なので、プロジェクト全体を拒否するのは損が大きい。
+/// パスが空のものは「載っていない」とみなして `None`。
+fn build_node(entry: PluginEntry) -> Option<PluginSnapshot> {
+    if entry.path.is_empty() {
+        return None;
+    }
     let base64 = base64::engine::general_purpose::STANDARD;
-    let mut plugins: Vec<Option<PluginSnapshot>> = entries
-        .into_iter()
-        .map(|slot| {
-            let entry = slot?;
-            if entry.path.is_empty() {
-                return None;
-            }
-            Some(PluginSnapshot {
-                kind: entry.kind,
-                path: PathBuf::from(entry.path),
-                id: entry.id,
-                state: base64.decode(&entry.state).unwrap_or_default(),
-            })
-        })
-        .collect();
-    // トラック数と長さを揃える (音源欄が短い/長いファイルへの備え)
-    plugins.resize(tracks, None);
-    plugins
+    Some(PluginSnapshot {
+        kind: entry.kind,
+        path: PathBuf::from(entry.path),
+        id: entry.id,
+        state: base64.decode(&entry.state).unwrap_or_default(),
+    })
+}
+
+/// バージョン2 以前の音源欄をオーディオトラックへ移す。
+///
+/// 打ち込みトラック `i` に載っていた音源を、**オーディオトラック `i + 1`** の
+/// 1段目にする (0 はマスターなので1つずらす)。送り先はマスター。
+///
+/// **16本に収まらないぶんは載せられない。** 打ち込みトラック数に上限が無い
+/// ため、音源を15個より多く載せたファイルがありうる。黙って捨てず、
+/// 呼び出し側が名指しで知らせられるように説明を返す。
+fn migrate_plugins(entries: Vec<Option<PluginEntry>>) -> (Vec<AudioTrackSnapshot>, Vec<String>) {
+    let mut tracks = empty_audio_tracks();
+    let mut overflow = Vec::new();
+
+    for (midi_track, slot) in entries.into_iter().enumerate() {
+        let Some(node) = slot.and_then(build_node) else {
+            continue;
+        };
+        let audio_track = midi_track + 1;
+        if audio_track >= AUDIO_TRACKS {
+            overflow.push(format!(
+                "・トラック {}: {} はオーディオトラックが足りず載せられません \
+                 (音を出せるのは {} 本まで)",
+                midi_track + 1,
+                node.path.display(),
+                AUDIO_TRACKS - 1
+            ));
+            continue;
+        }
+        tracks[audio_track] = AudioTrackSnapshot {
+            name: String::new(),
+            nodes: vec![node],
+            midi_track: Some(midi_track),
+            sends: vec![MASTER],
+        };
+    }
+
+    (tracks, overflow)
+}
+
+/// 空のオーディオトラック [`AUDIO_TRACKS`] 本
+fn empty_audio_tracks() -> Vec<AudioTrackSnapshot> {
+    (0..AUDIO_TRACKS)
+        .map(|_| AudioTrackSnapshot::default())
+        .collect()
 }
 
 /// 意味の検証。見つかった問題を人が読める形で並べて返す。
@@ -348,13 +456,167 @@ fn validate(project: &Project) -> Vec<String> {
         }
     }
 
+    problems.extend(validate_audio_tracks(&project.audio_tracks));
     problems
+}
+
+/// オーディオトラックの検証。
+///
+/// **編集操作で拒否するだけでは足りない。** 手で書き換えたファイルや、
+/// 将来の版で作られたファイルが入口になりうるので、読み込みでも見る。
+fn validate_audio_tracks(tracks: &[AudioTrackEntry]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if tracks.is_empty() {
+        return problems; // バージョン2 以前。移行側で扱う
+    }
+    if tracks.len() > AUDIO_TRACKS {
+        problems.push(format!(
+            "・オーディオトラックが {} 本あります (使えるのは {AUDIO_TRACKS} 本まで)",
+            tracks.len()
+        ));
+        return problems;
+    }
+
+    for (index, track) in tracks.iter().enumerate() {
+        let at = format!("・オーディオトラック {index}");
+
+        // マスターは常に受け手。送り側になると 0 を含む輪が作れてしまう
+        if index == MASTER && !track.sends.is_empty() {
+            problems.push(format!("{at}: マスターは送り先を持てません"));
+        }
+
+        let mut seen = Vec::new();
+        for send in &track.sends {
+            if send.to >= tracks.len() {
+                problems.push(format!("{at}: 送り先 {} は存在しません", send.to));
+                continue;
+            }
+            if send.to == index {
+                problems.push(format!("{at}: 自分自身へは送れません"));
+                continue;
+            }
+            // 同じ相手への二重の送りは、片方を消したつもりで残る事故のもと
+            if seen.contains(&send.to) {
+                problems.push(format!("{at}: 送り先 {} が重複しています", send.to));
+            }
+            seen.push(send.to);
+        }
+    }
+
+    // 2本の間の接続は1本だけ。両向きにあると、どちらが送り側か決まらない
+    for (index, track) in tracks.iter().enumerate() {
+        for send in &track.sends {
+            let Some(other) = tracks.get(send.to) else {
+                continue;
+            };
+            if other.sends.iter().any(|back| back.to == index) && index < send.to {
+                problems.push(format!(
+                    "・オーディオトラック {index} と {} が互いに送り合っています",
+                    send.to
+                ));
+            }
+        }
+    }
+
+    problems.extend(find_cycle(tracks));
+    problems
+}
+
+/// 輪になっていないか調べる。
+///
+/// **対で1本・マスターは受け手、の2つでは3本以上の輪が塞がらない。**
+/// `1 → 2 → 3 → 1` はどの規則も満たしたまま循環する。
+///
+/// 深さ優先で1周するだけ (トラックは16本しかない)。
+fn find_cycle(tracks: &[AudioTrackEntry]) -> Vec<String> {
+    /// 訪問済みの印
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        New,
+        InProgress,
+        Done,
+    }
+
+    fn visit(
+        index: usize,
+        tracks: &[AudioTrackEntry],
+        marks: &mut [Mark],
+        path: &mut Vec<usize>,
+    ) -> Option<Vec<usize>> {
+        marks[index] = Mark::InProgress;
+        path.push(index);
+
+        for send in &tracks[index].sends {
+            let Some(&mark) = marks.get(send.to) else {
+                continue;
+            };
+            match mark {
+                // 今たどっている経路へ戻った = 輪
+                Mark::InProgress => {
+                    let from = path.iter().position(|step| *step == send.to).unwrap_or(0);
+                    let mut cycle = path[from..].to_vec();
+                    cycle.push(send.to);
+                    return Some(cycle);
+                }
+                Mark::New => {
+                    if let Some(cycle) = visit(send.to, tracks, marks, path) {
+                        return Some(cycle);
+                    }
+                }
+                Mark::Done => {}
+            }
+        }
+
+        path.pop();
+        marks[index] = Mark::Done;
+        None
+    }
+
+    let mut marks = vec![Mark::New; tracks.len()];
+    for index in 0..tracks.len() {
+        if marks[index] != Mark::New {
+            continue;
+        }
+        let mut path = Vec::new();
+        if let Some(cycle) = visit(index, tracks, &mut marks, &mut path) {
+            let route = cycle
+                .iter()
+                .map(|step| step.to_string())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            return vec![format!("・オーディオトラックが輪になっています ({route})")];
+        }
+    }
+    Vec::new()
 }
 
 /// 検証済みのファイル内容をデータモデルに移す
 fn build(project: Project) -> Loaded {
-    let tracks = project.tracks.len().max(1);
-    let plugins = build_plugins(project.plugins, tracks);
+    // バージョン3 以降は `audio_tracks`、それ以前は `plugins` から移す。
+    // 両方あるファイル (手で書いたもの) では新しいほうを採る
+    let (audio_tracks, overflow) = if project.audio_tracks.is_empty() {
+        migrate_plugins(project.plugins)
+    } else {
+        let mut tracks = empty_audio_tracks();
+        for (index, entry) in project.audio_tracks.into_iter().enumerate() {
+            if index >= AUDIO_TRACKS {
+                break; // 検証で弾いてあるので、ここへは来ない
+            }
+            tracks[index] = AudioTrackSnapshot {
+                name: entry.name,
+                nodes: entry.nodes.into_iter().filter_map(build_node).collect(),
+                midi_track: entry.midi_track,
+                // マスターは送り側にならない
+                sends: if index == MASTER {
+                    Vec::new()
+                } else {
+                    entry.sends.into_iter().map(|send| send.to).collect()
+                },
+            };
+        }
+        (tracks, Vec::new())
+    };
+
     let editor = MidiEditor {
         notes: project
             .notes
@@ -403,7 +665,11 @@ fn build(project: Project) -> Loaded {
         // **0 以下や NaN を通すと拍長が壊れる**ので、丸めは waltz 側に任せる
         waltz_ratio: waltz::clamp_ratio(project.waltz_ratio),
     };
-    Loaded { editor, plugins }
+    Loaded {
+        editor,
+        audio_tracks,
+        overflow,
+    }
 }
 
 #[cfg(test)]
@@ -574,28 +840,85 @@ mod tests {
         }
     }
 
-    /// 音源のパス・ID・状態が往復すること
+    /// 打ち込みトラック `midi` の音源を、オーディオトラック `midi + 1` に載せる
+    fn audio_track(midi: usize, path: &str, id: &str, state: &[u8]) -> AudioTrackSnapshot {
+        AudioTrackSnapshot {
+            name: String::new(),
+            nodes: vec![snapshot(path, id, state)],
+            midi_track: Some(midi),
+            sends: vec![MASTER],
+        }
+    }
+
+    /// 空のオーディオトラック16本に、指定のものを差し込む
+    fn audio_tracks(entries: &[(usize, AudioTrackSnapshot)]) -> Vec<AudioTrackSnapshot> {
+        let mut tracks = empty_audio_tracks();
+        for (index, track) in entries {
+            tracks[*index] = track.clone();
+        }
+        tracks
+    }
+
+    /// 音源のパス・ID・状態と、繋ぎ方が往復すること
     #[test]
-    fn round_trip_keeps_plugins() {
+    fn round_trip_keeps_audio_tracks() {
         let editor = sample(); // トラック2本
-        let plugins = vec![
-            Some(snapshot(
+        let tracks = audio_tracks(&[(
+            1,
+            audio_track(
+                0,
                 "C:\\音源\\Surge XT.clap",
                 "org.surge-synth-team.surge-xt",
                 &[0, 1, 2, 255],
-            )),
-            None,
-        ];
+            ),
+        )]);
 
-        let restored = from_str(&to_string(&editor, &plugins).unwrap()).unwrap();
-        assert_eq!(restored.plugins, plugins);
+        let restored = from_str(&to_string(&editor, &tracks).unwrap()).unwrap();
+        assert_eq!(restored.audio_tracks, tracks);
+        assert!(restored.overflow.is_empty());
+    }
+
+    /// 常に16本書き出すこと (番号がそのまま識別子なので、詰めてはいけない)
+    #[test]
+    fn always_writes_every_audio_track() {
+        let restored =
+            from_str(&to_string(&MidiEditor::default(), &empty_audio_tracks()).unwrap()).unwrap();
+        assert_eq!(restored.audio_tracks.len(), AUDIO_TRACKS);
+    }
+
+    /// チェーン (複数段) が順序ごと往復すること
+    #[test]
+    fn round_trip_keeps_the_chain_order() {
+        let mut track = audio_track(0, "synth.clap", "s", b"1");
+        track.nodes.push(snapshot("gain.clap", "g", b"2"));
+        track.nodes.push(snapshot("verb.clap", "v", b"3"));
+        let tracks = audio_tracks(&[(1, track)]);
+
+        let restored = from_str(&to_string(&MidiEditor::default(), &tracks).unwrap()).unwrap();
+        let ids: Vec<_> = restored.audio_tracks[1]
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s", "g", "v"], "上から順のまま");
+    }
+
+    /// マスターは送り先を持たないこと (書き出しでも落とす)
+    #[test]
+    fn master_never_gets_sends() {
+        let mut tracks = empty_audio_tracks();
+        tracks[MASTER].sends = vec![3]; // 手で壊した状態
+        let text = to_string(&MidiEditor::default(), &tracks).unwrap();
+
+        let restored = from_str(&text).expect("書き出しで落ちるので読めること");
+        assert!(restored.audio_tracks[MASTER].sends.is_empty());
     }
 
     /// 状態は base64 で載ること (数値の配列にしない)
     #[test]
     fn state_is_stored_as_base64() {
-        let plugins = vec![Some(snapshot("a.clap", "x", b"Hello"))];
-        let text = to_string(&MidiEditor::default(), &plugins).unwrap();
+        let tracks = audio_tracks(&[(1, audio_track(0, "a.clap", "x", b"Hello"))]);
+        let text = to_string(&MidiEditor::default(), &tracks).unwrap();
 
         assert!(text.contains("SGVsbG8="), "base64 で載ること: {text}");
         assert!(!text.contains("state: ["), "数値の配列にしないこと");
@@ -603,13 +926,13 @@ mod tests {
 
     /// 音源欄はファイル末尾に置くこと (読みたい部分を先頭に残すため)
     #[test]
-    fn plugins_are_written_last() {
-        let plugins = vec![Some(snapshot("a.clap", "x", &[0; 64]))];
-        let text = to_string(&sample(), &plugins).unwrap();
+    fn audio_tracks_are_written_last() {
+        let tracks = audio_tracks(&[(1, audio_track(0, "a.clap", "x", &[0; 64]))]);
+        let text = to_string(&sample(), &tracks).unwrap();
 
         let at = |needle: &str| text.find(needle).expect(needle);
-        assert!(at("tempo:") < at("plugins:"));
-        assert!(at("notes:") < at("plugins:"));
+        assert!(at("tempo:") < at("audio_tracks:"));
+        assert!(at("notes:") < at("audio_tracks:"));
     }
 
     /// バージョン1 のファイル (音源欄なし) がそのまま読めること
@@ -621,22 +944,68 @@ mod tests {
 
         let loaded = from_str(text).expect("読めること");
         assert_eq!(loaded.editor.tempo, 120);
-        assert_eq!(loaded.plugins, vec![None], "音源なしとして扱うこと");
+        assert_eq!(loaded.audio_tracks.len(), AUDIO_TRACKS);
+        assert!(
+            loaded
+                .audio_tracks
+                .iter()
+                .all(|track| track.nodes.is_empty()),
+            "音源なしとして扱うこと"
+        );
     }
 
-    /// 音源欄の長さがトラック数と合わなくても、トラック数に揃うこと
+    /// **バージョン2 の音源が、1つずらしてオーディオトラックへ移ること。**
+    /// 落ちると、開き直したときに音源が別のトラックへ載る。
     #[test]
-    fn plugin_list_is_resized_to_the_tracks() {
-        let editor = sample(); // トラック2本
-                               // 音源を3つ書いた壊れたファイル相当
-        let plugins = vec![
-            Some(snapshot("a.clap", "x", b"1")),
-            Some(snapshot("b.clap", "y", b"2")),
-            Some(snapshot("c.clap", "z", b"3")),
-        ];
+    fn version_two_plugins_move_to_audio_tracks() {
+        let text = "(version: 2, tempo: 120, beats: 4, beat_type: 4, \
+                    tracks: [ (name: \"A\", lanes: 1), (name: \"B\", lanes: 1) ], \
+                    notes: [], \
+                    plugins: [ Some((kind: Clap, path: \"a.clap\", id: \"x\", state: \"\")), \
+                               Some((kind: Vst3, path: \"b.vst3\", id: \"y\", state: \"\")) ])";
 
-        let restored = from_str(&to_string(&editor, &plugins).unwrap()).unwrap();
-        assert_eq!(restored.plugins.len(), 2, "トラック数に揃うこと");
+        let loaded = from_str(text).expect("読めること");
+        assert!(loaded.audio_tracks[MASTER].nodes.is_empty(), "0 はマスター");
+
+        let first = &loaded.audio_tracks[1];
+        assert_eq!(first.nodes[0].id, "x");
+        assert_eq!(first.midi_track, Some(0), "打ち込みトラック0 を受け取る");
+        assert_eq!(first.sends, vec![MASTER], "マスターへ送る");
+
+        let second = &loaded.audio_tracks[2];
+        assert_eq!(second.nodes[0].id, "y");
+        assert_eq!(second.midi_track, Some(1));
+        assert!(loaded.overflow.is_empty());
+    }
+
+    /// **16本に収まらないバージョン2 は、溢れたぶんを名指しで知らせること。**
+    /// 黙って捨てると、開いた人は音源が消えたことに気付けない。
+    #[test]
+    fn version_two_overflow_is_reported() {
+        let mut plugins = String::new();
+        for index in 0..AUDIO_TRACKS {
+            plugins.push_str(&format!(
+                "Some((kind: Clap, path: \"p{index}.clap\", id: \"p{index}\", state: \"\")),"
+            ));
+        }
+        let tracks = (0..AUDIO_TRACKS)
+            .map(|index| format!("(name: \"t{index}\", lanes: 1)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!(
+            "(version: 2, tempo: 120, beats: 4, beat_type: 4, \
+             tracks: [{tracks}], notes: [], plugins: [{plugins}])"
+        );
+
+        let loaded = from_str(&text).expect("プロジェクト自体は読めること");
+        // 打ち込み 0..14 が オーディオ 1..15 に載り、15 番目が溢れる
+        assert_eq!(loaded.audio_tracks[15].nodes[0].id, "p14");
+        assert_eq!(loaded.overflow.len(), 1, "溢れたのは1つ");
+        assert!(
+            loaded.overflow[0].contains("トラック 16"),
+            "何番が載らなかったかを言うこと: {}",
+            loaded.overflow[0]
+        );
     }
 
     /// base64 が壊れていても、その音源だけを捨ててプロジェクトは読めること
@@ -649,9 +1018,94 @@ mod tests {
 
         let loaded = from_str(text).expect("プロジェクト自体は読めること");
         assert_eq!(loaded.editor.notes.len(), 1, "ノートは無事であること");
-        let plugin = loaded.plugins[0].as_ref().expect("音源は残ること");
+        let plugin = &loaded.audio_tracks[1].nodes[0];
         assert!(plugin.state.is_empty(), "状態だけ諦めること");
         assert_eq!(plugin.id, "x");
+    }
+
+    /// 送り先が範囲外・自分自身・重複なら弾くこと
+    #[test]
+    fn invalid_sends_are_rejected() {
+        let doc = |track_index: usize, sends: &str| {
+            let tracks = (0..AUDIO_TRACKS)
+                .map(|index| {
+                    if index == track_index {
+                        format!("(sends: [{sends}])")
+                    } else {
+                        "()".into()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "(version: 3, tempo: 120, beats: 4, beat_type: 4, \
+                 tracks: [(name: \"A\", lanes: 1)], notes: [], audio_tracks: [{tracks}])"
+            )
+        };
+
+        assert!(load(&doc(1, "(to: 0)")).is_ok(), "正常なものは通ること");
+        assert!(load(&doc(1, "(to: 99)"))
+            .unwrap_err()
+            .contains("存在しません"));
+        assert!(load(&doc(1, "(to: 1)")).unwrap_err().contains("自分自身"));
+        assert!(load(&doc(1, "(to: 0),(to: 0)"))
+            .unwrap_err()
+            .contains("重複"));
+        assert!(load(&doc(MASTER, "(to: 1)"))
+            .unwrap_err()
+            .contains("マスターは送り先を持てません"));
+    }
+
+    /// **輪になっているファイルを拒否すること。**
+    ///
+    /// 対で1本・マスターは受け手、の2つでは3本以上の輪が塞がらない。
+    /// 通してしまうとオーディオスレッドが無限に辿る。
+    #[test]
+    fn cycles_in_the_file_are_rejected() {
+        let tracks = (0..AUDIO_TRACKS)
+            .map(|index| match index {
+                1 => "(sends: [(to: 2)])".to_string(),
+                2 => "(sends: [(to: 3)])".to_string(),
+                3 => "(sends: [(to: 1)])".to_string(),
+                _ => "()".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!(
+            "(version: 3, tempo: 120, beats: 4, beat_type: 4, \
+             tracks: [(name: \"A\", lanes: 1)], notes: [], audio_tracks: [{tracks}])"
+        );
+
+        let error = load(&text).unwrap_err();
+        assert!(error.contains("輪になっています"), "実際: {error}");
+    }
+
+    /// 互いに送り合うのは1本の接続として矛盾するので弾くこと
+    #[test]
+    fn mutual_sends_are_rejected() {
+        let tracks = (0..AUDIO_TRACKS)
+            .map(|index| match index {
+                1 => "(sends: [(to: 2)])".to_string(),
+                2 => "(sends: [(to: 1)])".to_string(),
+                _ => "()".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!(
+            "(version: 3, tempo: 120, beats: 4, beat_type: 4, \
+             tracks: [(name: \"A\", lanes: 1)], notes: [], audio_tracks: [{tracks}])"
+        );
+
+        let error = load(&text).unwrap_err();
+        assert!(error.contains("互いに送り合って"), "実際: {error}");
+    }
+
+    /// 本数が `audio::graph` と食い違わないこと。
+    /// **ずれると保存と再生でトラック数が合わなくなる。**
+    #[test]
+    fn audio_track_count_matches_the_engine() {
+        assert_eq!(AUDIO_TRACKS, crate::audio::graph::AUDIO_TRACKS);
+        assert_eq!(MASTER, crate::audio::graph::MASTER);
     }
 
     /// 知らないフィールドは無視し、欠けたフィールドは既定値で埋めること。

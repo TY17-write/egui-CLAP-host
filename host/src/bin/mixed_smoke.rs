@@ -24,9 +24,10 @@
 
 use clack_host::prelude::*;
 use clap_host_test::audio::config::StreamAudioConfig;
+use clap_host_test::audio::graph::Graph;
 use clap_host_test::audio::offline::{self, RenderSetup};
 use clap_host_test::audio::transport::{Transport, TransportMsg, TransportShared};
-use clap_host_test::audio::{self, TrackProcessor};
+use clap_host_test::audio::{self};
 use clap_host_test::discovery;
 use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use clap_host_test::sequencer::{MidiEditor, Note};
@@ -91,8 +92,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (vst3_shared, vst3_processor) =
         audio::activate_vst3_track(vst3_path, &vst3_target.id, &stream_config)?;
 
-    let mut processors: Vec<(usize, Box<TrackProcessor>)> =
-        vec![(0, clap_processor), (1, vst3_processor)];
+    // オーディオトラックは 0 がマスターなので、打ち込み 0/1 は 1/2 に載る
+    let mut graph = Graph::new();
+    graph.place(1, Some(0), clap_processor);
+    graph.place(2, Some(1), vst3_processor);
 
     // ---- シーケンス ----
     // 0〜1拍: CLAP だけ / 1〜2拍: 両方 / 2〜3拍: VST3 だけ / 3〜4拍: 休み
@@ -124,7 +127,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
 
     // ---- 1. 実時間の経路: 1本のトランスポートで両方を回す ----
-    let realtime = run_realtime(&mut processors, &editor, end_sample)?;
+    let realtime = run_realtime(&mut graph, &editor, end_sample)?;
 
     // ---- 2. 書き出しの経路: 同じシーケンスをオフラインで回す ----
     let setup = RenderSetup {
@@ -138,23 +141,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         end_sample,
         tail_samples: (offline::TAIL_SECONDS * SAMPLE_RATE) as u64,
         block_frames: BLOCK_SIZE,
-        channels: CHANNELS,
         sample_rate: SAMPLE_RATE as u32,
     };
-    let rendered = offline::render(&mut processors, setup);
+    let rendered = offline::render(&mut graph, setup);
     let offline_peaks = region_peaks(&rendered.samples, spq);
 
     // ---- 後始末: 形式ごとに返し方が違う ----
     let mut clap_stopped = None;
-    for (track, processor) in processors {
+    for (track, processor) in graph.take_processors() {
         let Some(retired) = processor.into_single_retired() else {
             return Err("1段だけ載せたのに別のものが返ってきた".into());
         };
         match retired {
             audio::RetiredProcessor::Clap(stopped) => clap_stopped = Some(stopped),
             audio::RetiredProcessor::Vst3(shared) => {
-                if track != 1 {
-                    return Err("VST3 の処理器がトラック2 以外から返ってきた".into());
+                if track != 2 {
+                    return Err("VST3 の処理器がオーディオトラック2 以外から返ってきた".into());
                 }
                 shared.lock().stop_processing()?;
             }
@@ -242,7 +244,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// 実時間と同じ手順 (1本のトランスポート + ブロックごとの発行) で最後まで回し、
 /// 区間ごとのピークを返す。
 fn run_realtime(
-    processors: &mut [(usize, Box<TrackProcessor>)],
+    graph: &mut Graph,
     editor: &MidiEditor,
     end_sample: u64,
 ) -> Result<[f32; 4], Box<dyn Error>> {
@@ -258,35 +260,26 @@ fn run_realtime(
     }
     let _ = transport.handle_msg(TransportMsg::Play);
 
-    let mut mix = vec![0.0f32; BLOCK_SIZE * CHANNELS];
-    // **トラックごとに作業バッファを通す。** `process` は渡されたバッファを
-    // 上書きするので、共有のミックスへ直接処理させると後のトラックが前を消す
-    // (本体の再生・書き出しと同じ形。ここだけ違う組み方をすると意味が無い)
-    let mut scratch = vec![0.0f32; BLOCK_SIZE * CHANNELS];
-    let mut samples = Vec::with_capacity(end_sample as usize * CHANNELS + mix.len());
+    // **本体の再生と同じ `Graph` を通す。** ここだけ違う組み方をすると、
+    // 実時間と書き出しを突き合わせる意味が無くなる
+    graph.reserve(BLOCK_SIZE);
+    let mut samples = Vec::with_capacity(end_sample as usize * CHANNELS + BLOCK_SIZE * CHANNELS);
 
     let mut position = 0u64;
     while position < end_sample {
         let plan = transport.plan_block(BLOCK_SIZE as u64);
-        for (track, processor) in processors.iter_mut() {
-            processor.events_mut().clear();
-            if !plan.is_empty() {
-                transport.emit_track(*track, &plan, processor.events_mut());
-            }
+        graph.clear_events();
+        graph.emit_from(&mut transport, &plan);
+
+        let mut failure = None;
+        graph.process(position, BLOCK_SIZE, &mut |track, e| {
+            failure.get_or_insert_with(|| format!("オーディオトラック {track} の処理に失敗: {e}"));
+        });
+        if let Some(failure) = failure {
+            return Err(failure.into());
         }
 
-        mix.fill(0.0);
-        for (track, processor) in processors.iter_mut() {
-            scratch.fill(0.0);
-            if let Err(e) = processor.process(position, &mut scratch) {
-                return Err(format!("トラック {} の処理に失敗: {e}", *track + 1).into());
-            }
-            for (mixed, sample) in mix.iter_mut().zip(scratch.iter()) {
-                *mixed += *sample;
-            }
-        }
-
-        samples.extend_from_slice(&mix);
+        samples.extend_from_slice(graph.master(BLOCK_SIZE));
         position += BLOCK_SIZE as u64;
     }
 

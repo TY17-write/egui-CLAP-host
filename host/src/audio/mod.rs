@@ -18,6 +18,7 @@ pub mod buffers;
 pub mod clap;
 pub mod config;
 pub mod events;
+pub mod graph;
 pub mod offline;
 pub mod transport;
 pub mod vst3;
@@ -25,8 +26,21 @@ pub mod vst3;
 use clap::ClapProcessor;
 use config::*;
 use events::{BlockEvent, BlockEvents};
+use graph::Graph;
 use transport::{Transport, TransportMsg, TransportShared};
 use vst3::{SharedPlugin, Vst3Processor};
+
+/// プラグインに見せるストリーム構成。
+///
+/// **チャンネル数だけをバスの幅 (2ch) に差し替える。** デバイスの
+/// チャンネル数をそのまま渡すと、モノラル出力の環境ではグラフの中まで
+/// モノラルになり、書き出しまでモノラルになってしまう。
+fn bus_config(stream_config: &StreamAudioConfig) -> StreamAudioConfig {
+    StreamAudioConfig {
+        output_channel_count: graph::BUS_CHANNELS,
+        ..*stream_config
+    }
+}
 
 /// 1ブロックの処理が失敗した理由 (形式に依らない形)。
 ///
@@ -65,7 +79,10 @@ impl From<vst3_host::error::Error> for ProcessError {
     }
 }
 
-/// GUI スレッドからオーディオスレッドへ送るメッセージ
+/// GUI スレッドからオーディオスレッドへ送るメッセージ。
+///
+/// **`track` はオーディオトラック番号** (`graph::AudioTrack`)。
+/// 打ち込みトラックの番号ではない。
 pub enum GuiMsg {
     NoteOn {
         track: usize,
@@ -84,12 +101,16 @@ pub enum GuiMsg {
         value: f64,
     },
     Transport(TransportMsg),
-    /// トラックに音源を載せる (差し替え時は古い方を retired へ返す)
+    /// オーディオトラックに音源を載せる (差し替え時は古い方を retired へ返す)。
+    ///
+    /// `midi_track` はそのトラックが MIDI を取る打ち込みトラック
+    /// (`None` は入力なし = バス用)。
     SetTrack {
         track: usize,
+        midi_track: Option<usize>,
         processor: Box<TrackProcessor>,
     },
-    /// トラックの音源を外す
+    /// オーディオトラックの音源を外す
     ClearTrack {
         track: usize,
     },
@@ -260,6 +281,7 @@ pub fn start_engine(
         retired,
         transport_shared,
         stream_config.output_channel_count,
+        stream_config.max_likely_buffer_size as usize,
     );
 
     let stream = build_output_stream_for_sample_format(
@@ -280,7 +302,9 @@ pub fn activate_node(
     instance: &mut PluginInstance<MiniHost>,
     stream_config: &StreamAudioConfig,
 ) -> Result<Node, Box<dyn Error>> {
-    let audio_config = FullAudioConfig::for_plugin(stream_config, instance);
+    // バッファはバスの幅で組む (デバイスのチャンネル数ではない)
+    let bus = bus_config(stream_config);
+    let audio_config = FullAudioConfig::for_plugin(&bus, instance);
 
     let note_port = clap::find_main_note_port(instance);
     if note_port.is_none() {
@@ -288,7 +312,7 @@ pub fn activate_node(
     }
 
     let processor = instance
-        .activate(|_, _| (), stream_config.as_clack_plugin_config())?
+        .activate(|_, _| (), bus.as_clack_plugin_config())?
         .start_processing()?;
 
     Ok(Node::new(Backend::Clap(ClapProcessor::new(
@@ -332,18 +356,21 @@ pub fn activate_vst3_node(
     class_id: &str,
     stream_config: &StreamAudioConfig,
 ) -> Result<(SharedPlugin, Node), Box<dyn Error>> {
+    // バスの幅で組む (デバイスのチャンネル数ではない)
+    let bus = bus_config(stream_config);
+
     // ホストはインスタンス化のための入口でしかないので、ここで作って捨ててよい
     // (`Plugin` がモジュールを自分で抱える)。
     let mut vst3_host = vst3_host::host::Vst3Host::builder()
-        .sample_rate(stream_config.sample_rate as f64)
+        .sample_rate(bus.sample_rate as f64)
         // CPAL が一度に渡してくる最大長。これを超えるブロックは
         // `vst3-host` 側が分割して処理する。
-        .block_size(stream_config.max_likely_buffer_size as usize)
+        .block_size(bus.max_likely_buffer_size as usize)
         // **エフェクトを載せるので入力バスが要る。** 0 にすると、繋いでも
         // 音が入らない音源専用の構成になる。音源側は入力を読まないだけなので、
         // 常に用意しておいて損はない
-        .input_channels(stream_config.output_channel_count)
-        .output_channels(stream_config.output_channel_count)
+        .input_channels(bus.output_channel_count)
+        .output_channels(bus.output_channel_count)
         .build()?;
 
     let mut plugin = vst3_host.load_plugin_class(path, class_id)?;
@@ -354,8 +381,8 @@ pub fn activate_vst3_node(
     let processor = Vst3Processor::new(
         shared.clone(),
         plugin_channels,
-        stream_config.output_channel_count,
-        stream_config,
+        bus.output_channel_count,
+        &bus,
     );
 
     Ok((shared, Node::new(Backend::Vst3(processor))))
@@ -375,25 +402,18 @@ pub fn reconfigure_vst3_track(
     shared: SharedPlugin,
     stream_config: &StreamAudioConfig,
 ) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
+    let bus = bus_config(stream_config);
     let plugin_channels = {
         let mut plugin = shared.lock();
         // reconfigure は処理中には呼べない
         plugin.stop_processing()?;
-        plugin.reconfigure(
-            stream_config.sample_rate as f64,
-            stream_config.max_likely_buffer_size as usize,
-        )?;
+        plugin.reconfigure(bus.sample_rate as f64, bus.max_likely_buffer_size as usize)?;
         plugin.start_processing()?;
         plugin.output_channel_count()
     };
 
     Ok(Box::new(TrackProcessor::new(Backend::Vst3(
-        Vst3Processor::new(
-            shared,
-            plugin_channels,
-            stream_config.output_channel_count,
-            stream_config,
-        ),
+        Vst3Processor::new(shared, plugin_channels, bus.output_channel_count, &bus),
     ))))
 }
 
@@ -449,19 +469,14 @@ fn make_stream_runner<S: FromSample<f32>>(
 
 /// オーディオスレッド上で動くデータ一式
 struct StreamAudioProcessor {
-    /// トラックごとの音源。None は音源未ロードのトラック。
-    tracks: Vec<Option<Box<TrackProcessor>>>,
-    /// 外した音源を (トラック番号, 音源) でメインスレッドへ返す口。
+    /// オーディオトラック一式。再生と書き出しで同じものを使う
+    graph: Graph,
+    /// 外した音源を (オーディオトラック番号, 音源) でメインスレッドへ返す口。
     /// どのインスタンスへ返すか分かるようトラック番号を添える。
     retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
     gui_events: Consumer<GuiMsg>,
-    /// 全トラックの出力を足し込むバッファ (インターリーブ済み)
-    mix: Vec<f32>,
-    /// **1トラック分の作業バッファ。** チェーンはここを通る。
-    ///
-    /// 各ノードが読んで上書きする形なので、トラックごとに独立した場所が要る
-    /// (`mix` へ直接書くと、前のトラックの音をエフェクトが拾ってしまう)。
-    scratch: Vec<f32>,
+    /// デバイスのチャンネル数。**グラフの中とは別**
+    /// (グラフは常に [`graph::BUS_CHANNELS`])
     output_channel_count: usize,
     transport: Transport,
     steady_counter: u64,
@@ -473,23 +488,19 @@ impl StreamAudioProcessor {
         retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
         transport_shared: TransportShared,
         output_channel_count: usize,
+        max_frames: usize,
     ) -> Self {
+        let mut graph = Graph::new();
+        // 想定される最大ブロック長ぶんを先に取っておく
+        // (オーディオスレッドで伸ばすと確保が起きる)
+        graph.reserve(max_frames);
         Self {
-            tracks: Vec::new(),
+            graph,
             retired,
             gui_events,
-            mix: Vec::new(),
-            scratch: Vec::new(),
             output_channel_count,
             transport: Transport::new(transport_shared),
             steady_counter: 0,
-        }
-    }
-
-    /// トラック数を確保する (足りなければ空きで埋める)
-    fn ensure_track(&mut self, track: usize) {
-        while self.tracks.len() <= track {
-            self.tracks.push(None);
         }
     }
 
@@ -504,9 +515,7 @@ impl StreamAudioProcessor {
     /// GUI からのメッセージをすべて取り出し、トラックごとのイベントに変換する。
     /// その後、再生中ならシーケンスのイベントを sample_count 分発行する。
     fn collect_gui_events(&mut self, sample_count: u64) {
-        for track in self.tracks.iter_mut().flatten() {
-            track.events.clear();
-        }
+        self.graph.clear_events();
 
         while let Ok(msg) = self.gui_events.pop() {
             match msg {
@@ -515,8 +524,8 @@ impl StreamAudioProcessor {
                     key,
                     velocity,
                 } => {
-                    if let Some(Some(target)) = self.tracks.get_mut(track) {
-                        target.events.push(BlockEvent::NoteOn {
+                    if let Some(events) = self.graph.events_mut(track) {
+                        events.push(BlockEvent::NoteOn {
                             offset: 0,
                             key: key.min(127) as u8,
                             velocity,
@@ -524,8 +533,8 @@ impl StreamAudioProcessor {
                     }
                 }
                 GuiMsg::NoteOff { track, key } => {
-                    if let Some(Some(target)) = self.tracks.get_mut(track) {
-                        target.events.push(BlockEvent::NoteOff {
+                    if let Some(events) = self.graph.events_mut(track) {
+                        events.push(BlockEvent::NoteOff {
                             offset: 0,
                             key: key.min(127) as u8,
                         });
@@ -537,8 +546,8 @@ impl StreamAudioProcessor {
                     id,
                     value,
                 } => {
-                    if let Some(Some(target)) = self.tracks.get_mut(track) {
-                        target.events.push(BlockEvent::Param {
+                    if let Some(events) = self.graph.events_mut(track) {
+                        events.push(BlockEvent::Param {
                             offset: 0,
                             node,
                             id,
@@ -549,21 +558,37 @@ impl StreamAudioProcessor {
                 GuiMsg::Transport(msg) => {
                     // 状態の更新は1回。消音が要るときは全トラックへ配る
                     if self.transport.handle_msg(msg) {
-                        for track in self.tracks.iter_mut().flatten() {
-                            transport::push_choke(&mut track.events, 0);
+                        for (_, processor) in self.graph.processors_mut() {
+                            transport::push_choke(processor.events_mut(), 0);
                         }
                     }
                 }
-                GuiMsg::SetTrack { track, processor } => {
-                    self.ensure_track(track);
-                    let previous = self.tracks[track].replace(processor);
+                GuiMsg::SetTrack {
+                    track,
+                    midi_track,
+                    processor,
+                } => {
+                    let Some(slot) = self.graph.track_mut(track) else {
+                        // 範囲外。処理器はここで落とさずメインスレッドへ返す
+                        self.retire(track, Some(processor));
+                        continue;
+                    };
+                    slot.midi_track = midi_track;
+                    slot.sends = if track == graph::MASTER {
+                        // マスターは送り側にならない
+                        Vec::new()
+                    } else {
+                        vec![graph::MASTER]
+                    };
+                    let previous = slot.processor.replace(processor);
                     self.retire(track, previous);
                 }
                 GuiMsg::ClearTrack { track } => {
-                    if let Some(slot) = self.tracks.get_mut(track) {
-                        let previous = slot.take();
-                        self.retire(track, previous);
-                    }
+                    let previous = self
+                        .graph
+                        .track_mut(track)
+                        .and_then(|slot| slot.processor.take());
+                    self.retire(track, previous);
                 }
             }
         }
@@ -571,69 +596,35 @@ impl StreamAudioProcessor {
         // 再生位置を1回だけ進めてから、トラックごとにイベントを発行する。
         // (オーディオスレッドで確保しないよう、区間の計画は固定長で持ち回る)
         let plan = self.transport.plan_block(sample_count);
-        if !plan.is_empty() {
-            for (index, slot) in self.tracks.iter_mut().enumerate() {
-                if let Some(track) = slot {
-                    self.transport.emit_track(index, &plan, &mut track.events);
-                }
-            }
-        }
+        self.graph.emit_from(&mut self.transport, &plan);
     }
 
     /// CPAL の出力バッファ1回分を処理する。
     ///
-    /// **トラックごとに作業バッファを通してから足し合わせる。** チェーンの各ノードが
-    /// バッファを読んで上書きする形なので、共有のミックスへ直接書かせると、
-    /// 前のトラックの音を次のトラックのエフェクトが拾ってしまう。
+    /// **音の組み立てはすべて [`Graph`] の中。** ここがやるのは、
+    /// グラフの出力 (常に2ch) をデバイスのチャンネル数へ移すところだけ。
     fn process<S: FromSample<f32>>(&mut self, data: &mut [S]) {
-        let sample_count = data.len() / self.output_channel_count.max(1);
+        let frames = data.len() / self.output_channel_count.max(1);
 
-        self.collect_gui_events(sample_count as u64);
+        self.collect_gui_events(frames as u64);
 
-        // ミックス用と作業用のバッファを用意する。
-        // 伸びるのは最初と、想定より長いブロックが来たときだけ
-        if self.mix.len() < data.len() {
-            self.mix.resize(data.len(), 0.0);
-        }
-        if self.scratch.len() < data.len() {
-            self.scratch.resize(data.len(), 0.0);
-        }
+        // 想定より長いブロックが来たときだけ伸びる (普段は起きない)
+        self.graph.reserve(frames);
 
         let steady = self.steady_counter;
-        // フィールドを個別に借りる (トラックと2つのバッファを同時に触るため)
-        let Self {
-            tracks,
-            mix,
-            scratch,
-            ..
-        } = self;
-        let mix = &mut mix[..data.len()];
-        let scratch = &mut scratch[..data.len()];
-        mix.fill(0.0);
-
-        for track in tracks.iter_mut().flatten() {
-            // 先頭が音源なら読まれずに上書きされる。エフェクトなら無音から始まる
-            scratch.fill(0.0);
-            match track.process(steady, scratch) {
-                Ok(()) => {}
+        self.graph
+            .process(steady, frames, &mut |track, error| match error {
                 // 想定内で、放っておけば直る。VST3 のエディタを開くときに
                 // 数秒ぶん出ることがあり (音源の生成が重い)、そのたびに
                 // オーディオスレッドから書き出すほうが害が大きい
-                Err(ProcessError::Busy) => continue,
-                Err(e) => {
-                    eprintln!("{e}");
-                    continue;
-                }
-            }
-            for (mixed, sample) in mix.iter_mut().zip(scratch.iter()) {
-                *mixed += *sample;
-            }
-        }
+                ProcessError::Busy => {}
+                e => eprintln!("オーディオトラック {}: {e}", track + 1),
+            });
 
-        for (out, mixed) in data.iter_mut().zip(self.mix.iter()) {
-            *out = FromSample::from_sample_(*mixed);
-        }
+        // グラフは 2ch。ここで初めてデバイスに合わせる
+        let master = self.graph.master(frames);
+        graph::write_to_device(master, data, self.output_channel_count);
 
-        self.steady_counter += sample_count as u64;
+        self.steady_counter += frames as u64;
     }
 }

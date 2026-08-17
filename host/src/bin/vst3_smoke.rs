@@ -13,6 +13,7 @@
 //! 使い方: cargo run -p clap-host-test --bin vst3_smoke -- <path\to\plugin.vst3>
 
 use clap_host_test::audio::config::StreamAudioConfig;
+use clap_host_test::audio::graph::Graph;
 use clap_host_test::audio::offline::{self, RenderSetup};
 use clap_host_test::audio::transport::{self, Transport, TransportMsg, TransportShared};
 use clap_host_test::audio::{self, ProcessError};
@@ -161,7 +162,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ---- 3. オフラインレンダリング (WAV 書き出しと同じ経路) ----
     // 書き出しは処理器をオーディオスレッドから借りてその場で回す作りなので、
     // 実時間の再生が通っても、こちらが通るとは限らない。
-    let mut processors = vec![(0usize, processor)];
+    // オーディオトラックは 0 がマスターなので、打ち込み0 は 1 に載る
+    let mut graph = Graph::new();
+    graph.place(1, Some(0), processor);
     let setup = RenderSetup {
         sequences: vec![editor
             .to_events_for_track(0, SAMPLE_RATE)
@@ -169,11 +172,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         end_sample,
         tail_samples: (offline::TAIL_SECONDS * SAMPLE_RATE) as u64,
         block_frames: BLOCK_SIZE,
-        channels: CHANNELS,
         sample_rate: SAMPLE_RATE as u32,
     };
-    let rendered = offline::render(&mut processors, setup);
-    let processor = processors
+    let rendered = offline::render(&mut graph, setup);
+    let processor = graph
+        .take_processors()
         .pop()
         .map(|(_, processor)| processor)
         .ok_or("借りた処理器が戻ってこなかった")?;

@@ -11,6 +11,7 @@ use clap_host_test::{
 };
 
 use audio::config::StreamAudioConfig;
+use audio::graph;
 use audio::offline::{RenderSetup, TAIL_SECONDS};
 use audio::transport::{TransportMsg, TransportShared};
 use audio::vst3::SharedPlugin;
@@ -571,7 +572,7 @@ impl App {
         };
 
         // 音源の状態を集めてから組み立てる (音源はエディタではなく App 側にある)
-        let snapshots = self.plugin_snapshots();
+        let snapshots = self.audio_track_snapshots();
         let text = match project::to_string(&self.editor.editor, &snapshots) {
             Ok(text) => text,
             Err(e) => {
@@ -618,12 +619,18 @@ impl App {
             Ok(loaded) => {
                 let notes = loaded.editor.notes.len();
                 let tracks = loaded.editor.tracks.len();
-                let wanted = loaded.plugins.iter().flatten().count();
+                let wanted = loaded
+                    .audio_tracks
+                    .iter()
+                    .filter(|track| !track.nodes.is_empty())
+                    .count();
 
                 self.editor.replace_project(loaded.editor);
                 // 音源はシーケンスを入れ替えたあとに載せる
                 // (トラック数が揃ってからでないと行き先が決まらない)
-                let failures = self.restore_plugins(loaded.plugins);
+                let mut failures = self.restore_audio_tracks(loaded.audio_tracks);
+                // 16本に収まらず載せられなかったぶんも同じ扱いで知らせる
+                failures.extend(loaded.overflow);
 
                 self.set_project_path(path.clone());
                 self.error = None;
@@ -665,12 +672,17 @@ impl App {
     /// 借りた処理器をオーディオスレッドへ返す。
     ///
     /// **返さないと音が出なくなる。** 途中で諦めるときも必ず通ること。
+    /// `processors` の番号は**オーディオトラック**のもの。
     fn return_processors(&mut self, processors: Vec<(usize, Box<audio::TrackProcessor>)>) {
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
         for (track, processor) in processors {
-            let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
+            let _ = engine.producer.push(GuiMsg::SetTrack {
+                track,
+                midi_track: graph::midi_track_for(track),
+                processor,
+            });
         }
     }
 
@@ -696,7 +708,6 @@ impl App {
             tail_samples: (TAIL_SECONDS * sample_rate) as u64,
             // activate 時に宣言した上限。これを超えるブロックは渡せない。
             block_frames: config.max_likely_buffer_size as usize,
-            channels: config.output_channel_count,
             sample_rate: config.sample_rate,
         }
     }
@@ -724,7 +735,8 @@ impl App {
             .tracks
             .iter()
             .enumerate()
-            .filter_map(|(track, slot)| slot.as_ref().map(|_| track))
+            // 借りる相手はオーディオスレッド。番号はオーディオトラックのもの
+            .filter_map(|(track, slot)| slot.as_ref().and_then(|_| graph::audio_track_for(track)))
             .collect();
 
         // ---- 借りる ----
@@ -752,8 +764,14 @@ impl App {
             dropped.extend(failed);
         }
 
+        // 借りた処理器をグラフへ載せて回す。**再生と同じ経路を通すため**
         let setup = self.render_setup(&export_config);
-        let rendered = audio::offline::render(&mut processors, setup);
+        let mut graph = audio::graph::Graph::new();
+        for (track, processor) in processors {
+            graph.place(track, graph::midi_track_for(track), processor);
+        }
+        let rendered = audio::offline::render(&mut graph, setup);
+        let mut processors = graph.take_processors();
 
         // ---- 元のレートへ戻す ----
         // **ここを飛ばすと、書き出し後に再生できなくなる。**
@@ -1104,7 +1122,9 @@ impl App {
     /// リサンプリングではなく**音源自身をそのレートで動かす**ので、本当にその
     /// レートで鳴らした音になる。
     ///
-    /// 戻り値は (動かし直せた処理器, 失敗したトラック番号)。
+    /// 戻り値は (動かし直せた処理器, 失敗した**打ち込み**トラック番号)。
+    /// 処理器の番号はオーディオトラックのものだが、失敗の報告は画面に出すので
+    /// 打ち込み側の番号へ直して返す。
     ///
     /// **失敗したトラックの処理器は失われる。** CLAP は deactivate まで進んだあとの
     /// activate で落ちうるためで、そのトラックは呼び出し側が音源ごと外すこと
@@ -1118,11 +1138,12 @@ impl App {
         let mut failed = Vec::new();
 
         for (track, processor) in processors {
+            let midi_track = graph::midi_track_for(track).unwrap_or(0);
             match self.switch_one_rate(track, processor, config) {
                 Ok(processor) => switched.push((track, processor)),
                 Err(e) => {
-                    eprintln!("トラック {} のレート切り替えに失敗: {e}", track + 1);
-                    failed.push(track);
+                    eprintln!("トラック {} のレート切り替えに失敗: {e}", midi_track + 1);
+                    failed.push(midi_track);
                 }
             }
         }
@@ -1140,7 +1161,13 @@ impl App {
         processor: Box<audio::TrackProcessor>,
         config: &StreamAudioConfig,
     ) -> Result<Box<audio::TrackProcessor>, Box<dyn Error>> {
-        let Some(audio) = self.tracks.get_mut(track).and_then(|slot| slot.as_mut()) else {
+        // `track` はオーディオトラック番号。`self.tracks` は打ち込み番号で並ぶ
+        let midi_track = graph::midi_track_for(track).ok_or("マスターには音源がありません")?;
+        let Some(audio) = self
+            .tracks
+            .get_mut(midi_track)
+            .and_then(|slot| slot.as_mut())
+        else {
             return Err("このトラックに音源がありません".into());
         };
 
@@ -1171,7 +1198,11 @@ impl App {
         let Some(engine) = &mut self.engine else {
             return;
         };
-        while let Ok((track, processor)) = engine.retired.pop() {
+        while let Ok((audio_track, processor)) = engine.retired.pop() {
+            // **返ってくるのはオーディオトラック番号。** `self.tracks` と
+            // `self.retiring` は打ち込みトラック番号で並ぶので直す
+            let track = graph::midi_track_for(audio_track).unwrap_or(0);
+
             // 差し替えで外したインスタンスが待っていればそちらへ返す。
             // 待っていない場合 (書き出しの借り出しが時間切れになったときなど) は
             // 今そのトラックに載っているものが当人なので、欄から降ろして始末する
@@ -1255,6 +1286,16 @@ impl App {
         state: Option<&[u8]>,
     ) -> Result<bool, String> {
         // 最初のロード時にストリームを用意する
+        // **音を出せる系統は16まで。** 打ち込みトラックには上限が無いので、
+        // 先に行き先を確かめる (0 はマスターなので1つずれる)
+        let Some(audio_index) = graph::audio_track_for(track) else {
+            return Err(format!(
+                "トラック {} には音源を載せられません。音を出せるのは {} 本までです",
+                track + 1,
+                graph::AUDIO_TRACKS - 1
+            ));
+        };
+
         if self.engine.is_none() {
             let engine = start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
             self.engine = Some(engine);
@@ -1291,7 +1332,11 @@ impl App {
             None => true,
         };
 
-        let _ = engine.producer.push(GuiMsg::SetTrack { track, processor });
+        let _ = engine.producer.push(GuiMsg::SetTrack {
+            track: audio_index,
+            midi_track: Some(track),
+            processor,
+        });
 
         // 未ロード中に動かした再生ヘッドの位置を引き継ぐ
         let spq = self
@@ -1315,20 +1360,40 @@ impl App {
         Ok(restored)
     }
 
-    /// 保存用に、各トラックの音源とその状態を集める
-    fn plugin_snapshots(&mut self) -> Vec<Option<PluginSnapshot>> {
-        let count = self.editor.editor.track_count();
-        let mut snapshots = Vec::with_capacity(count);
-        for track in 0..count {
-            let slot = self.tracks.get_mut(track).and_then(|slot| slot.as_mut());
-            snapshots.push(slot.map(|audio| PluginSnapshot {
-                kind: audio.kind(),
-                path: audio.path.clone(),
-                id: audio.id.clone(),
-                state: audio.capture_state(),
-            }));
+    /// 保存用に、各オーディオトラックの中身を集める。
+    ///
+    /// **`self.tracks` は打ち込みトラック番号で並んでいる。** 画面から作れるのは
+    /// まだ「打ち込み1本につき音源1つ」なので、[`graph::audio_track_for`] で
+    /// オーディオトラックへ写す (0 はマスターなので1つずれる)。
+    fn audio_track_snapshots(&mut self) -> Vec<project::AudioTrackSnapshot> {
+        let mut tracks: Vec<project::AudioTrackSnapshot> = (0..project::AUDIO_TRACKS)
+            .map(|_| project::AudioTrackSnapshot::default())
+            .collect();
+
+        for midi_track in 0..self.editor.editor.track_count() {
+            let Some(index) = graph::audio_track_for(midi_track) else {
+                continue; // 16本に収まらないぶんは、そもそも載っていない
+            };
+            let Some(audio) = self
+                .tracks
+                .get_mut(midi_track)
+                .and_then(|slot| slot.as_mut())
+            else {
+                continue;
+            };
+            tracks[index] = project::AudioTrackSnapshot {
+                name: String::new(),
+                nodes: vec![PluginSnapshot {
+                    kind: audio.kind(),
+                    path: audio.path.clone(),
+                    id: audio.id.clone(),
+                    state: audio.capture_state(),
+                }],
+                midi_track: Some(midi_track),
+                sends: vec![project::MASTER],
+            };
         }
-        snapshots
+        tracks
     }
 
     /// 今載っている音源を全部降ろす (プロジェクトを開く前の片付け)
@@ -1338,7 +1403,9 @@ impl App {
         };
         for track in 0..self.tracks.len() {
             if let Some(previous) = self.tracks[track].take() {
-                let _ = engine.producer.push(GuiMsg::ClearTrack { track });
+                if let Some(index) = graph::audio_track_for(track) {
+                    let _ = engine.producer.push(GuiMsg::ClearTrack { track: index });
+                }
                 // 処理器が返ってくるまで生かしておく (解放はメインスレッド)
                 self.retiring.push_back((track, previous));
             }
@@ -1347,15 +1414,34 @@ impl App {
 
     /// プロジェクトに書かれていた音源を読み直す。
     /// 失敗したトラックの説明を返す (そのトラックは音源なしのままになる)。
-    fn restore_plugins(&mut self, plugins: Vec<Option<PluginSnapshot>>) -> Vec<String> {
+    ///
+    /// **画面が扱えるのはまだ「打ち込み1本につき音源1つ」。** チェーンの2段目
+    /// 以降が書かれていても載せられないので、名指しで知らせる (黙って捨てない)。
+    fn restore_audio_tracks(&mut self, tracks: Vec<project::AudioTrackSnapshot>) -> Vec<String> {
         self.unload_all_plugins();
 
         let mut failures = Vec::new();
-        for (track, slot) in plugins.into_iter().enumerate() {
-            let Some(plugin) = slot else { continue };
+        for (index, track) in tracks.into_iter().enumerate() {
+            let Some(plugin) = track.nodes.first().cloned() else {
+                continue;
+            };
+            // 打ち込みトラックが書かれていなければ、番号から割り出す
+            let midi_track = track
+                .midi_track
+                .or_else(|| graph::midi_track_for(index))
+                .unwrap_or(0);
             let label = file_label(&plugin.path);
+
+            if track.nodes.len() > 1 {
+                failures.push(format!(
+                    "・オーディオトラック {index}: {} 段のうち先頭だけ載せました \
+                     (画面はまだ1段しか扱えません)",
+                    track.nodes.len()
+                ));
+            }
+
             match self.load_plugin(
-                track,
+                midi_track,
                 plugin.kind,
                 &plugin.path,
                 &plugin.id,
@@ -1364,9 +1450,9 @@ impl App {
                 Ok(true) => {}
                 Ok(false) => failures.push(format!(
                     "・トラック {}: {label} は読み込めましたが、音作りの復元に失敗しました",
-                    track + 1
+                    midi_track + 1
                 )),
-                Err(e) => failures.push(format!("・トラック {}: {label} — {e}", track + 1)),
+                Err(e) => failures.push(format!("・トラック {}: {label} — {e}", midi_track + 1)),
             }
         }
         failures

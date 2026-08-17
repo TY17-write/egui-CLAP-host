@@ -64,10 +64,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         id: id.clone(),
         state: saved.clone(),
     };
-    let text = project::to_string(&MidiEditor::default(), &[Some(snapshot)])?;
+    // オーディオトラック1 (0 はマスター) の1段目に載せる
+    let mut tracks: Vec<project::AudioTrackSnapshot> = (0..project::AUDIO_TRACKS)
+        .map(|_| project::AudioTrackSnapshot::default())
+        .collect();
+    tracks[1] = project::AudioTrackSnapshot {
+        name: String::new(),
+        nodes: vec![snapshot],
+        midi_track: Some(0),
+        sends: vec![project::MASTER],
+    };
+
+    let text = project::to_string(&MidiEditor::default(), &tracks)?;
     let loaded = project::from_str(&text)?;
-    let restored_snapshot = loaded.plugins[0]
-        .as_ref()
+    let restored_snapshot = loaded.audio_tracks[1]
+        .nodes
+        .first()
         .ok_or("音源が .ron から戻ってきません")?;
 
     // ---- 3. 別インスタンスへ流し込む ----

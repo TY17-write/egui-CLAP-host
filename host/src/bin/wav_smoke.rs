@@ -9,9 +9,10 @@
 //! 使い方: cargo run -p clap-host-test --bin wav_smoke -- <path\to\plugin.clap> [out.wav]
 
 use clack_host::prelude::*;
+use clap_host_test::audio::activate_track;
 use clap_host_test::audio::config::StreamAudioConfig;
+use clap_host_test::audio::graph::{self, Graph};
 use clap_host_test::audio::offline::{self, RenderSetup};
-use clap_host_test::audio::{activate_track, TrackProcessor};
 use clap_host_test::discovery;
 use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use clap_host_test::sequencer::{MidiEditor, Note};
@@ -51,14 +52,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         sample_format: cpal::SampleFormat::F32,
     };
 
-    // トラックごとに1インスタンス (ホスト本体と同じ構成にする)
+    // 打ち込みトラックごとに1インスタンス (ホスト本体と同じ構成にする)。
+    // オーディオトラックは 0 がマスターなので、1つずらして載せる
     let mut instances = Vec::new();
-    let mut processors: Vec<(usize, Box<TrackProcessor>)> = Vec::new();
-    for track in 0..2 {
+    let mut graph = Graph::new();
+    for midi_track in 0..2 {
         let mut instance = instantiate(&entry, &target.id)?;
         let processor = activate_track(&mut instance, &stream_config)?;
+        let audio_track = graph::audio_track_for(midi_track).expect("2本なら収まる");
+        graph.place(audio_track, Some(midi_track), processor);
         instances.push(instance);
-        processors.push((track, processor));
     }
 
     // ---- シーケンス: トラック1 に C4 [0,1拍) / トラック2 に G4 [2,3拍) @120bpm ----
@@ -96,14 +99,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         end_sample,
         tail_samples: (offline::TAIL_SECONDS * rate) as u64,
         block_frames: BLOCK_SIZE as usize,
-        channels: CHANNELS,
         sample_rate: SAMPLE_RATE,
     };
 
-    let rendered = offline::render(&mut processors, setup);
+    let rendered = offline::render(&mut graph, setup);
 
     // 使い終わった処理器はメインスレッドで停止・解放する
-    for ((_, processor), mut instance) in processors.into_iter().zip(instances) {
+    for ((_, processor), mut instance) in graph.take_processors().into_iter().zip(instances) {
         let Some(clap_host_test::audio::RetiredProcessor::Clap(stopped)) =
             processor.into_single_retired()
         else {
