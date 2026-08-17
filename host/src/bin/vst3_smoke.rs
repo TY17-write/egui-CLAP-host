@@ -195,8 +195,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // ---- 後始末 (メインスレッドで止めてから解放する) ----
-    let audio::RetiredProcessor::Vst3(retired) = processor.into_retired() else {
-        return Err("VST3 を載せたのに別形式の処理器が返ってきた".into());
+    let Some(audio::RetiredProcessor::Vst3(retired)) = processor.into_single_retired() else {
+        return Err("VST3 1段を載せたのに別のものが返ってきた".into());
     };
     retired.lock().stop_processing()?;
     drop(retired);

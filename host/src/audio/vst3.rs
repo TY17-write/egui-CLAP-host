@@ -113,15 +113,21 @@ pub struct Vst3Processor {
 
 impl Vst3Processor {
     /// `plugin_channels` はプラグインの出力チャンネル数 (CPAL 側とは違ってよい)。
+    ///
+    /// **入力チャンネル数はホスト側が決めている。** `vst3-host` には
+    /// `output_channel_count` はあるが入力側を問い合わせる術が無く、
+    /// `Vst3HostBuilder::input_channels` で指定した数にバスが並ぶ。
+    /// そのため `mod.rs` が渡した値をそのまま使う。
     pub fn new(
         plugin: SharedPlugin,
         plugin_channels: usize,
+        input_channels: usize,
         stream_config: &StreamAudioConfig,
     ) -> Self {
         Self {
             plugin,
             buffers: AudioBuffers::new(
-                0,
+                input_channels,
                 plugin_channels.max(1),
                 stream_config.max_likely_buffer_size as usize,
                 stream_config.sample_rate as f64,
@@ -141,17 +147,26 @@ impl Vst3Processor {
         self.plugin
     }
 
-    /// 1ブロック処理して `mix` に足し込む。
-    /// `mix` の長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
-    pub fn process(&mut self, events: &BlockEvents, mix: &mut [f32]) -> Result<(), ProcessError> {
+    /// 1ブロック処理して `buf` を**置き換える**。
+    ///
+    /// `buf` は入力と出力を兼ねる。入ってきた音を読み、処理した音で上書きする。
+    /// 長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
+    ///
+    /// `node` はチェーンの何段目か。**自分に宛てたパラメータだけを拾う**ために使う。
+    pub fn process(
+        &mut self,
+        events: &BlockEvents,
+        node: usize,
+        buf: &mut [f32],
+    ) -> Result<(), ProcessError> {
         let Some(mut plugin) = self.plugin.try_lock() else {
             // メインスレッドが音源を使っている。このブロックは無音のまま返し、
             // イベントは取っておいて次に送る。
-            self.defer(events);
+            self.defer(events, node);
             return Err(ProcessError::Busy);
         };
 
-        let frames = mix.len() / self.output_channels;
+        let frames = buf.len() / self.output_channels;
         if frames == 0 {
             return Ok(());
         }
@@ -170,6 +185,9 @@ impl Vst3Processor {
         }
         self.deferred.clear();
         for event in events {
+            if !addressed_to(event, node) {
+                continue;
+            }
             send(
                 &mut plugin,
                 &mut self.active,
@@ -179,60 +197,117 @@ impl Vst3Processor {
             );
         }
 
-        self.buffers.clear();
+        // 出力だけを 0 にする。**入力は今から書くので消してはいけない**
+        for channel in self.buffers.outputs.iter_mut() {
+            channel.fill(0.0);
+        }
+        feed_input(&mut self.buffers, buf, self.output_channels, frames);
         plugin.process_audio(&mut self.buffers)?;
         drop(plugin);
 
-        self.mix_into(mix, frames);
+        self.write_into(buf, frames);
         Ok(())
     }
 
     /// 送れなかったイベントを取っておく。上限を超えたぶんは捨てる。
-    fn defer(&mut self, events: &BlockEvents) {
+    ///
+    /// **他のノード宛てのパラメータは取っておかない。** 持ち越すと、次に
+    /// 取れたブロックで自分に効いてしまう。
+    fn defer(&mut self, events: &BlockEvents, node: usize) {
         for event in events {
             if self.deferred.len() >= MAX_DEFERRED {
                 return;
+            }
+            if !addressed_to(event, node) {
+                continue;
             }
             // 次のブロックで送るので、ブロック内の位置は先頭に潰す
             self.deferred.push(at_block_start(*event));
         }
     }
 
-    /// プラグインの出力を CPAL のインターリーブ形式へ移して**加算**する。
+    /// プラグインの出力を CPAL のインターリーブ形式へ移して**書き込む** (加算ではない)。
     /// チャンネル数が食い違うときは複製・平均で合わせる (`buffers.rs` と同じ方針)。
-    fn mix_into(&self, mix: &mut [f32], frames: usize) {
+    ///
+    /// **上書きなのは、このバッファが次のノードの入力になるため** (`buffers.rs` の
+    /// `write_into` と同じ理由)。トラック同士を混ぜるのは呼び出し側の仕事。
+    fn write_into(&self, buf: &mut [f32], frames: usize) {
         let outputs = &self.buffers.outputs;
         let channels = self.output_channels;
 
         match outputs.len() {
-            0 => {}
+            // 出力バスが無い。入ってきた音を残さず無音にする
+            // (上書きの約束を守るため。加算だった頃は何もしないのが正しかった)
+            0 => buf[..frames * channels].fill(0.0),
             // モノラル出力は全チャンネルへ複製する
             1 => {
                 let source = &outputs[0];
-                for (frame, samples) in mix.chunks_exact_mut(channels).take(frames).enumerate() {
+                for (frame, samples) in buf.chunks_exact_mut(channels).take(frames).enumerate() {
                     let value = source[frame];
                     for sample in samples {
-                        *sample += value;
+                        *sample = value;
                     }
                 }
             }
             // モノラル出力へはダウンミックスする
             count if channels == 1 => {
                 let scale = 1.0 / count as f32;
-                for (frame, sample) in mix.iter_mut().take(frames).enumerate() {
+                for (frame, sample) in buf.iter_mut().take(frames).enumerate() {
                     let total: f32 = outputs.iter().map(|channel| channel[frame]).sum();
-                    *sample += total * scale;
+                    *sample = total * scale;
                 }
             }
             // 足りないチャンネルは最後のもので埋める (2ch 出力に 1ch 音源は上で処理済み)
             count => {
-                for (frame, samples) in mix.chunks_exact_mut(channels).take(frames).enumerate() {
+                for (frame, samples) in buf.chunks_exact_mut(channels).take(frames).enumerate() {
                     for (channel, sample) in samples.iter_mut().enumerate() {
-                        *sample += outputs[channel.min(count - 1)][frame];
+                        *sample = outputs[channel.min(count - 1)][frame];
                     }
                 }
             }
         }
+    }
+}
+
+/// 入ってきた音をプラグインの入力バッファへ配る。
+///
+/// **入力バスが無ければ何もしない。** 音源はこちらに来る。
+/// チャンネル数が食い違うときの扱いは `write_into` と揃える。
+///
+/// 自由関数にしてあるのは、呼び出し時点で `plugin` のロックを握っており
+/// `&mut self` を取れないため (`resize_buffers` と同じ事情)。
+fn feed_input(buffers: &mut AudioBuffers, buf: &[f32], channels: usize, frames: usize) {
+    let inputs = &mut buffers.inputs;
+    match inputs.len() {
+        0 => {}
+        // モノラル入力へは平均で落とす
+        1 => {
+            let scale = 1.0 / channels as f32;
+            for (frame, sample) in inputs[0].iter_mut().take(frames).enumerate() {
+                let base = frame * channels;
+                *sample = buf[base..base + channels].iter().sum::<f32>() * scale;
+            }
+        }
+        // 足りないチャンネルは最後のもので埋める
+        _ => {
+            for (index, input) in inputs.iter_mut().enumerate() {
+                let source = index.min(channels - 1);
+                for (frame, sample) in input.iter_mut().take(frames).enumerate() {
+                    *sample = buf[frame * channels + source];
+                }
+            }
+        }
+    }
+}
+
+/// このノードが受け取るべきイベントか。
+///
+/// 音符・CC・消音はトラックの全ノードへ配る (受け取れないノードは自分で捨てる)。
+/// **パラメータだけは宛先を見る。**
+fn addressed_to(event: &BlockEvent, node: usize) -> bool {
+    match event {
+        BlockEvent::Param { node: target, .. } => *target == node,
+        _ => true,
     }
 }
 
@@ -316,7 +391,10 @@ fn send(
                 }
             }
         }
-        BlockEvent::Param { offset, id, value } => {
+        // 宛先の振り分けは `addressed_to` で済ませてある
+        BlockEvent::Param {
+            offset, id, value, ..
+        } => {
             // パラメータ UI は現在無効なので、ここを通るのは鍵盤 UI 経由のときだけ。
             // VST3 の値域は 0.0〜1.0 に正規化されている。
             let _ = plugin.set_parameter_at(id, value.clamp(0.0, 1.0), clamp(offset));
@@ -352,8 +430,11 @@ fn at_block_start(event: BlockEvent) -> BlockEvent {
         },
         BlockEvent::NoteOff { key, .. } => BlockEvent::NoteOff { offset: 0, key },
         BlockEvent::Choke { .. } => BlockEvent::Choke { offset: 0 },
-        BlockEvent::Param { id, value, .. } => BlockEvent::Param {
+        BlockEvent::Param {
+            node, id, value, ..
+        } => BlockEvent::Param {
             offset: 0,
+            node,
             id,
             value,
         },

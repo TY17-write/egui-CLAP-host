@@ -53,19 +53,24 @@ impl ClapProcessor {
         self.audio_processor.stop_processing()
     }
 
-    /// 1ブロック処理して `mix` に足し込む。
-    /// `mix` の長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
+    /// 1ブロック処理して `buf` を**置き換える**。
+    ///
+    /// `buf` は入力と出力を兼ねる。入ってきた音を読み、処理した音で上書きする。
+    /// 長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
+    ///
+    /// `node` はチェーンの何段目か。**自分に宛てたパラメータだけを拾う**ために使う。
     pub fn process(
         &mut self,
         events: &BlockEvents,
+        node: usize,
         steady: u64,
-        mix: &mut [f32],
+        buf: &mut [f32],
     ) -> Result<(), ProcessError> {
-        self.translate(events);
+        self.translate(events, node);
 
-        self.buffers.ensure_buffer_size_matches(mix.len());
+        self.buffers.ensure_buffer_size_matches(buf.len());
         let input_events = self.native.as_input();
-        let (ins, mut outs) = self.buffers.prepare_plugin_buffers(mix.len());
+        let (ins, mut outs) = self.buffers.prepare_plugin_buffers(buf.len(), buf);
 
         self.audio_processor.process(
             &ins,
@@ -75,14 +80,15 @@ impl ClapProcessor {
             Some(steady),
             None,
         )?;
-        self.buffers.mix_into(mix);
+        self.buffers.write_into(buf);
         Ok(())
     }
 
     /// 中立のイベント列を CLAP の形へ移す。
     ///
-    /// ノート入力ポートが無いプラグインにはノートを送らない (パラメータは送る)。
-    fn translate(&mut self, events: &BlockEvents) {
+    /// ノート入力ポートが無いプラグインにはノートを送らない。
+    /// パラメータは**自分に宛てたものだけ**を送る (`node` で振り分ける)。
+    fn translate(&mut self, events: &BlockEvents, node: usize) {
         self.native.clear();
         for event in events {
             match *event {
@@ -98,7 +104,14 @@ impl ClapProcessor {
                     number,
                     value,
                 } => self.push_cc(offset, number, value),
-                BlockEvent::Param { offset, id, value } => {
+                // 自分に宛てたものだけ。同じエフェクトを2段刺したとき、
+                // 片方だけを動かせなくなるため
+                BlockEvent::Param {
+                    offset,
+                    node: target,
+                    id,
+                    value,
+                } if target == node => {
                     // 中立側は素の u32。CLAP の ID に載らない値は捨てる
                     if let Some(id) = ClapId::from_raw(id) {
                         self.native.push(&ParamValueEvent::new(
@@ -109,6 +122,8 @@ impl ClapProcessor {
                         ));
                     }
                 }
+                // 他のノード宛て
+                BlockEvent::Param { .. } => {}
             }
         }
     }

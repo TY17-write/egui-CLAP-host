@@ -109,6 +109,8 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
     let _ = transport.handle_msg(TransportMsg::Play);
 
     let mut mix = vec![0.0f32; block_len];
+    // トラック1本分の作業バッファ。理由は `audio::mod` の `scratch` と同じ
+    let mut scratch = vec![0.0f32; block_len];
     let mut samples = Vec::with_capacity((total_frames as usize + block_frames) * channels);
     let mut failures = FailureLog::default();
 
@@ -118,7 +120,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
         processor.events.clear();
         transport::push_choke(&mut processor.events, 0);
     }
-    process_block(processors, 0, &mut mix, &mut failures);
+    process_block(processors, 0, &mut mix, &mut scratch, &mut failures);
 
     // 端数ブロックを作らず、常に同じ長さで回して最後に切る。
     // min_frames_count を下回るブロックをプラグインへ渡さずに済む。
@@ -133,7 +135,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
             }
         }
 
-        process_block(processors, steady, &mut mix, &mut failures);
+        process_block(processors, steady, &mut mix, &mut scratch, &mut failures);
         samples.extend_from_slice(&mix);
 
         steady += block_frames as u64;
@@ -155,20 +157,29 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
 /// 1ブロックぶんを全トラック処理して `mix` にまとめる。
 /// `mix` の長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
 /// イベントは呼び出し側が各処理器へ積んでおくこと。
+///
+/// **再生時 (`audio::mod`) と同じ形にしてある。** トラックごとに `scratch` を
+/// 通してから足す。ここだけ違う組み方をすると、書き出しと再生で音が変わる。
 fn process_block(
     processors: &mut [(usize, Box<TrackProcessor>)],
     steady: u64,
     mix: &mut [f32],
+    scratch: &mut [f32],
     failures: &mut FailureLog,
 ) {
     mix.fill(0.0);
 
     for (track, processor) in processors.iter_mut() {
+        scratch.fill(0.0);
         // 失敗したトラックはこのブロックが無音のまま混ざる。
         // 黙って進めると中身の欠けたファイルが「成功」として出てしまうので、
         // 呼び出し側へ持ち帰って知らせる。
-        if let Err(e) = processor.process(steady, mix) {
+        if let Err(e) = processor.process(steady, scratch) {
             failures.record(*track, e);
+            continue;
+        }
+        for (mixed, sample) in mix.iter_mut().zip(scratch.iter()) {
+            *mixed += *sample;
         }
     }
 }

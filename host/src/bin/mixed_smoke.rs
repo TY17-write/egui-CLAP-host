@@ -147,7 +147,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ---- 後始末: 形式ごとに返し方が違う ----
     let mut clap_stopped = None;
     for (track, processor) in processors {
-        match processor.into_retired() {
+        let Some(retired) = processor.into_single_retired() else {
+            return Err("1段だけ載せたのに別のものが返ってきた".into());
+        };
+        match retired {
             audio::RetiredProcessor::Clap(stopped) => clap_stopped = Some(stopped),
             audio::RetiredProcessor::Vst3(shared) => {
                 if track != 1 {

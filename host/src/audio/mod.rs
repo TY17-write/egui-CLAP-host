@@ -78,6 +78,8 @@ pub enum GuiMsg {
     },
     ParamValue {
         track: usize,
+        /// チェーンの何段目に宛てたものか (0 が先頭)
+        node: usize,
         id: u32,
         value: f64,
     },
@@ -103,11 +105,56 @@ pub enum Backend {
     Vst3(Vst3Processor),
 }
 
-/// オーディオスレッドが持つトラック1本ぶんの処理器一式
-pub struct TrackProcessor {
-    /// このブロックで送るイベント (バックエンドに依らない形)
-    events: BlockEvents,
+/// チェーンの1段。音源とエフェクトを区別しない。
+///
+/// **違いは入力ポートを持つかどうかだけ**で、それはプラグインが自分で申告する。
+/// 入力ポートを持たないノード (音源) は入ってきた音を読まずに上書きするので、
+/// チェーンの途中に置けばそこまでの音が消える。
+pub struct Node {
     backend: Backend,
+}
+
+impl Node {
+    pub fn new(backend: Backend) -> Self {
+        Self { backend }
+    }
+
+    /// メインスレッドへ返せる形にする (このメソッド自体もメインスレッドで呼ぶ)
+    pub fn into_retired(self) -> RetiredProcessor {
+        match self.backend {
+            Backend::Clap(processor) => RetiredProcessor::Clap(processor.into_stopped()),
+            Backend::Vst3(processor) => RetiredProcessor::Vst3(processor.into_shared()),
+        }
+    }
+
+    /// 1ブロック処理して `buf` を置き換える。
+    /// `index` はチェーンの何段目か (自分宛てのパラメータを拾うために使う)。
+    fn process(
+        &mut self,
+        events: &BlockEvents,
+        index: usize,
+        steady: u64,
+        buf: &mut [f32],
+    ) -> Result<(), ProcessError> {
+        match &mut self.backend {
+            Backend::Clap(processor) => processor.process(events, index, steady, buf),
+            Backend::Vst3(processor) => processor.process(events, index, buf),
+        }
+    }
+}
+
+/// オーディオスレッドが持つトラック1本ぶんの処理器一式。
+///
+/// **ノードを上から順に通す。** 各ノードは渡されたバッファを読んで上書きするので、
+/// 前段の出力がそのまま次段の入力になる。
+pub struct TrackProcessor {
+    /// このブロックでこのトラックに届いたイベント (バックエンドに依らない形)。
+    ///
+    /// **全ノードへ配る。** 受け取れないノードは自分で捨てる。ただし
+    /// パラメータだけは宛先を持ち、その段でしか効かない
+    /// ([`BlockEvent::Param`](events::BlockEvent::Param))。
+    events: BlockEvents,
+    nodes: Vec<Node>,
 }
 
 /// オーディオスレッドから外した処理器。メインスレッドで始末するために形式を保つ。
@@ -120,19 +167,43 @@ pub enum RetiredProcessor {
 }
 
 impl TrackProcessor {
+    /// 1段だけのトラックを作る
     pub fn new(backend: Backend) -> Self {
+        Self::from_node(Node::new(backend))
+    }
+
+    /// 1段だけのトラックを作る
+    pub fn from_node(node: Node) -> Self {
         Self {
             events: BlockEvents::with_capacity(128),
-            backend,
+            nodes: vec![node],
         }
     }
 
-    /// メインスレッドへ返せる形にする (このメソッド自体もメインスレッドで呼ぶ)
-    pub fn into_retired(self) -> RetiredProcessor {
-        match self.backend {
-            Backend::Clap(processor) => RetiredProcessor::Clap(processor.into_stopped()),
-            Backend::Vst3(processor) => RetiredProcessor::Vst3(processor.into_shared()),
+    /// チェーンの末尾に足す。**メインスレッドで組み立てること** (確保が起きる)
+    pub fn push_node(&mut self, node: Node) {
+        self.nodes.push(node);
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// チェーンの全ノードを上から順に、メインスレッドへ返せる形にする
+    pub fn into_retired(self) -> Vec<RetiredProcessor> {
+        self.nodes.into_iter().map(Node::into_retired).collect()
+    }
+
+    /// 1段だけのトラックから、その1つを取り出す。**段数が1でなければ `None`。**
+    ///
+    /// 画面から作れるトラックはまだ1段だけ (チェーンを組めるのは `chain_smoke`
+    /// のような検証経路だけ) なので、呼び出し側の多くはこれで足りる。
+    /// **想定外の段数を黙って捨てない**ようにするために `Option` にしてある。
+    pub fn into_single_retired(self) -> Option<RetiredProcessor> {
+        if self.nodes.len() != 1 {
+            return None;
         }
+        self.nodes.into_iter().next().map(Node::into_retired)
     }
 
     /// このブロックで送るイベント (呼び出し側が積む)
@@ -140,15 +211,25 @@ impl TrackProcessor {
         &mut self.events
     }
 
-    /// 1ブロック処理して `mix` に足し込む。
+    /// チェーンを上から順に通して `buf` を置き換える。
+    ///
+    /// `buf` は呼び出し側が 0 で埋めてから渡すこと。先頭が音源なら中身は
+    /// 読まれずに上書きされ、先頭がエフェクトなら無音を加工することになる。
     ///
     /// `steady` は再生開始からの通し時間 (サンプル)。CLAP はこれを受け取るが、
     /// VST3 は `ProcessContext` を自前で組み立てる作りなので使わない。
-    pub fn process(&mut self, steady: u64, mix: &mut [f32]) -> Result<(), ProcessError> {
-        match &mut self.backend {
-            Backend::Clap(processor) => processor.process(&self.events, steady, mix),
-            Backend::Vst3(processor) => processor.process(&self.events, mix),
+    ///
+    /// **どこか1段でも失敗したら、そのブロックは無音にして返す。** 途中まで
+    /// 処理した音を出すと、加工されていない原音が混ざって出てしまう
+    /// (呼び出し側は「失敗したトラックは無音のまま混ざる」前提で記録している)。
+    pub fn process(&mut self, steady: u64, buf: &mut [f32]) -> Result<(), ProcessError> {
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if let Err(e) = node.process(&self.events, index, steady, buf) {
+                buf.fill(0.0);
+                return Err(e);
+            }
         }
+        Ok(())
     }
 }
 
@@ -192,11 +273,13 @@ pub fn start_engine(
     Ok((stream, stream_config))
 }
 
-/// CLAP プラグインを指定のストリーム構成でアクティベートし、トラック処理器にする
-pub fn activate_track(
+/// CLAP プラグインを指定のストリーム構成でアクティベートし、チェーンの1段にする。
+///
+/// 音源かエフェクトかは見ない (プラグインが申告する入力ポートで決まる)。
+pub fn activate_node(
     instance: &mut PluginInstance<MiniHost>,
     stream_config: &StreamAudioConfig,
-) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
+) -> Result<Node, Box<dyn Error>> {
     let audio_config = FullAudioConfig::for_plugin(stream_config, instance);
 
     let note_port = clap::find_main_note_port(instance);
@@ -208,9 +291,22 @@ pub fn activate_track(
         .activate(|_, _| (), stream_config.as_clack_plugin_config())?
         .start_processing()?;
 
-    Ok(Box::new(TrackProcessor::new(Backend::Clap(
-        ClapProcessor::new(processor, audio_config, note_port),
+    Ok(Node::new(Backend::Clap(ClapProcessor::new(
+        processor,
+        audio_config,
+        note_port,
     ))))
+}
+
+/// CLAP プラグイン1つだけを載せたトラック処理器を作る
+pub fn activate_track(
+    instance: &mut PluginInstance<MiniHost>,
+    stream_config: &StreamAudioConfig,
+) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
+    Ok(Box::new(TrackProcessor::from_node(activate_node(
+        instance,
+        stream_config,
+    )?)))
 }
 
 /// VST3 プラグインを指定のストリーム構成で読み込み、トラック処理器にする。
@@ -233,8 +329,10 @@ pub fn activate_vst3_track(
         // CPAL が一度に渡してくる最大長。これを超えるブロックは
         // `vst3-host` 側が分割して処理する。
         .block_size(stream_config.max_likely_buffer_size as usize)
-        // 音源として使うだけなので入力は要らない
-        .input_channels(0)
+        // **エフェクトを載せるので入力バスが要る。** 0 にすると、繋いでも
+        // 音が入らない音源専用の構成になる。音源側は入力を読まないだけなので、
+        // 常に用意しておいて損はない
+        .input_channels(stream_config.output_channel_count)
         .output_channels(stream_config.output_channel_count)
         .build()?;
 
@@ -243,7 +341,12 @@ pub fn activate_vst3_track(
     plugin.start_processing()?;
 
     let shared = SharedPlugin::new(plugin);
-    let processor = Vst3Processor::new(shared.clone(), plugin_channels, stream_config);
+    let processor = Vst3Processor::new(
+        shared.clone(),
+        plugin_channels,
+        stream_config.output_channel_count,
+        stream_config,
+    );
 
     Ok((
         shared,
@@ -278,7 +381,12 @@ pub fn reconfigure_vst3_track(
     };
 
     Ok(Box::new(TrackProcessor::new(Backend::Vst3(
-        Vst3Processor::new(shared, plugin_channels, stream_config),
+        Vst3Processor::new(
+            shared,
+            plugin_channels,
+            stream_config.output_channel_count,
+            stream_config,
+        ),
     ))))
 }
 
@@ -342,6 +450,11 @@ struct StreamAudioProcessor {
     gui_events: Consumer<GuiMsg>,
     /// 全トラックの出力を足し込むバッファ (インターリーブ済み)
     mix: Vec<f32>,
+    /// **1トラック分の作業バッファ。** チェーンはここを通る。
+    ///
+    /// 各ノードが読んで上書きする形なので、トラックごとに独立した場所が要る
+    /// (`mix` へ直接書くと、前のトラックの音をエフェクトが拾ってしまう)。
+    scratch: Vec<f32>,
     output_channel_count: usize,
     transport: Transport,
     steady_counter: u64,
@@ -359,6 +472,7 @@ impl StreamAudioProcessor {
             retired,
             gui_events,
             mix: Vec::new(),
+            scratch: Vec::new(),
             output_channel_count,
             transport: Transport::new(transport_shared),
             steady_counter: 0,
@@ -410,10 +524,16 @@ impl StreamAudioProcessor {
                         });
                     }
                 }
-                GuiMsg::ParamValue { track, id, value } => {
+                GuiMsg::ParamValue {
+                    track,
+                    node,
+                    id,
+                    value,
+                } => {
                     if let Some(Some(target)) = self.tracks.get_mut(track) {
                         target.events.push(BlockEvent::Param {
                             offset: 0,
+                            node,
                             id,
                             value,
                         });
@@ -454,28 +574,52 @@ impl StreamAudioProcessor {
     }
 
     /// CPAL の出力バッファ1回分を処理する。
-    /// 各トラックを自分のバッファへ処理してから、まとめて足し合わせる。
+    ///
+    /// **トラックごとに作業バッファを通してから足し合わせる。** チェーンの各ノードが
+    /// バッファを読んで上書きする形なので、共有のミックスへ直接書かせると、
+    /// 前のトラックの音を次のトラックのエフェクトが拾ってしまう。
     fn process<S: FromSample<f32>>(&mut self, data: &mut [S]) {
         let sample_count = data.len() / self.output_channel_count.max(1);
 
         self.collect_gui_events(sample_count as u64);
 
-        // ミックス用バッファを用意して 0 クリア
+        // ミックス用と作業用のバッファを用意する。
+        // 伸びるのは最初と、想定より長いブロックが来たときだけ
         if self.mix.len() < data.len() {
             self.mix.resize(data.len(), 0.0);
         }
-        let mix = &mut self.mix[..data.len()];
-        mix.fill(0.0);
+        if self.scratch.len() < data.len() {
+            self.scratch.resize(data.len(), 0.0);
+        }
 
         let steady = self.steady_counter;
-        for track in self.tracks.iter_mut().flatten() {
-            match track.process(steady, mix) {
+        // フィールドを個別に借りる (トラックと2つのバッファを同時に触るため)
+        let Self {
+            tracks,
+            mix,
+            scratch,
+            ..
+        } = self;
+        let mix = &mut mix[..data.len()];
+        let scratch = &mut scratch[..data.len()];
+        mix.fill(0.0);
+
+        for track in tracks.iter_mut().flatten() {
+            // 先頭が音源なら読まれずに上書きされる。エフェクトなら無音から始まる
+            scratch.fill(0.0);
+            match track.process(steady, scratch) {
                 Ok(()) => {}
                 // 想定内で、放っておけば直る。VST3 のエディタを開くときに
                 // 数秒ぶん出ることがあり (音源の生成が重い)、そのたびに
                 // オーディオスレッドから書き出すほうが害が大きい
-                Err(ProcessError::Busy) => {}
-                Err(e) => eprintln!("{e}"),
+                Err(ProcessError::Busy) => continue,
+                Err(e) => {
+                    eprintln!("{e}");
+                    continue;
+                }
+            }
+            for (mixed, sample) in mix.iter_mut().zip(scratch.iter()) {
+                *mixed += *sample;
             }
         }
 

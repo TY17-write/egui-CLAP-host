@@ -134,8 +134,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // 使い終わった処理器はメインスレッドで停止・解放する
-    let audio::RetiredProcessor::Clap(stopped) = processor.into_retired() else {
-        return Err("CLAP を載せたのに別形式の処理器が返ってきた".into());
+    let Some(audio::RetiredProcessor::Clap(stopped)) = processor.into_single_retired() else {
+        return Err("CLAP 1段を載せたのに別のものが返ってきた".into());
     };
     instance.deactivate(stopped);
 

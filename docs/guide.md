@@ -43,6 +43,7 @@ cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap   #
 cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
 cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
 cargo run -p clap-host-test --bin gain_smoke -- target\debug\test_plugin.clap  # 検証用エフェクトの挙動確認
+cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap # 音源→エフェクトのチェーンの検証
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
 cargo run -p clap-host-test --bin opus_smoke

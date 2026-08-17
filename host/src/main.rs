@@ -1144,7 +1144,12 @@ impl App {
             return Err("このトラックに音源がありません".into());
         };
 
-        match (processor.into_retired(), &mut audio.plugin) {
+        // 画面から作れるトラックはまだ1段だけ。段数が増えたらここも組み直す
+        let Some(retired) = processor.into_single_retired() else {
+            return Err("1段だけのトラックのはずが、そうなっていません".into());
+        };
+
+        match (retired, &mut audio.plugin) {
             (audio::RetiredProcessor::Clap(stopped), TrackPlugin::Clap(clap)) => {
                 clap.instance.deactivate(stopped);
                 audio::activate_track(&mut clap.instance, config)
@@ -1177,20 +1182,28 @@ impl App {
                 None => self.tracks.get_mut(track).and_then(|slot| slot.take()),
             };
 
-            // 形式ごとに始末の仕方が違う
-            match processor.into_retired() {
-                audio::RetiredProcessor::Clap(stopped) => {
-                    // CLAP は処理器をインスタンスへ返して初めて解放できる
-                    if let Some(TrackPlugin::Clap(clap)) =
-                        owner.as_mut().map(|track| &mut track.plugin)
-                    {
-                        clap.instance.deactivate(stopped);
+            // CLAP は処理器をインスタンスへ返して初めて解放できる。
+            // **`owner` が抱えるインスタンスは1つ**なので、返せるのも1段ぶん。
+            // `take` で1回に限る (画面から作れるトラックはまだ1段だけ。
+            // 段数が増えたら `owner` 側も段ごとに持つ必要がある)。
+            let mut clap_owner = owner.as_mut().and_then(|track| match &mut track.plugin {
+                TrackPlugin::Clap(clap) => Some(clap),
+                TrackPlugin::Vst3(_) => None,
+            });
+
+            // 形式ごとに始末の仕方が違う。**チェーンの全段が返ってくる**
+            for retired in processor.into_retired() {
+                match retired {
+                    audio::RetiredProcessor::Clap(stopped) => {
+                        if let Some(clap) = clap_owner.take() {
+                            clap.instance.deactivate(stopped);
+                        }
                     }
-                }
-                audio::RetiredProcessor::Vst3(shared) => {
-                    // VST3 はオーディオスレッドで止められない (`setProcessing` が
-                    // リアルタイム安全でない) ので、ここで止める
-                    let _ = shared.lock().stop_processing();
+                    audio::RetiredProcessor::Vst3(shared) => {
+                        // VST3 はオーディオスレッドで止められない (`setProcessing` が
+                        // リアルタイム安全でない) ので、ここで止める
+                        let _ = shared.lock().stop_processing();
+                    }
                 }
             }
             // owner はここで破棄される (CLAP は GUI も閉じられる)
@@ -1772,6 +1785,9 @@ impl eframe::App for App {
                                 if ui.add(slider).changed() {
                                     let _ = loaded.producer.push(GuiMsg::ParamValue {
                                         track: 0,
+                                        // チェーンの何段目か。この UI を戻すときは
+                                        // 段を選べるようにすること
+                                        node: 0,
                                         id: param.id,
                                         value: param.value,
                                     });
