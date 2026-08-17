@@ -2666,9 +2666,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opus-rs"
-version = "0.1.26"
+version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f1ce2826529746cac003d7338e9c0f47cdd2979ba769c61cc26fdebc402f4c"
+checksum = "2434df4ec78066c56777c4b53acaef5984b138fb322847ce090d4822b7989dde"
 
 [[package]]
 name = "orbclient"

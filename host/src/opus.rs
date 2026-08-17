@@ -33,13 +33,17 @@ const MAX_PACKET: usize = 4000;
 
 /// 選べるビットレート (kbps)。
 ///
-/// **高いビットレートは出さない。** `opus-rs` 0.1.26 は、あるビットレートを
-/// 超えると**壊れたストリームを吐く** (本家 libopus で復号するとノイズになる)。
-/// **閾値は内容で変わる** — 手元では和音+ノイズが 160kbps、純音が 176kbps、
-/// 実際の曲は 192kbps で発覚した。**複雑な内容ほど安全、ではない。**
-/// 両方の試験信号で正常だった上限は 128kbps だが、そこに張り付かない値に留める。
-/// 測定と経緯は `docs/export_rate_plan.md` の「高ビットレートは出さない」。
-pub const BITRATES_KBPS: [u32; 2] = [48, 96];
+/// **かつて 48 / 96 に絞っていた。** `opus-rs` 0.1.26 が、あるビットレートを
+/// 超えると壊れたストリームを吐いたため (本家 libopus で復号するとノイズ)。
+/// **0.1.28 で修正された。** 試験信号 2種では 510kbps まで正常になっている。
+/// 測定と経緯は `docs/export_rate_plan.md` の「高ビットレートは出さない」と
+/// `spike/opus/upstream-issue.md`。
+///
+/// **192 が上限なのは、それ以上を必要としていないから** (試験信号では 510kbps
+/// まで正常だったので、クレート側の制限ではない)。**元の不具合が発覚したのは
+/// 実際の曲の 192kbps** だったので、そこは曲を書き出して聴いて確かめてある
+/// (ノイズにならず、落ちもしない)。
+pub const BITRATES_KBPS: [u32; 4] = [48, 96, 128, 192];
 
 /// 既定のビットレート。
 ///
@@ -47,10 +51,47 @@ pub const BITRATES_KBPS: [u32; 2] = [48, 96];
 /// 活かせる値を既定にする。上げたい場合はメニューで選ぶ。
 pub const DEFAULT_BITRATE_KBPS: u32 = 96;
 
+/// 符号化に使うスレッドのスタック。
+///
+/// **`OpusEncoder::new` が大量にスタックを使う。** 0.1.26 は 64KiB でも足りたが、
+/// **0.1.28 は release で約 0.85MiB、debug では 2〜3MiB 要る** (実測は
+/// `spike/opus/src/bin/stack_probe.rs` と `bin/opus_smoke.rs`)。
+///
+/// **書き出しは `export_opus` からメインスレッド上で呼ばれ、Windows の
+/// メインスレッドは既定で 1MiB しか無い。** 必要量がその 1MiB のすぐ際にあるので、
+/// **ビルドの些細な違いで落ちたり落ちなかったりする** — 実際、本体の経路は
+/// release でも落ち、spike の同等コードは通った。**際どい線に賭けない。**
+///
+/// **符号化1回ぶんの一時的な確保**なので、余裕を取って困ることはない。
+const ENCODE_STACK: usize = 8 * 1024 * 1024;
+
 /// インターリーブされた f32 を Ogg/Opus のバイト列にする。
 ///
 /// `sample_rate` は [`SAMPLE_RATE`] でなければならない (呼び出し側で揃えること)。
+///
+/// **符号化は専用のスレッドで行う** ([`ENCODE_STACK`] の理由を参照)。
+/// 呼び出し側から見た振る舞いは変わらない (終わるまで待つ)。
 pub fn to_bytes(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    bitrate_kbps: u32,
+) -> Result<Vec<u8>, String> {
+    // 借りたまま渡したいので、スコープ付きスレッドを使う
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .stack_size(ENCODE_STACK)
+            .spawn_scoped(scope, || {
+                encode(samples, channels, sample_rate, bitrate_kbps)
+            })
+            .map_err(|e| format!("Opus の符号化を始められません: {e}"))?;
+        worker
+            .join()
+            .map_err(|_| "Opus の符号化が異常終了しました".to_string())?
+    })
+}
+
+fn encode(
     samples: &[f32],
     channels: u16,
     sample_rate: u32,
@@ -217,8 +258,14 @@ mod tests {
     #[test]
     fn refuses_what_it_cannot_encode() {
         let samples = sine(1);
-        assert!(to_bytes(&samples, 2, 44_100, 128).is_err(), "44.1kHz は断る");
-        assert!(to_bytes(&samples, 3, SAMPLE_RATE, 128).is_err(), "3ch は断る");
+        assert!(
+            to_bytes(&samples, 2, 44_100, 128).is_err(),
+            "44.1kHz は断る"
+        );
+        assert!(
+            to_bytes(&samples, 3, SAMPLE_RATE, 128).is_err(),
+            "3ch は断る"
+        );
         assert!(to_bytes(&[], 2, SAMPLE_RATE, 128).is_err(), "空は断る");
     }
 
