@@ -61,7 +61,7 @@ MIT のまま VST3 対応にできています (`vst3-host` → `vst3` → SDK �
 | `host` | ミニホスト本体 (egui GUI + cpal オーディオ出力 + clack-host + vst3-host) |
 | `test-plugin` | テスト用のサイン波シンセ CLAP プラグイン (16ボイス、Volume パラメータ、ベロシティ対応) |
 | `spike/vst3` | VST3 に進めるかを確かめた実験用クレート (親のワークスペースからは切り離してある) |
-| `spike/opus` | Ogg/Opus の書き出しを確かめた実験用クレート (同上) |
+| `spike/opus` | Ogg/Opus の書き出しを確かめた実験用クレート (同上)。`opus-rs` の不具合を測って上流へ報告した検証コードも置いてある |
 
 `host/src/bin/` にはオーディオデバイス不要の検証バイナリが並びます。
 `test-plugin` は **CLAP 専用**なので、VST3 側の検証には実物の `.vst3` が要ります

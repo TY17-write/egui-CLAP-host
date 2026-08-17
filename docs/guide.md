@@ -43,6 +43,10 @@ cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap   #
 cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
 cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
 
+# Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
+cargo run -p clap-host-test --bin opus_smoke
+cargo run -p clap-host-test --bin opus_smoke -- 262144   # 256KiB のスレッドから呼ぶ
+
 # VST3 バックエンドの検証 (実物の .vst3 が要る。test-plugin は CLAP 専用のため)
 cargo run -p clap-host-test --bin vst3_smoke -- "<音源へのパス>.vst3"
 
@@ -343,7 +347,7 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 ### Opus (.opus) への書き出し
 
 **「出力 > Opus ファイルとして出力」** から、ビットレート
-(**48 / 96 (既定) kbps**) を選んで書き出す。容器は Ogg。
+(**48 / 96 (既定) / 128 / 192 kbps**) を選んで書き出す。容器は Ogg。
 
 **Opus が鳴らせるのは 48kHz だけ**だが、ストリームはデバイスのレート
 (多くは 44.1kHz) で開いている。そこで**書き出しの間だけ音源自体を 48kHz で
@@ -362,12 +366,18 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
   書く範囲ではないため)
 - 既定を 96kbps にしてあるのは、**低いビットレートでも音質が保たれるのが
   Opus の利点**だから
-- **高いビットレートは出さない。** `opus-rs` 0.1.26 は、あるビットレートを超えると
-  壊れたストリームを吐き、聴くとノイズになる。**閾値は内容で変わり** (手元では
-  和音+ノイズが 160kbps、純音が 176kbps、実際の曲は 192kbps で発覚)、
-  **ビットレートだけでは安全な線を引けない**。両方の試験信号で正常だった上限は
-  128kbps だが、そこに張り付かないよう 48 / 96 に留めている
-  (測定と経緯は [export_rate_plan.md](export_rate_plan.md))
+- **上限が 192kbps なのは、それ以上を必要としていないから。** 試験信号では
+  510kbps まで正常なので、クレート側の制限ではない
+- **かつては 48 / 96 に絞っていた。** `opus-rs` 0.1.26 が、あるビットレートを
+  超えると壊れたストリームを吐いたため (聴くとノイズになり、**閾値は内容で
+  変わる**ので安全な線を引けなかった)。上流へ報告して
+  [0.1.28 で修正され](https://github.com/restsend/opus-rs/issues/11)、
+  128 / 192 を戻してある。測定と経緯は
+  [export_rate_plan.md](export_rate_plan.md)
+- **符号化は専用スレッドで行っている。** `opus-rs` 0.1.27 以降は
+  `OpusEncoder::new` だけで 1MiB 近いスタックを使い、**Windows のメイン
+  スレッド (既定 1MiB) から呼ぶと落ちる**ため
+  ([issue #12](https://github.com/restsend/opus-rs/issues/12))
 
 `opus-rs` と `ogg` はどちらも純 Rust で、**C のビルド環境 (CMake) は要らない**。
 
