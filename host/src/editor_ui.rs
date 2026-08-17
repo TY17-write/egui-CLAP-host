@@ -6,6 +6,7 @@
 use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
 use crate::swing;
 use crate::theme::palette;
+use crate::waltz;
 use eframe::egui::{
     self, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke,
 };
@@ -1789,6 +1790,41 @@ fn toolbar(
             // 鳴り方が変わるのでシーケンスを送り直す (編集ではないので履歴には積まない)
             state.dirty = true;
         }
+
+        // 不均等な拍 (ウィンナ・ワルツ風)。掛けるトラックはトラック欄の「V」で選ぶ。
+        // 奇数の N/4 でしか効かない。
+        //
+        // **1.0 が中央で無効**、左へ動かすと山 (2拍目が前)、右へ動かすと谷。
+        // 値だけでは向きが分からないので、説明で補う。
+        let waltz_usable = waltz::applies_to(state.editor.beats, state.editor.beat_type);
+        let waltz_hint = if waltz_usable {
+            "拍の長さの偏り (1.00 = 均等)。1.00 未満で2拍目が前に出ます (ウィンナ・ワルツ風)。\
+             掛けるトラックは左の欄の「V」で選びます"
+        } else {
+            "不均等な拍は奇数の N/4 拍子 (3/4・5/4・7/4…) のときだけ使えます"
+        };
+        // スウィングのラベルと同じ理由で1語として折り返す
+        ui.add_enabled(
+            waltz_usable,
+            egui::Label::new("拍の偏り").wrap_mode(egui::TextWrapMode::Extend),
+        );
+
+        ui.spacing_mut().slider_width = 84.0;
+        let mut waltz_ratio = state.editor.waltz_ratio;
+        let waltz_changed = ui
+            .add_enabled(
+                waltz_usable,
+                egui::Slider::new(&mut waltz_ratio, waltz::MIN_RATIO..=waltz::MAX_RATIO)
+                    .fixed_decimals(2),
+            )
+            .on_hover_text(waltz_hint)
+            .changed();
+        ui.spacing_mut().slider_width = slider_width;
+
+        if waltz_changed {
+            state.editor.waltz_ratio = waltz_ratio;
+            state.dirty = true;
+        }
     });
 
     // 選択中ノートの詳細
@@ -2898,7 +2934,8 @@ fn track_gutter_content(
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         content.set_clip_rect(rect);
-        // トグル3つ + 名前 + ボタン3つを 200px に収めるため間隔を詰める
+        // トグル4つ (M/S/W/V) + 名前 + ボタン3つを 200px に収めるため間隔を詰める。
+        // **右端は clip_rect で切られる**ので、増やすときは実際に見て確かめること
         content.spacing_mut().item_spacing.x = 2.0;
 
         // ミュート / ソロ。編集ではないのでアンドゥ履歴には積まない。
@@ -2959,6 +2996,31 @@ fn track_gutter_content(
             "スウィング (跳ねの深さはツールバーで設定)"
         } else {
             "スウィングは N/4 拍子のときだけ使えます"
+        });
+
+        // 不均等な拍 (ウィンナ = Vienna の V)。スウィングと併用できる。
+        // 偏りの強さはツールバーの「拍の偏り」で全体設定。
+        let waltzing = state.editor.tracks[track].waltz;
+        let waltz_enabled = waltz::applies_to(state.editor.beats, state.editor.beat_type);
+        let response = content.add_enabled(
+            waltz_enabled,
+            egui::SelectableLabel::new(
+                waltzing,
+                egui::RichText::new("V").size(10.0).color(if waltzing {
+                    palette::CYAN
+                } else {
+                    palette::FG_DIM
+                }),
+            ),
+        );
+        if response.clicked() {
+            state.editor.tracks[track].waltz = !waltzing;
+            state.dirty = true;
+        }
+        response.on_hover_text(if waltz_enabled {
+            "不均等な拍 / ウィンナ・ワルツ風 (偏りはツールバーで設定)"
+        } else {
+            "不均等な拍は奇数の N/4 拍子のときだけ使えます"
         });
 
         // 狭いときは名前の枠を詰める (右のボタンを見切れさせないため)

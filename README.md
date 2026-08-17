@@ -14,6 +14,7 @@ CLAP と VST3 はトラック単位で混在でき、どちらも音源独自の
 - **ピアノロールでの打ち込み** — 範囲選択・移動・伸縮・移調・連符、縦横のズーム
 - **CC 段** — ペダルなどを「書いた区間だけ効く」形で書ける
 - **スウィング** — 研究に基づく裏拍の比と表拍の遅れを、再生と書き出しにだけ乗せる
+- **不均等な拍** — 3/5/7拍子で拍の長さ自体を変える (ウィンナ・ワルツ風。スウィングと併用可)
 - **12平均律 / ボーレン・ピアース13音**の切り替え
 - **保存と書き出し** — `.ron` (音源の音作りごと) / MIDI (入出力) / WAV / Ogg-Opus / CeVIO (.ccs)
 
@@ -95,6 +96,7 @@ cargo test -p clap-host-test --lib
 | [docs/vst3_host_plan.md](docs/vst3_host_plan.md) | VST3 対応の設計と実測 (フォークした理由、エディタまわりの調査) |
 | [docs/export_rate_plan.md](docs/export_rate_plan.md) | Opus 書き出しの設計と、ビットレートを絞った理由 |
 | [docs/swing-plan.md](docs/swing-plan.md) | スウィングの実装計画 |
+| [docs/waltz-plan.md](docs/waltz-plan.md) | 不均等な拍 (ウィンナ・ワルツ風) の実装計画 |
 
 ## ライセンス
 

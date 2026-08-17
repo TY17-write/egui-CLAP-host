@@ -427,11 +427,13 @@ mod tests {
         editor.beat_type = 4;
         editor.scale = ScaleMode::BohlenPierce13;
         editor.swing_peak_ratio = 1.75;
+        editor.waltz_ratio = 0.8;
         editor.add_track();
         editor.tracks[0].name = "リズム".into();
         editor.tracks[0].lanes = 2;
         editor.tracks[0].muted = true;
         editor.tracks[1].swing = true;
+        editor.tracks[1].waltz = true;
         editor.tracks[1].soloed = true;
         editor.notes = vec![
             Note {
@@ -496,6 +498,51 @@ mod tests {
         assert!(!restored.tracks[0].swing, "伴奏は OFF のまま");
         assert!(restored.tracks[1].swing, "ソロは ON のまま");
         assert_eq!(restored.swing_peak_ratio, 1.75);
+    }
+
+    #[test]
+    fn round_trip_keeps_waltz_settings() {
+        let restored = load(&save(&sample())).unwrap();
+        assert!(!restored.tracks[0].waltz, "伴奏は OFF のまま");
+        assert!(restored.tracks[1].waltz, "ソロは ON のまま");
+        assert_eq!(restored.waltz_ratio, 0.8);
+    }
+
+    /// 不均等な拍を知らない頃の `.ron` が、既定値で開けること。
+    /// **古いファイルを開けなくしないことが version を 1 のままにした条件。**
+    #[test]
+    fn older_files_without_waltz_fields_open_with_defaults() {
+        let text = r#"(
+            version: 1,
+            tempo: 120,
+            beats: 3,
+            beat_type: 4,
+            swing_peak_ratio: 1.5,
+            tracks: [(name: "トラック 1", lanes: 1, muted: false, soloed: false, swing: false)],
+            notes: [],
+        )"#;
+
+        let editor = load(text).expect("開けること");
+        assert_eq!(editor.waltz_ratio, waltz::DEFAULT_RATIO);
+        assert!(!editor.tracks[0].waltz);
+    }
+
+    /// **0 以下や NaN を通すと拍長が壊れる**ので、読み込みで丸めること
+    #[test]
+    fn out_of_range_waltz_ratio_is_clamped() {
+        for (written, expected) in [
+            ("0.0", waltz::MIN_RATIO),
+            ("-3.0", waltz::MIN_RATIO),
+            ("0.1", waltz::MIN_RATIO),
+            ("99.0", waltz::MAX_RATIO),
+        ] {
+            let text = format!(
+                r#"(version: 1, tempo: 120, beats: 3, beat_type: 4, waltz_ratio: {written},
+                    tracks: [(name: "t", lanes: 1)], notes: [])"#
+            );
+            let editor = load(&text).expect("開けること");
+            assert_eq!(editor.waltz_ratio, expected, "{written} を丸めること");
+        }
     }
 
     /// 記譜位置のまま保存されること (スウィングを焼き込まない)
