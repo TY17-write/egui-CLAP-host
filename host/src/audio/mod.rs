@@ -114,6 +114,12 @@ pub enum GuiMsg {
     ClearTrack {
         track: usize,
     },
+    /// 繋ぎ方と処理順を丸ごと差し替える。
+    ///
+    /// **メインスレッドで組み立て済みのものだけを送る。** 輪になっていないことは
+    /// 組み立ての時点で確かめてあるので、オーディオスレッドは何も検査しない。
+    /// [`graph::Routing`] は `Copy` なので、ここで確保も解放も起きない。
+    SetRouting(graph::Routing),
 }
 
 /// 音源の形式ごとの処理器。
@@ -568,21 +574,17 @@ impl StreamAudioProcessor {
                     midi_track,
                     processor,
                 } => {
-                    let Some(slot) = self.graph.track_mut(track) else {
+                    if self.graph.track(track).is_none() {
                         // 範囲外。処理器はここで落とさずメインスレッドへ返す
                         self.retire(track, Some(processor));
                         continue;
-                    };
-                    slot.midi_track = midi_track;
-                    slot.sends = if track == graph::MASTER {
-                        // マスターは送り側にならない
-                        Vec::new()
-                    } else {
-                        vec![graph::MASTER]
-                    };
-                    let previous = slot.processor.replace(processor);
+                    }
+                    // 繋ぎ方には触らない (`SetRouting` が別に決める)
+                    let previous = self.graph.place(track, midi_track, processor);
                     self.retire(track, previous);
                 }
+                // 繋ぎ方を丸ごと差し替える。組み立て済みなので検査は要らない
+                GuiMsg::SetRouting(routing) => self.graph.set_routing(routing),
                 GuiMsg::ClearTrack { track } => {
                     let previous = self
                         .graph

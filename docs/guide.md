@@ -44,6 +44,7 @@ cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap #
 cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
 cargo run -p clap-host-test --bin gain_smoke -- target\debug\test_plugin.clap  # 検証用エフェクトの挙動確認
 cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap # 音源→エフェクトのチェーンの検証
+cargo run -p clap-host-test --bin route_smoke -- target\debug\test_plugin.clap # トラック間のルーティングの検証
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
 cargo run -p clap-host-test --bin opus_smoke
@@ -367,7 +368,10 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 - **`midi_track` がどの打ち込みトラックから MIDI を取るかを決める。**
   同じ打ち込みを複数のオーディオトラックが見てもよい (重ねられる)
 - **`sends` は送り先。片側だけ書く。** 両側に書くと「A は→B と言い、B は何も
-  言っていない」という矛盾したファイルが作れてしまう
+  言っていない」という矛盾したファイルが作れてしまう。
+  **繋ぎ替える画面はまだ無いので、今はここに書くのが唯一の入口。**
+  1本を複数へ送れば枝分かれ (センド) になり、**送り先どうしで足し合わさる**。
+  マスターへ辿り着けないトラックは鳴らない
 - **バージョン2 以前のファイルは自動で移る。** 打ち込みトラック `i` の音源が
   オーディオトラック `i + 1` の1段目になる (0 がマスターなので1つずれる)。
   **16本に収まらないぶんは名指しで知らせる** (黙って捨てない)

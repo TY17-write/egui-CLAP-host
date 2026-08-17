@@ -379,6 +379,24 @@ struct App {
     status: Option<String>,
     /// 画面中央に出す結果通知 (閉じるまで残る)
     notice: Option<Notice>,
+    /// オーディオトラックの送り先 (番号順、[`graph::AUDIO_TRACKS`] 本)。
+    ///
+    /// **画面から繋ぎ替える手段はまだ無い** (フェーズ4)。今は既定の
+    /// 「全部マスターへ直結」か、`.ron` に書かれていたものが入る。
+    routing_sends: Vec<Vec<usize>>,
+}
+
+/// 既定の繋ぎ方: マスター以外はマスターへ1本
+fn default_routing_sends() -> Vec<Vec<usize>> {
+    (0..graph::AUDIO_TRACKS)
+        .map(|index| {
+            if index == graph::MASTER {
+                Vec::new()
+            } else {
+                vec![graph::MASTER]
+            }
+        })
+        .collect()
 }
 
 impl App {
@@ -626,9 +644,17 @@ impl App {
                     .count();
 
                 self.editor.replace_project(loaded.editor);
+                // **繋ぎ方はファイルのものを使う。** 検証は読み込みで済んでいる
+                self.routing_sends = loaded
+                    .audio_tracks
+                    .iter()
+                    .map(|track| track.sends.clone())
+                    .collect();
                 // 音源はシーケンスを入れ替えたあとに載せる
                 // (トラック数が揃ってからでないと行き先が決まらない)
                 let mut failures = self.restore_audio_tracks(loaded.audio_tracks);
+                // 音源を載せる過程でエンジンが起きるので、そのあとに送る
+                self.push_routing();
                 // 16本に収まらず載せられなかったぶんも同じ扱いで知らせる
                 failures.extend(loaded.overflow);
 
@@ -667,6 +693,34 @@ impl App {
         self.last_directory = path.parent().map(PathBuf::from);
         self.editor.project_path = Some(file_label(&path));
         self.project_path = Some(path);
+    }
+
+    /// 今の繋ぎ方を組み立てる。
+    ///
+    /// **組めなければ既定 (全部マスターへ直結) に戻す。** 読み込みの時点で
+    /// 検証してあるので普通は起きないが、鳴らなくなるより既定で鳴るほうがよい。
+    fn routing(&self) -> graph::Routing {
+        if self.routing_sends.is_empty() {
+            return graph::Routing::default();
+        }
+        graph::Routing::from_lists(&self.routing_sends).unwrap_or_else(|problems| {
+            eprintln!(
+                "繋ぎ方を組めないので既定に戻します:\n{}",
+                problems.join("\n")
+            );
+            graph::Routing::default()
+        })
+    }
+
+    /// 繋ぎ方をオーディオスレッドへ送る。
+    ///
+    /// **音源を載せ替えても繋ぎ方は変わらない**ので、送るのは繋ぎ方が
+    /// 変わったときとエンジンを起こしたときだけでよい。
+    fn push_routing(&mut self) {
+        let routing = self.routing();
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.producer.push(GuiMsg::SetRouting(routing));
+        }
     }
 
     /// 借りた処理器をオーディオスレッドへ返す。
@@ -767,6 +821,9 @@ impl App {
         // 借りた処理器をグラフへ載せて回す。**再生と同じ経路を通すため**
         let setup = self.render_setup(&export_config);
         let mut graph = audio::graph::Graph::new();
+        // **繋ぎ方も再生と同じにする。** ここを既定のままにすると、
+        // 繋ぎ替えたときに鳴っている音と書き出した音が食い違う
+        graph.set_routing(self.routing());
         for (track, processor) in processors {
             graph.place(track, graph::midi_track_for(track), processor);
         }
@@ -1299,6 +1356,8 @@ impl App {
         if self.engine.is_none() {
             let engine = start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
             self.engine = Some(engine);
+            // 起こしたばかりのエンジンは既定の繋ぎ方なので、今のものを送る
+            self.push_routing();
         }
 
         // 名前は選択 UI に出したものと同じにしたいので、ここでも数え上げる
@@ -1390,8 +1449,20 @@ impl App {
                     state: audio.capture_state(),
                 }],
                 midi_track: Some(midi_track),
-                sends: vec![project::MASTER],
+                sends: Vec::new(), // 下でまとめて入れる
             };
+        }
+
+        // **繋ぎ方は音源の有無と無関係。** 空のトラックの送りも残す
+        // (繋ぎ替えてから音源を外しても、繋ぎ方は保たれる)
+        for (index, track) in tracks.iter_mut().enumerate() {
+            track.sends = self.routing_sends.get(index).cloned().unwrap_or_else(|| {
+                if index == project::MASTER {
+                    Vec::new()
+                } else {
+                    vec![project::MASTER]
+                }
+            });
         }
         tracks
     }

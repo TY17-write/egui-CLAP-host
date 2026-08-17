@@ -464,130 +464,28 @@ fn validate(project: &Project) -> Vec<String> {
 ///
 /// **編集操作で拒否するだけでは足りない。** 手で書き換えたファイルや、
 /// 将来の版で作られたファイルが入口になりうるので、読み込みでも見る。
+///
+/// 繋ぎ方の規則そのものは [`Routing`](crate::audio::graph::Routing) が持っている。
+/// **ここで別に書くと、画面から繋ぐときとファイルを読むときで規則がずれる。**
 fn validate_audio_tracks(tracks: &[AudioTrackEntry]) -> Vec<String> {
-    let mut problems = Vec::new();
     if tracks.is_empty() {
-        return problems; // バージョン2 以前。移行側で扱う
+        return Vec::new(); // バージョン2 以前。移行側で扱う
     }
     if tracks.len() > AUDIO_TRACKS {
-        problems.push(format!(
+        return vec![format!(
             "・オーディオトラックが {} 本あります (使えるのは {AUDIO_TRACKS} 本まで)",
             tracks.len()
-        ));
-        return problems;
+        )];
     }
 
-    for (index, track) in tracks.iter().enumerate() {
-        let at = format!("・オーディオトラック {index}");
+    let lists: Vec<Vec<usize>> = tracks
+        .iter()
+        .map(|track| track.sends.iter().map(|send| send.to).collect())
+        .collect();
 
-        // マスターは常に受け手。送り側になると 0 を含む輪が作れてしまう
-        if index == MASTER && !track.sends.is_empty() {
-            problems.push(format!("{at}: マスターは送り先を持てません"));
-        }
-
-        let mut seen = Vec::new();
-        for send in &track.sends {
-            if send.to >= tracks.len() {
-                problems.push(format!("{at}: 送り先 {} は存在しません", send.to));
-                continue;
-            }
-            if send.to == index {
-                problems.push(format!("{at}: 自分自身へは送れません"));
-                continue;
-            }
-            // 同じ相手への二重の送りは、片方を消したつもりで残る事故のもと
-            if seen.contains(&send.to) {
-                problems.push(format!("{at}: 送り先 {} が重複しています", send.to));
-            }
-            seen.push(send.to);
-        }
-    }
-
-    // 2本の間の接続は1本だけ。両向きにあると、どちらが送り側か決まらない
-    for (index, track) in tracks.iter().enumerate() {
-        for send in &track.sends {
-            let Some(other) = tracks.get(send.to) else {
-                continue;
-            };
-            if other.sends.iter().any(|back| back.to == index) && index < send.to {
-                problems.push(format!(
-                    "・オーディオトラック {index} と {} が互いに送り合っています",
-                    send.to
-                ));
-            }
-        }
-    }
-
-    problems.extend(find_cycle(tracks));
-    problems
-}
-
-/// 輪になっていないか調べる。
-///
-/// **対で1本・マスターは受け手、の2つでは3本以上の輪が塞がらない。**
-/// `1 → 2 → 3 → 1` はどの規則も満たしたまま循環する。
-///
-/// 深さ優先で1周するだけ (トラックは16本しかない)。
-fn find_cycle(tracks: &[AudioTrackEntry]) -> Vec<String> {
-    /// 訪問済みの印
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mark {
-        New,
-        InProgress,
-        Done,
-    }
-
-    fn visit(
-        index: usize,
-        tracks: &[AudioTrackEntry],
-        marks: &mut [Mark],
-        path: &mut Vec<usize>,
-    ) -> Option<Vec<usize>> {
-        marks[index] = Mark::InProgress;
-        path.push(index);
-
-        for send in &tracks[index].sends {
-            let Some(&mark) = marks.get(send.to) else {
-                continue;
-            };
-            match mark {
-                // 今たどっている経路へ戻った = 輪
-                Mark::InProgress => {
-                    let from = path.iter().position(|step| *step == send.to).unwrap_or(0);
-                    let mut cycle = path[from..].to_vec();
-                    cycle.push(send.to);
-                    return Some(cycle);
-                }
-                Mark::New => {
-                    if let Some(cycle) = visit(send.to, tracks, marks, path) {
-                        return Some(cycle);
-                    }
-                }
-                Mark::Done => {}
-            }
-        }
-
-        path.pop();
-        marks[index] = Mark::Done;
-        None
-    }
-
-    let mut marks = vec![Mark::New; tracks.len()];
-    for index in 0..tracks.len() {
-        if marks[index] != Mark::New {
-            continue;
-        }
-        let mut path = Vec::new();
-        if let Some(cycle) = visit(index, tracks, &mut marks, &mut path) {
-            let route = cycle
-                .iter()
-                .map(|step| step.to_string())
-                .collect::<Vec<_>>()
-                .join(" → ");
-            return vec![format!("・オーディオトラックが輪になっています ({route})")];
-        }
-    }
-    Vec::new()
+    crate::audio::graph::Routing::from_lists(&lists)
+        .err()
+        .unwrap_or_default()
 }
 
 /// 検証済みのファイル内容をデータモデルに移す
@@ -1098,6 +996,34 @@ mod tests {
 
         let error = load(&text).unwrap_err();
         assert!(error.contains("互いに送り合って"), "実際: {error}");
+    }
+
+    /// **ファイルに書いた繋ぎ方が、そのまま実行順になること。**
+    ///
+    /// 落ちると「保存した繋ぎ方で鳴らない」ことになる。往復するだけでなく、
+    /// エンジンが受け取れる形まで通して確かめる。
+    #[test]
+    fn routing_from_the_file_becomes_the_execution_order() {
+        let mut tracks = empty_audio_tracks();
+        // 3 → 1 → 0 の直列
+        tracks[3].sends = vec![1];
+        tracks[1].sends = vec![MASTER];
+
+        let restored = from_str(&to_string(&MidiEditor::default(), &tracks).unwrap()).unwrap();
+        assert_eq!(restored.audio_tracks[3].sends, vec![1]);
+        assert_eq!(restored.audio_tracks[1].sends, vec![MASTER]);
+
+        let lists: Vec<Vec<usize>> = restored
+            .audio_tracks
+            .iter()
+            .map(|track| track.sends.clone())
+            .collect();
+        let routing = crate::audio::graph::Routing::from_lists(&lists).expect("組めること");
+
+        let order: Vec<_> = routing.order().collect();
+        let at = |track: usize| order.iter().position(|step| *step == track).unwrap();
+        assert!(at(3) < at(1), "送り元が先に来ること");
+        assert!(at(1) < at(MASTER));
     }
 
     /// 本数が `audio::graph` と食い違わないこと。

@@ -62,22 +62,209 @@ pub struct AudioTrack {
     pub processor: Option<Box<TrackProcessor>>,
     /// MIDI をどの打ち込みトラックから取るか。`None` は入力なし (バス用)
     pub midi_track: Option<usize>,
-    /// 送り先。**マスターは常に空** (送り側にならない)。
-    ///
-    /// 空なら鳴らない。それを仕様としているので、繋がっていないトラックを
-    /// 画面で分かるようにするのは UI 側の仕事 (フェーズ4)。
-    pub sends: Vec<usize>,
 }
 
-impl AudioTrack {
-    /// マスターへ送るだけのトラック (音源を載せたときの既定)
-    pub fn to_master(midi_track: Option<usize>) -> Self {
-        Self {
-            processor: None,
-            midi_track,
-            sends: vec![MASTER],
+/// 繋ぎ方と処理順。**メインスレッドで組み立てて丸ごと差し替える。**
+///
+/// オーディオスレッドは受け取ったものを**上から実行するだけ**で、探索もソートも
+/// 確保もしない。輪になっていないことは組み立てた時点で保証されているので、
+/// 実行中に確かめる必要もない。
+///
+/// # なぜビット列と固定長配列なのか
+///
+/// **`Copy` にするため。** リングバッファ越しに丸ごと送るので、`Vec` を持つと
+/// オーディオスレッド側で解放が起きる。16本なので送り先は `u16` 1つに収まり、
+/// 順序も `[u8; 16]` で足りる (合わせて 49 バイト)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Routing {
+    /// `sends[i]` のビット `j` が立っていれば **i から j へ送る**
+    sends: [u16; AUDIO_TRACKS],
+    /// 処理する順。`order[..len]` だけが有効
+    order: [u8; AUDIO_TRACKS],
+    len: u8,
+}
+
+impl Default for Routing {
+    /// 全部がマスターへ直結した状態
+    fn default() -> Self {
+        let mut sends = [0u16; AUDIO_TRACKS];
+        for (index, bits) in sends.iter_mut().enumerate() {
+            if index != MASTER {
+                *bits = 1 << MASTER;
+            }
+        }
+        // 破れないはずの繋ぎ方なので、失敗したらこちらの組み立て間違い
+        Self::build(&sends).expect("マスター直結が組めること")
+    }
+}
+
+impl Routing {
+    /// 送り先のビット列から処理順を決める。
+    ///
+    /// 返すのは**人が読める形の問題**。1つでもあれば繋ぎ方を採用しない。
+    /// 見るのは次の5つ。
+    ///
+    /// - 送り先が範囲内か
+    /// - 自分自身へ送っていないか
+    /// - **マスターが送り側になっていないか** (0 を含む輪を作れてしまう)
+    /// - **2本の間に両向きの接続が無いか** (どちらが送り側か決まらない)
+    /// - **輪になっていないか**
+    ///
+    /// 最後の1つが本体。上の2つでは `1 → 2 → 3 → 1` が塞がらない。
+    pub fn build(sends: &[u16; AUDIO_TRACKS]) -> Result<Self, Vec<String>> {
+        let mut problems = Vec::new();
+
+        for (index, bits) in sends.iter().enumerate() {
+            if index == MASTER && *bits != 0 {
+                problems.push("・マスターは送り先を持てません".into());
+            }
+            if bits & (1 << index) != 0 {
+                problems.push(format!(
+                    "・オーディオトラック {index}: 自分自身へは送れません"
+                ));
+            }
+            for target in targets(*bits) {
+                if sends[target] & (1 << index) != 0 && index < target {
+                    problems.push(format!(
+                        "・オーディオトラック {index} と {target} が互いに送り合っています"
+                    ));
+                }
+            }
+        }
+        if !problems.is_empty() {
+            return Err(problems);
+        }
+
+        match topological_order(sends) {
+            Some((order, len)) => Ok(Self {
+                sends: *sends,
+                order,
+                len,
+            }),
+            None => Err(vec![
+                "・オーディオトラックの繋ぎ方が輪になっています".to_string()
+            ]),
         }
     }
+
+    /// 送り先の一覧 (トラック番号) からビット列を組む。
+    /// **範囲外・自分自身・重複はここで弾く。**
+    pub fn from_lists(lists: &[Vec<usize>]) -> Result<Self, Vec<String>> {
+        let mut sends = [0u16; AUDIO_TRACKS];
+        let mut problems = Vec::new();
+
+        for (index, list) in lists.iter().enumerate().take(AUDIO_TRACKS) {
+            for target in list {
+                if *target >= AUDIO_TRACKS {
+                    problems.push(format!(
+                        "・オーディオトラック {index}: 送り先 {target} は存在しません"
+                    ));
+                    continue;
+                }
+                let bit = 1u16 << target;
+                if sends[index] & bit != 0 {
+                    problems.push(format!(
+                        "・オーディオトラック {index}: 送り先 {target} が重複しています"
+                    ));
+                    continue;
+                }
+                sends[index] |= bit;
+            }
+        }
+        if !problems.is_empty() {
+            return Err(problems);
+        }
+        Self::build(&sends)
+    }
+
+    /// 処理する順 (先に流すものから)
+    pub fn order(&self) -> impl Iterator<Item = usize> + '_ {
+        self.order[..self.len as usize].iter().map(|i| *i as usize)
+    }
+
+    /// `index` の送り先
+    pub fn sends_of(&self, index: usize) -> impl Iterator<Item = usize> {
+        targets(self.sends.get(index).copied().unwrap_or(0))
+    }
+
+    /// マスターへ辿り着けるか。**辿り着けないトラックは鳴らない。**
+    ///
+    /// 「繋がっていなければ鳴らない」を仕様にしたぶん、画面で分かるようにする
+    /// 必要がある (フェーズ4 の赤枠)。
+    pub fn reaches_master(&self, index: usize) -> bool {
+        if index == MASTER {
+            return true;
+        }
+        // マスターから辺を逆向きに辿って印を付ける
+        let mut reached = 1u16 << MASTER;
+        loop {
+            let mut added = false;
+            for (from, bits) in self.sends.iter().enumerate() {
+                if reached & (1 << from) != 0 {
+                    continue;
+                }
+                if bits & reached != 0 {
+                    reached |= 1 << from;
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        reached & (1 << index) != 0
+    }
+}
+
+/// ビット列の立っている位置を昇順で返す
+fn targets(bits: u16) -> impl Iterator<Item = usize> {
+    (0..AUDIO_TRACKS).filter(move |index| bits & (1 << index) != 0)
+}
+
+/// 送り元が送り先より先に来る順を求める。輪があれば `None`。
+///
+/// 深さ優先で1周するだけ (16本しかないので、確保も再帰の深さも問題にならない)。
+fn topological_order(sends: &[u16; AUDIO_TRACKS]) -> Option<([u8; AUDIO_TRACKS], u8)> {
+    /// 0: 未訪問 / 1: 訪問中 / 2: 済
+    let mut mark = [0u8; AUDIO_TRACKS];
+    let mut order = [0u8; AUDIO_TRACKS];
+    let mut len = 0usize;
+
+    // 再帰の代わりに自前の積みで辿る (戻りがけに順へ入れる)
+    for start in 0..AUDIO_TRACKS {
+        if mark[start] != 0 {
+            continue;
+        }
+        let mut stack = vec![(start, targets(sends[start]).collect::<Vec<_>>(), 0usize)];
+        mark[start] = 1;
+
+        while let Some((index, children, cursor)) = stack.last_mut() {
+            if *cursor < children.len() {
+                let child = children[*cursor];
+                *cursor += 1;
+                match mark[child] {
+                    // 辿っている最中の相手へ戻った = 輪
+                    1 => return None,
+                    0 => {
+                        mark[child] = 1;
+                        let next = targets(sends[child]).collect::<Vec<_>>();
+                        stack.push((child, next, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                mark[*index] = 2;
+                // 送り先を全部済ませてから自分を積む → 逆順が処理順になる
+                order[len] = *index as u8;
+                len += 1;
+                stack.pop();
+            }
+        }
+    }
+
+    // 戻りがけに入れたので「送り先が先」。**逆にすると送り元が先**になる
+    order[..len].reverse();
+    Some((order, len as u8))
 }
 
 /// オーディオトラック一式と、その作業バッファ。
@@ -86,6 +273,8 @@ impl AudioTrack {
 /// 256KiB しかないので、使っていないトラックのぶんを惜しむ理由がない。
 pub struct Graph {
     tracks: Vec<AudioTrack>,
+    /// 繋ぎ方と処理順。**丸ごと差し替える**
+    routing: Routing,
     /// トラックごとの出力 (2ch インターリーブ)。`frames` ごとに区切って使う
     buffers: Vec<f32>,
     /// いま確保してあるフレーム数
@@ -102,9 +291,20 @@ impl Graph {
     pub fn new() -> Self {
         Self {
             tracks: (0..AUDIO_TRACKS).map(|_| AudioTrack::default()).collect(),
+            routing: Routing::default(),
             buffers: Vec::new(),
             capacity_frames: 0,
         }
+    }
+
+    /// 繋ぎ方を差し替える。**組み立て済みのものしか受け取らない**ので、
+    /// ここで検査することは何も無い。
+    pub fn set_routing(&mut self, routing: Routing) {
+        self.routing = routing;
+    }
+
+    pub fn routing(&self) -> &Routing {
+        &self.routing
     }
 
     pub fn track(&self, index: usize) -> Option<&AudioTrack> {
@@ -117,8 +317,8 @@ impl Graph {
 
     /// オーディオトラックに処理器を載せる。既に載っていたものを返す。
     ///
-    /// 送り先は**マスターへ1本**にする (マスター自身は空)。
-    /// 任意の繋ぎ方を許すのはフェーズ3。
+    /// **繋ぎ方には触らない。** 繋ぎ方は [`set_routing`](Self::set_routing) で
+    /// 丸ごと差し替えるもので、音源の載せ降ろしとは独立している。
     pub fn place(
         &mut self,
         index: usize,
@@ -129,11 +329,6 @@ impl Graph {
             return Some(processor);
         };
         slot.midi_track = midi_track;
-        slot.sends = if index == MASTER {
-            Vec::new()
-        } else {
-            vec![MASTER]
-        };
         slot.processor.replace(processor)
     }
 
@@ -213,9 +408,9 @@ impl Graph {
 
     /// 1ブロック処理する。結果は [`master`](Self::master) に入る。
     ///
-    /// 処理の順は **1〜15 を順に、最後にマスター**。今は送り先がマスターだけ
-    /// なのでこれで足りる。**任意の繋ぎ方を許すフェーズ3 では、ここが
-    /// トポロジカルソートの結果に変わる。**
+    /// **[`Routing`] が決めた順に上から実行するだけ。** 送り元が必ず先に来るので、
+    /// あるトラックを処理する時点で、そこへ入ってくる音は全部揃っている。
+    /// ここで探索もソートも確保もしない。
     ///
     /// 失敗したトラックは `on_error` に渡し、そのトラックは**無音のまま混ざる**
     /// (途中まで処理した音を出すと、加工されていない原音が漏れる)。
@@ -235,21 +430,15 @@ impl Graph {
             self.buffer_mut(index, len).fill(0.0);
         }
 
-        for index in (MASTER + 1)..AUDIO_TRACKS {
+        let routing = self.routing;
+        for index in routing.order() {
             self.run_track(index, steady, len, on_error);
 
             // 送り先へ足す。**加算コピー**なので、複数から送られれば混ざる
-            for send in 0..self.tracks[index].sends.len() {
-                let target = self.tracks[index].sends[send];
-                if target == index || target >= AUDIO_TRACKS {
-                    continue; // 自分への送りは無視 (グラフとして意味を成さない)
-                }
+            for target in routing.sends_of(index) {
                 self.add_into(index, target, len);
             }
         }
-
-        // マスターは最後。ここまでに全部が足し込まれている
-        self.run_track(MASTER, steady, len, on_error);
     }
 
     /// 最終出力 (マスターの中身)。`frames` フレーム × [`BUS_CHANNELS`]
@@ -329,22 +518,127 @@ pub fn write_to_device<S: FromSample<f32>>(bus: &[f32], device: &mut [S], device
 mod tests {
     use super::*;
 
+    /// 送り先の一覧から繋ぎ方を組む (テスト用の短縮)
+    fn routing(edges: &[(usize, usize)]) -> Result<Routing, Vec<String>> {
+        let mut lists = vec![Vec::new(); AUDIO_TRACKS];
+        for (from, to) in edges {
+            lists[*from].push(*to);
+        }
+        Routing::from_lists(&lists)
+    }
+
     #[test]
     fn master_is_track_zero_and_never_sends() {
-        let graph = Graph::new();
         assert_eq!(MASTER, 0);
+        let default = Routing::default();
+        assert_eq!(default.sends_of(MASTER).count(), 0);
+    }
+
+    /// 既定は全部がマスターへ直結していること
+    #[test]
+    fn default_routing_sends_everything_to_master() {
+        let default = Routing::default();
+        for index in 1..AUDIO_TRACKS {
+            assert_eq!(default.sends_of(index).collect::<Vec<_>>(), vec![MASTER]);
+        }
+        // マスターは最後に処理される (全部が足し込まれてから)
+        assert_eq!(default.order().last(), Some(MASTER));
+    }
+
+    /// **送り元が送り先より必ず先に来ること。** ここが崩れると、
+    /// まだ音が揃っていないトラックを処理してしまう。
+    #[test]
+    fn order_puts_sources_before_targets() {
+        // 3 → 1 → 2 → 0
+        let routing = routing(&[(3, 1), (1, 2), (2, MASTER)]).unwrap();
+        let order: Vec<_> = routing.order().collect();
+        let at = |track: usize| order.iter().position(|step| *step == track).unwrap();
+
+        assert!(at(3) < at(1));
+        assert!(at(1) < at(2));
+        assert!(at(2) < at(MASTER));
+        assert_eq!(order.len(), AUDIO_TRACKS, "全トラックが1回ずつ入ること");
+    }
+
+    /// 1本が複数へ送る形でも順序が守られること (センド)
+    #[test]
+    fn order_handles_one_source_feeding_several_targets() {
+        // 5 は 0 と 7 の両方へ送り、7 も 0 へ送る
+        let routing = routing(&[(5, MASTER), (5, 7), (7, MASTER)]).unwrap();
+        let order: Vec<_> = routing.order().collect();
+        let at = |track: usize| order.iter().position(|step| *step == track).unwrap();
+
+        assert!(at(5) < at(7));
+        assert!(at(7) < at(MASTER));
+    }
+
+    /// **3本以上の輪を拒否すること。** 対で1本・マスターは受け手、の2つでは
+    /// 塞がらない形なので、ここが最後の砦になる。
+    #[test]
+    fn cycles_are_refused() {
+        let error = routing(&[(1, 2), (2, 3), (3, 1)]).unwrap_err();
         assert!(
-            graph.track(MASTER).unwrap().sends.is_empty(),
-            "マスターは送り側にならないこと"
+            error.iter().any(|line| line.contains("輪になっています")),
+            "実際: {error:?}"
         );
     }
 
-    /// 音源を載せたトラックは既定でマスターへ送ること
+    /// 互いに送り合うのは1本の接続として矛盾するので拒否すること
     #[test]
-    fn new_tracks_send_to_master() {
-        let track = AudioTrack::to_master(Some(3));
-        assert_eq!(track.sends, vec![MASTER]);
-        assert_eq!(track.midi_track, Some(3));
+    fn mutual_sends_are_refused() {
+        let error = routing(&[(1, 2), (2, 1)]).unwrap_err();
+        assert!(
+            error.iter().any(|line| line.contains("互いに送り合って")),
+            "実際: {error:?}"
+        );
+    }
+
+    /// マスターが送り側になるのを拒否すること (0 を含む輪を作れてしまう)
+    #[test]
+    fn master_may_not_send() {
+        let error = routing(&[(MASTER, 1)]).unwrap_err();
+        assert!(
+            error.iter().any(|line| line.contains("マスターは送り先")),
+            "実際: {error:?}"
+        );
+    }
+
+    /// 範囲外・自分自身・重複を拒否すること
+    #[test]
+    fn invalid_targets_are_refused() {
+        assert!(routing(&[(1, 99)])
+            .unwrap_err()
+            .iter()
+            .any(|line| line.contains("存在しません")));
+        assert!(routing(&[(1, 1)])
+            .unwrap_err()
+            .iter()
+            .any(|line| line.contains("自分自身")));
+        assert!(routing(&[(1, 0), (1, 0)])
+            .unwrap_err()
+            .iter()
+            .any(|line| line.contains("重複")));
+    }
+
+    /// **マスターへ辿り着けないトラックが分かること。**
+    /// 「繋がっていなければ鳴らない」を仕様にしたぶん、画面で示す必要がある。
+    #[test]
+    fn tracks_that_cannot_reach_master_are_detectable() {
+        // 1 → 0 は届く。5 → 7 は行き止まり
+        let routing = routing(&[(1, MASTER), (5, 7)]).unwrap();
+
+        assert!(routing.reaches_master(MASTER));
+        assert!(routing.reaches_master(1));
+        assert!(!routing.reaches_master(5), "行き止まりの先は届かない");
+        assert!(!routing.reaches_master(7));
+        assert!(!routing.reaches_master(9), "送り先が空なら届かない");
+    }
+
+    /// 2段先からでも辿り着けること
+    #[test]
+    fn reaching_master_follows_the_whole_path() {
+        let routing = routing(&[(4, 2), (2, MASTER)]).unwrap();
+        assert!(routing.reaches_master(4));
     }
 
     /// 送りは加算で混ざること (上書きしない)
