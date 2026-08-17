@@ -1575,6 +1575,87 @@ fn shortcuts(
     }
 }
 
+/// 揺らぎ (スウィング / 拍の偏り) のツールバー。**独立した行にする。**
+///
+/// 1行目に足していたが、**スライダー1本ぶんの幅が足りず、右端で切れて操作
+/// できなくなった** (1366px の窓で「拍の偏り」のラベルだけが出てスライダーが
+/// 画面外)。項目が増えるたびに同じことが起きるので、性質の似た2つを別の行に
+/// 分けて幅の取り合いから外す。
+///
+/// ラベルとスライダーは折り返しレイアウトの**直接の子**にしておくこと。
+/// `add_enabled_ui` や `scope` で包むと入れ子の Ui になり、折り返しに参加せず
+/// 右端からはみ出して見えなくなる。
+fn groove_toolbar(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.horizontal_wrapped(|ui| {
+        // 既定の 100px はツールバーには広すぎる。抜ける前に元へ戻す
+        let default_slider_width = ui.spacing().slider_width;
+        ui.spacing_mut().slider_width = 84.0;
+
+        // スウィングの深さ (200BPM 時の裏拍の比)。
+        // 掛けるトラックはトラック欄の「W」で選ぶ。N/4 拍子でしか効かない。
+        let swing_usable = swing::applies_to(state.editor.beat_type);
+        let swing_hint = if swing_usable {
+            "跳ねの深さ (1.00 = 直線 / 2.00 = 三連)。掛けるトラックは左の欄の「W」で選びます"
+        } else {
+            "スウィングは N/4 拍子のときだけ使えます"
+        };
+        // 折り返しレイアウトなので、そのままだと文字の途中で改行される
+        // (「ス」と「ウィング」に割れる)。1語として次の行へ送る。
+        ui.add_enabled(
+            swing_usable,
+            egui::Label::new("スウィング").wrap_mode(egui::TextWrapMode::Extend),
+        );
+        let mut peak = state.editor.swing_peak_ratio;
+        if ui
+            .add_enabled(
+                swing_usable,
+                egui::Slider::new(&mut peak, swing::MIN_PEAK_RATIO..=swing::MAX_PEAK_RATIO)
+                    .fixed_decimals(2),
+            )
+            .on_hover_text(swing_hint)
+            .changed()
+        {
+            state.editor.swing_peak_ratio = peak;
+            // 鳴り方が変わるのでシーケンスを送り直す (編集ではないので履歴には積まない)
+            state.dirty = true;
+        }
+
+        ui.separator();
+
+        // 不均等な拍 (ウィンナ・ワルツ風)。掛けるトラックはトラック欄の「V」で選ぶ。
+        // 奇数の N/4 でしか効かない。
+        //
+        // **1.00 が中央で無効**、左へ動かすと山 (2拍目が前)、右へ動かすと谷。
+        // 値だけでは向きが分からないので、説明で補う。
+        let waltz_usable = waltz::applies_to(state.editor.beats, state.editor.beat_type);
+        let waltz_hint = if waltz_usable {
+            "拍の長さの偏り (1.00 = 均等)。1.00 未満で2拍目が前に出ます (ウィンナ・ワルツ風)。\
+             掛けるトラックは左の欄の「V」で選びます"
+        } else {
+            "不均等な拍は奇数の N/4 拍子 (3/4・5/4・7/4…) のときだけ使えます"
+        };
+        ui.add_enabled(
+            waltz_usable,
+            egui::Label::new("拍の偏り").wrap_mode(egui::TextWrapMode::Extend),
+        );
+        let mut waltz_ratio = state.editor.waltz_ratio;
+        if ui
+            .add_enabled(
+                waltz_usable,
+                egui::Slider::new(&mut waltz_ratio, waltz::MIN_RATIO..=waltz::MAX_RATIO)
+                    .fixed_decimals(2),
+            )
+            .on_hover_text(waltz_hint)
+            .changed()
+        {
+            state.editor.waltz_ratio = waltz_ratio;
+            state.dirty = true;
+        }
+
+        ui.spacing_mut().slider_width = default_slider_width;
+    });
+}
+
 /// 上部ツールバー
 fn toolbar(
     ui: &mut egui::Ui,
@@ -1750,82 +1831,9 @@ fn toolbar(
             state.dirty = true;
         }
 
-        ui.separator();
-
-        // スウィングの深さ (200BPM 時の裏拍の比)。掛けるトラックはトラック欄の「W」で選ぶ。
-        // N/4 拍子でしか効かないので、それ以外では触らせない。
-        //
-        // ラベルとスライダーはこの折り返しレイアウトの「直接の子」にしておくこと。
-        // add_enabled_ui や scope で包むと入れ子の Ui になり、折り返しに参加せず
-        // 右端からはみ出して見えなくなる。
-        let usable = swing::applies_to(state.editor.beat_type);
-        let hint = if usable {
-            "跳ねの深さ (1.00 = 直線 / 2.00 = 三連)。掛けるトラックは左の欄の「W」で選びます"
-        } else {
-            "スウィングは N/4 拍子のときだけ使えます"
-        };
-        // 折り返しレイアウトなので、そのままだと文字の途中で改行される
-        // (「ス」と「ウィング」に割れる)。1語として次の行へ送る。
-        ui.add_enabled(
-            usable,
-            egui::Label::new("スウィング").wrap_mode(egui::TextWrapMode::Extend),
-        );
-
-        // 既定の 100px はツールバーには広すぎる。元に戻してから抜ける
-        let slider_width = ui.spacing().slider_width;
-        ui.spacing_mut().slider_width = 84.0;
-        let mut peak = state.editor.swing_peak_ratio;
-        let changed = ui
-            .add_enabled(
-                usable,
-                egui::Slider::new(&mut peak, swing::MIN_PEAK_RATIO..=swing::MAX_PEAK_RATIO)
-                    .fixed_decimals(2),
-            )
-            .on_hover_text(hint)
-            .changed();
-        ui.spacing_mut().slider_width = slider_width;
-
-        if changed {
-            state.editor.swing_peak_ratio = peak;
-            // 鳴り方が変わるのでシーケンスを送り直す (編集ではないので履歴には積まない)
-            state.dirty = true;
-        }
-
-        // 不均等な拍 (ウィンナ・ワルツ風)。掛けるトラックはトラック欄の「V」で選ぶ。
-        // 奇数の N/4 でしか効かない。
-        //
-        // **1.0 が中央で無効**、左へ動かすと山 (2拍目が前)、右へ動かすと谷。
-        // 値だけでは向きが分からないので、説明で補う。
-        let waltz_usable = waltz::applies_to(state.editor.beats, state.editor.beat_type);
-        let waltz_hint = if waltz_usable {
-            "拍の長さの偏り (1.00 = 均等)。1.00 未満で2拍目が前に出ます (ウィンナ・ワルツ風)。\
-             掛けるトラックは左の欄の「V」で選びます"
-        } else {
-            "不均等な拍は奇数の N/4 拍子 (3/4・5/4・7/4…) のときだけ使えます"
-        };
-        // スウィングのラベルと同じ理由で1語として折り返す
-        ui.add_enabled(
-            waltz_usable,
-            egui::Label::new("拍の偏り").wrap_mode(egui::TextWrapMode::Extend),
-        );
-
-        ui.spacing_mut().slider_width = 84.0;
-        let mut waltz_ratio = state.editor.waltz_ratio;
-        let waltz_changed = ui
-            .add_enabled(
-                waltz_usable,
-                egui::Slider::new(&mut waltz_ratio, waltz::MIN_RATIO..=waltz::MAX_RATIO)
-                    .fixed_decimals(2),
-            )
-            .on_hover_text(waltz_hint)
-            .changed();
-        ui.spacing_mut().slider_width = slider_width;
-
-        if waltz_changed {
-            state.editor.waltz_ratio = waltz_ratio;
-            state.dirty = true;
-        }
     });
+
+    groove_toolbar(ui, state);
 
     // 選択中ノートの詳細
     let max_semitone = state.editor.scale.max_semitone();
