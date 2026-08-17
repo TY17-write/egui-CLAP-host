@@ -27,6 +27,23 @@
 //! 違いで落ちたり落ちなかったりする。実際、本体の書き出し経路は release でも
 //! 1MiB で落ちたが、ここの同等コードは通った。
 //!
+//! # `Box` で包んでも逃げられない (実測)
+//!
+//! `Box::new(OpusEncoder::new(..))` と書いても、**閾値は1バイトも動かない。**
+//!
+//! | 作り方 | release | debug |
+//! |---|---|---|
+//! | そのまま | 832KiB は落ち、864KiB で足りる | 1MiB は落ち、2MiB で足りる |
+//! | `Box` で包む | **同じ** | **同じ** |
+//!
+//! `new` が `Self` を値で返す以上、**`Box::new` に渡す時点で既にスタック上に
+//! 出来上がっている**。Rust は「戻り値をヒープの確保先へ直接書く」ことを
+//! 保証しないので、包むのは手遅れ。
+//!
+//! **クレート側で `Box` を返す構築子を足すだけでも同じこと**で、中で
+//! `Box::new(Self { .. })` と書けば結局スタックに積まれる。避けるには
+//! `Box<MaybeUninit<Self>>` を確保して**その場で埋める**必要がある。
+//!
 //! スタックオーバーフローは捕まえられない (プロセスごと落ちる) ので、
 //! **最後に出た行が落ちた場所**になる。
 //!
@@ -48,6 +65,9 @@ fn main() {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(1024 * 1024);
+    // 第2引数に box を渡すと `Box::new(OpusEncoder::new(..))` を測る。
+    // **呼び出し側で包めば逃げられるのか**を確かめるため
+    let boxed = std::env::args().nth(2).is_some_and(|a| a == "box");
 
     // **構造体そのものの大きさを先に出す。** これが大きければ、
     // 「戻り値をスタックに積む」だけで溢れるという話になる
@@ -61,39 +81,36 @@ fn main() {
         stack,
         stack as f64 / (1024.0 * 1024.0)
     );
+    println!(
+        "作り方: {}",
+        if boxed {
+            "Box で包む"
+        } else {
+            "そのまま"
+        }
+    );
     println!("(落ちた場合、最後に出た行が落ちた場所)\n");
 
     let worker = std::thread::Builder::new()
         .stack_size(stack)
-        .spawn(|| {
+        .spawn(move || {
             println!("  符号化器を作る...");
-            let mut encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Audio)
-                .expect("符号化器を作れること");
-            encoder.bitrate_bps = 48_000;
-            println!("  作れた");
-
-            // **まず無音**。これで落ちるなら入力の中身は関係ないと言える
-            println!("  無音を1フレーム符号化する...");
-            let mut packet = vec![0u8; 4000];
-            let silence = vec![0.0f32; FRAME_SIZE * CHANNELS];
-            let len = encoder
-                .encode(&silence, FRAME_SIZE, &mut packet)
-                .expect("符号化できること");
-            println!("  符号化できた ({len} バイト)");
-
-            // **次に実際の信号**。無音が通ってこちらで落ちるなら、
-            // 中身によって通る経路が違うということ
-            println!("  和音+ノイズを{FRAMES}フレーム符号化する...");
-            for frame in 0..FRAMES {
-                let block = chord_frame(frame);
-                encoder
-                    .encode(&block, FRAME_SIZE, &mut packet)
-                    .expect("符号化できること");
-                if frame % 10 == 0 {
-                    println!("    {frame} フレーム目まで通過");
-                }
+            // **`Box::new` に渡す前に、一度スタック上へ作られる。**
+            // Rust は「戻り値をヒープの確保先へ直接書く」ことを保証しないので、
+            // 呼び出し側で包んでも逃げられるとは限らない。実測で確かめる。
+            if boxed {
+                let mut encoder = Box::new(
+                    OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Audio)
+                        .expect("符号化器を作れること"),
+                );
+                println!("  作れた");
+                encode_all(&mut encoder);
+            } else {
+                let mut encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Audio)
+                    .expect("符号化器を作れること");
+                println!("  作れた");
+                encode_all(&mut encoder);
             }
-            println!("  符号化できた");
         })
         .expect("スレッドを立てられること");
 
@@ -104,6 +121,36 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// 無音1フレームと、和音+ノイズを `FRAMES` フレーム符号化する。
+///
+/// 生成の仕方 (そのまま / `Box`) で共用したいので `&mut` で受ける。
+fn encode_all(encoder: &mut OpusEncoder) {
+    encoder.bitrate_bps = 48_000;
+    let mut packet = vec![0u8; 4000];
+
+    // **まず無音**。これで落ちるなら入力の中身は関係ないと言える
+    println!("  無音を1フレーム符号化する...");
+    let silence = vec![0.0f32; FRAME_SIZE * CHANNELS];
+    let len = encoder
+        .encode(&silence, FRAME_SIZE, &mut packet)
+        .expect("符号化できること");
+    println!("  符号化できた ({len} バイト)");
+
+    // **次に実際の信号**。無音が通ってこちらで落ちるなら、
+    // 中身によって通る経路が違うということ
+    println!("  和音+ノイズを{FRAMES}フレーム符号化する...");
+    for frame in 0..FRAMES {
+        let block = chord_frame(frame);
+        encoder
+            .encode(&block, FRAME_SIZE, &mut packet)
+            .expect("符号化できること");
+        if frame % 10 == 0 {
+            println!("    {frame} フレーム目まで通過");
+        }
+    }
+    println!("  符号化できた");
 }
 
 /// 和音 + 微小ノイズの1フレーム。無音より広く帯域を使う
