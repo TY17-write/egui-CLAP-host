@@ -60,10 +60,9 @@ PVQ 側も変わった。
 広げ、**実際の曲を 192kbps で書き出して聴いて確かめた** (ノイズにならない)。
 経緯は `docs/export_rate_plan.md` の「0.1.28 で直った」。
 
-**版を上げるとスタックが足りなくなる。** 0.1.28 は 0.1.26 より大幅に多く
-スタックを使い、**1MiB では debug / release とも符号化の最初で落ちる**。
-書き出しはメインスレッド (Windows の既定で 1MiB) から呼ばれるので、
-`opus::to_bytes` が専用スレッドを立てるようにして塞いだ。
+**版を上げるとスタックが足りなくなる。** これは別件なので
+`upstream-issue-stack.md` に分けた (原因は 0.1.27 の設計変更)。
+`opus::to_bytes` が専用スレッドを立てるようにして塞いである。
 
 ---
 
@@ -428,52 +427,19 @@ index I tried, and encoding is clean at every bitrate now. So this does not
 affect me. I am mentioning it only because a hang is a worse failure mode than a
 panic for a library — a caller can catch the panic.
 
-#### 4. A regression: `OpusEncoder::new` now needs about a megabyte of stack
+#### A separate problem, filed on its own
 
-This one has bitten me in practice, so it may be worth more attention than the
-hang above.
-
-`OpusEncoder::new` overflows a small thread stack on 0.1.28 where 0.1.26 was
-comfortable. Encoding is not involved — it dies during construction.
-
-```rust
-use opus_rs::{Application, OpusEncoder};
-
-std::thread::Builder::new()
-    .stack_size(832 * 1024)
-    .spawn(|| {
-        // 0.1.26: fine. 0.1.28: stack overflow here.
-        let _ = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
-    })
-    .unwrap()
-    .join()
-    .unwrap();
-```
-
-Where the boundary sits, bisecting the thread stack size:
-
-| version | release | debug |
-|---|---|---|
-| 0.1.26 | fits in 64 KiB (smallest I tried) | — |
-| 0.1.28 | 832 KiB overflows, 864 KiB is enough | 1 MiB overflows, 2 MiB is enough |
-
-**Why this hurts: on Windows the main thread gets 1 MiB by default** (the MSVC
-linker default; Rust does not raise it). So an application that encodes on its
-main thread — mine did — sits right on the edge. In my case the same logic
-crashed from one crate and survived from another, presumably because inlining
-moved the frame size slightly either side of the line. That is an unpleasant
-failure mode: it looks like it works until it does not.
-
-I have worked around it by encoding on a thread with an explicit 8 MiB stack.
+While measuring the above I also found that `OpusEncoder::new` needs about
+0.85 MiB of stack since 0.1.27 (0.1.26 fit in 64 KiB), which is enough to crash
+an application that encodes on the Windows main thread. That is unrelated to the
+codec behaviour discussed here, so I have raised it separately rather than
+lengthening this thread.
 
 #### What I did not verify
 
 - Other sample rates, mono, or `Application` values other than `Audio`.
 - That `N = 200` really is unreachable from the encoder — I only checked that
   `N <= 176` behaves, and that encoding is clean end to end.
-- Where the stack goes in `OpusEncoder::new` — I only bisected the boundary, I
-  did not look at what is allocated.
 
-On the other hand, the bitrate fix does hold up on real material: I exported the
-music that originally showed the problem at 192 kbps and it is clean by ear, with
-no crash.
+The bitrate fix does hold up on real material, though: I exported the music that
+originally showed the problem at 192 kbps and it is clean by ear, with no crash.

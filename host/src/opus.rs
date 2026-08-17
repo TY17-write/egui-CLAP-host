@@ -54,8 +54,12 @@ pub const DEFAULT_BITRATE_KBPS: u32 = 96;
 /// 符号化に使うスレッドのスタック。
 ///
 /// **`OpusEncoder::new` が大量にスタックを使う。** 0.1.26 は 64KiB でも足りたが、
-/// **0.1.28 は release で約 0.85MiB、debug では 2〜3MiB 要る** (実測は
+/// **0.1.27 以降は release で約 0.85MiB、debug では 2〜3MiB 要る** (実測は
 /// `spike/opus/src/bin/stack_probe.rs` と `bin/opus_smoke.rs`)。
+///
+/// 0.1.27 で符号化器の状態がヒープからインラインの固定長へ移り、
+/// `size_of::<OpusEncoder>()` が **1,288 → 254,608 バイト**になった。
+/// `new` は `Self` を値で返すので、**呼ぶだけで複製が数回積まれる**。
 ///
 /// **書き出しは `export_opus` からメインスレッド上で呼ばれ、Windows の
 /// メインスレッドは既定で 1MiB しか無い。** 必要量がその 1MiB のすぐ際にあるので、
