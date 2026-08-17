@@ -42,6 +42,7 @@ cargo run -p clap-host-test --bin seq_smoke -- target\debug\test_plugin.clap   #
 cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap   # WAV 書き出しの検証
 cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
 cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
+cargo run -p clap-host-test --bin gain_smoke -- target\debug\test_plugin.clap  # 検証用エフェクトの挙動確認
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
 cargo run -p clap-host-test --bin opus_smoke
@@ -64,6 +65,19 @@ cargo run -p clap-host-test --bin editor_smoke -- "<音源へのパス>.vst3" --
 # ユニットテスト
 cargo test -p clap-host-test --lib
 ```
+
+### test_plugin.clap には2つ入っている
+
+| 索引 | ID | 中身 |
+|---|---|---|
+| 0 | `com.example.test-sine` | 16ボイスのサイン波音源 |
+| 1 | `com.example.test-gain` | `out = in * gain + offset` のエフェクト |
+
+エフェクトのほうは**音声ルーティングの検証治具**で、音として使うものではない
+(経緯は [routing_plan.md](routing_plan.md))。**索引0 が音源のまま**なので、
+最初の1つを取る検証バイナリは今まで通り音源を掴む。
+
+画面から読み込むと**候補が2つ出る**ので、どちらかを選ぶことになる。
 
 ### テスト治具: test-plugin の VST3 版
 
