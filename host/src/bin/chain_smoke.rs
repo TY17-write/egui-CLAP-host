@@ -18,8 +18,16 @@
 //! 4. **入力ポートを持たない段が、そこまでの音を捨てること** — 音源を2段
 //!    重ねても2倍にならない (足し込みではなく上書きであること)
 //!
+//! `.vst3` を第2引数に渡すと、**VST3 のエフェクトを混ぜたチェーン**も試す。
+//! CLAP と VST3 では入力バッファの渡し方が全く違う (ポート連続配置 vs
+//! チャンネルごとの `Vec`) ので、片方が通っても他方は分からない。
+//!
 //! ```text
 //! cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap
+//!
+//! # VST3 も見る (clap-wrapper で作った test_plugin.vst3。作り方は guide.md)
+//! $env:CLAP_PATH = "$PWD\target\debug"
+//! cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
 //! ```
 
 use clack_host::prelude::*;
@@ -46,10 +54,21 @@ const GAIN_ID: &str = "com.example.test-gain";
 /// 比率の許容差。段ごとの丸めだけを吸収する幅
 const TOLERANCE: f32 = 0.02;
 
+/// チェーンの1段の指定
+#[derive(Clone, Copy)]
+enum Stage<'a> {
+    /// CLAP のプラグイン ID
+    Clap(&'a str),
+    /// VST3 のバンドルと、その中のクラス名 (名前で引く)
+    Vst3 { path: &'a Path, name: &'a str },
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let path = std::env::args()
-        .nth(1)
-        .ok_or("使い方: chain_smoke <path\\to\\test_plugin.clap>")?;
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
+        .ok_or("使い方: chain_smoke <path\\to\\test_plugin.clap> [path\\to\\test_plugin.vst3]")?;
+    let vst3_path = args.next();
 
     let (entry, plugins) = discovery::load_clap_file(Path::new(&path))?;
     for plugin in &plugins {
@@ -78,29 +97,31 @@ fn main() -> Result<(), Box<dyn Error>> {
             .ok_or("エフェクトに Gain パラメータがありません")?
     };
 
+    let sine = Stage::Clap(SINE_ID);
+    let gain = Stage::Clap(GAIN_ID);
     let mut failures = Vec::new();
 
     // ---- 1. 音源だけ (基準) ----
-    let plain = run_chain(&entry, &stream_config, &[SINE_ID], &[])?;
-    println!("音源のみ              : ピーク {plain:.4}");
+    let plain = run_chain(&entry, &stream_config, &[sine], &[])?;
+    println!("音源のみ                   : ピーク {plain:.4}");
     if plain < 0.01 {
         return Err("音源が鳴っていません。先に smoke で確かめてください".into());
     }
 
     // ---- 2. 音源 → ×0.5 ----
-    let one_stage = run_chain(&entry, &stream_config, &[SINE_ID, GAIN_ID], &[])?;
+    let one_stage = run_chain(&entry, &stream_config, &[sine, gain], &[])?;
     let ratio = one_stage / plain;
-    println!("音源 → ×0.5           : ピーク {one_stage:.4} (基準比 {ratio:.3}、期待 0.500)");
+    println!("音源 → ×0.5                : ピーク {one_stage:.4} (基準比 {ratio:.3}、期待 0.500)");
     if (ratio - 0.5).abs() > TOLERANCE {
         failures.push(format!(
-            "エフェクトに音が入っていません (基準比 {ratio:.3}、期待 0.5)"
+            "CLAP エフェクトに音が入っていません (基準比 {ratio:.3}、期待 0.5)"
         ));
     }
 
     // ---- 3. 音源 → ×0.5 → ×0.5 ----
-    let two_stages = run_chain(&entry, &stream_config, &[SINE_ID, GAIN_ID, GAIN_ID], &[])?;
+    let two_stages = run_chain(&entry, &stream_config, &[sine, gain, gain], &[])?;
     let ratio = two_stages / plain;
-    println!("音源 → ×0.5 → ×0.5    : ピーク {two_stages:.4} (基準比 {ratio:.3}、期待 0.250)");
+    println!("音源 → ×0.5 → ×0.5         : ピーク {two_stages:.4} (基準比 {ratio:.3}、期待 0.250)");
     if (ratio - 0.25).abs() > TOLERANCE {
         failures.push(format!(
             "2段目が効いていません (基準比 {ratio:.3}、期待 0.25)"
@@ -112,11 +133,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let addressed = run_chain(
         &entry,
         &stream_config,
-        &[SINE_ID, GAIN_ID, GAIN_ID],
+        &[sine, gain, gain],
         &[(1, gain_param, 2.0)],
     )?;
     let ratio = addressed / plain;
-    println!("音源 → ×2.0 → ×0.5    : ピーク {addressed:.4} (基準比 {ratio:.3}、期待 1.000)");
+    println!("音源 → ×2.0 → ×0.5         : ピーク {addressed:.4} (基準比 {ratio:.3}、期待 1.000)");
     if (ratio - 1.0).abs() > TOLERANCE {
         let hint = if ratio > 3.0 {
             " ← 全段に配られています"
@@ -129,9 +150,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // ---- 5. 音源を2段重ねる (2段目が1段目の音を捨てること) ----
-    let stacked = run_chain(&entry, &stream_config, &[SINE_ID, SINE_ID], &[])?;
+    let stacked = run_chain(&entry, &stream_config, &[sine, sine], &[])?;
     let ratio = stacked / plain;
-    println!("音源 → 音源           : ピーク {stacked:.4} (基準比 {ratio:.3}、期待 1.000)");
+    println!("音源 → 音源                : ピーク {stacked:.4} (基準比 {ratio:.3}、期待 1.000)");
     if (ratio - 1.0).abs() > TOLERANCE {
         let hint = if ratio > 1.8 {
             " ← 足し込まれています"
@@ -141,6 +162,44 @@ fn main() -> Result<(), Box<dyn Error>> {
         failures.push(format!(
             "入力を持たない段が前の音を捨てていません (基準比 {ratio:.3}、期待 1.0){hint}"
         ));
+    }
+
+    // ---- 6. VST3 のエフェクトを混ぜる (渡されたときだけ) ----
+    //
+    // **CLAP が通っても VST3 は分からない。** 入力バッファの渡し方が別物
+    // (ポート連続配置 vs チャンネルごとの `Vec`) で、実装も別にある。
+    if let Some(vst3_path) = &vst3_path {
+        let vst3_path = Path::new(vst3_path);
+        let vst3_gain = Stage::Vst3 {
+            path: vst3_path,
+            name: "Test Gain Effect",
+        };
+
+        let mixed = run_chain(&entry, &stream_config, &[sine, vst3_gain], &[])?;
+        let ratio = mixed / plain;
+        println!("音源 → ×0.5(VST3)          : ピーク {mixed:.4} (基準比 {ratio:.3}、期待 0.500)");
+        if (ratio - 0.5).abs() > TOLERANCE {
+            let hint = if ratio < 0.05 {
+                " ← 音が入っていません"
+            } else {
+                ""
+            };
+            failures.push(format!(
+                "VST3 エフェクトに音が入っていません (基準比 {ratio:.3}、期待 0.5){hint}"
+            ));
+        }
+
+        // CLAP と VST3 を混ぜた3段。どちらの向きの受け渡しも通ること
+        let both = run_chain(&entry, &stream_config, &[sine, vst3_gain, gain], &[])?;
+        let ratio = both / plain;
+        println!("音源 → ×0.5(VST3) → ×0.5   : ピーク {both:.4} (基準比 {ratio:.3}、期待 0.250)");
+        if (ratio - 0.25).abs() > TOLERANCE {
+            failures.push(format!(
+                "VST3 の出力を CLAP が受け取れていません (基準比 {ratio:.3}、期待 0.25)"
+            ));
+        }
+    } else {
+        println!("\n(VST3 は未検証。第2引数に .vst3 を渡すと一緒に見ます)");
     }
 
     if failures.is_empty() {
@@ -154,24 +213,40 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// `ids` の順にチェーンを組み、C4 を鳴らして出力のピークを返す。
+/// `stages` の順にチェーンを組み、C4 を鳴らして出力のピークを返す。
 ///
 /// `params` は `(段, パラメータ ID, 値)`。最初のブロックの先頭で送る。
 fn run_chain(
     entry: &PluginEntry,
     stream_config: &StreamAudioConfig,
-    ids: &[&str],
+    stages: &[Stage],
     params: &[(usize, u32, f64)],
 ) -> Result<f32, Box<dyn Error>> {
-    // インスタンスは処理器より長生きさせる (処理器を返す先が要る)
-    let mut instances = Vec::with_capacity(ids.len());
-    for id in ids {
-        instances.push(instantiate(entry, id)?);
+    // 段と同じ並びで持つ。VST3 は CLAP のインスタンスを持たないので None
+    let mut owners: Vec<Option<PluginInstance<MiniHost>>> = Vec::with_capacity(stages.len());
+    for stage in stages {
+        owners.push(match stage {
+            Stage::Clap(id) => Some(instantiate(entry, id)?),
+            Stage::Vst3 { .. } => None,
+        });
     }
 
-    let mut nodes = Vec::with_capacity(ids.len());
-    for instance in instances.iter_mut() {
-        nodes.push(audio::activate_node(instance, stream_config)?);
+    let mut nodes = Vec::with_capacity(stages.len());
+    for (stage, owner) in stages.iter().zip(owners.iter_mut()) {
+        let node = match (stage, owner) {
+            (Stage::Clap(_), Some(instance)) => audio::activate_node(instance, stream_config)?,
+            (Stage::Vst3 { path, name }, _) => {
+                let found = discovery::load_vst3_file(path)?;
+                let class = found
+                    .iter()
+                    .find(|plugin| plugin.name == *name)
+                    .ok_or_else(|| format!("{name} が {} にありません", path.display()))?;
+                // SharedPlugin は捨ててよい (処理器が同じ音源を指している)
+                audio::activate_vst3_node(path, &class.id, stream_config)?.1
+            }
+            (Stage::Clap(_), None) => return Err("CLAP の段にインスタンスがありません".into()),
+        };
+        nodes.push(node);
     }
 
     let mut nodes = nodes.into_iter();
@@ -214,13 +289,17 @@ fn run_chain(
         }
     }
 
-    // 借りた処理器をインスタンスへ返す (返さないと解放できない)
-    for (retired, mut instance) in track.into_retired().into_iter().zip(instances) {
-        match retired {
-            audio::RetiredProcessor::Clap(stopped) => instance.deactivate(stopped),
-            audio::RetiredProcessor::Vst3(_) => {
-                return Err("CLAP を載せたのに VST3 が返ってきた".into())
+    // 借りた処理器を始末する。**形式ごとにやり方が違う** (CLAP はインスタンスへ
+    // 返して初めて解放でき、VST3 はメインスレッドで停止する)
+    for (retired, owner) in track.into_retired().into_iter().zip(owners) {
+        match (retired, owner) {
+            (audio::RetiredProcessor::Clap(stopped), Some(mut instance)) => {
+                instance.deactivate(stopped)
             }
+            (audio::RetiredProcessor::Vst3(shared), None) => {
+                shared.lock().stop_processing()?;
+            }
+            _ => return Err("処理器と段の形式が食い違っています".into()),
         }
     }
 

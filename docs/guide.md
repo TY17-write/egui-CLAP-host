@@ -111,8 +111,17 @@ cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap t
 `--same-plugin` を付けると、片方だけ鳴る区間の音量が両形式で一致することまで
 確かめる (ベロシティやゲインの扱いが形式で食い違うと落ちる)。
 
+**`.clap` の中身がそのまま VST3 のクラスになる。** 音源とエフェクトの2つが
+入っているので、VST3 版にも2つ入る。エフェクトの入力経路を両形式で
+突き合わせられるので、チェーンの検証はこちらも通しておくとよい。
+
+```powershell
+cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
+```
+
 依存は VST3 SDK 3.8.0 の `base` / `public.sdk` / `pluginterfaces` / `cmake` だけを
 取得する (vstgui は含まれない)。ソースとビルド成果物を合わせて **約 80 MB** だった。
+CMake 4.4.2 / VS Build Tools 2022 で通っている (2026-08-17 時点)。
 
 ## 使い方
 

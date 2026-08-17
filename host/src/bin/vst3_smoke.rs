@@ -41,6 +41,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let path = Path::new(&path);
 
     let found = discovery::load_vst3_file(path)?;
+    // 1つのファイルに複数入りうる。何が見えているかを出しておく
+    for plugin in &found {
+        println!("  発見: {} ({})", plugin.name, plugin.id);
+    }
     let target = &found[0];
     println!("プラグイン: {} ({})", target.name, target.id);
 

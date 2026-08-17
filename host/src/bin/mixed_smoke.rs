@@ -259,6 +259,10 @@ fn run_realtime(
     let _ = transport.handle_msg(TransportMsg::Play);
 
     let mut mix = vec![0.0f32; BLOCK_SIZE * CHANNELS];
+    // **トラックごとに作業バッファを通す。** `process` は渡されたバッファを
+    // 上書きするので、共有のミックスへ直接処理させると後のトラックが前を消す
+    // (本体の再生・書き出しと同じ形。ここだけ違う組み方をすると意味が無い)
+    let mut scratch = vec![0.0f32; BLOCK_SIZE * CHANNELS];
     let mut samples = Vec::with_capacity(end_sample as usize * CHANNELS + mix.len());
 
     let mut position = 0u64;
@@ -273,8 +277,12 @@ fn run_realtime(
 
         mix.fill(0.0);
         for (track, processor) in processors.iter_mut() {
-            if let Err(e) = processor.process(position, &mut mix) {
+            scratch.fill(0.0);
+            if let Err(e) = processor.process(position, &mut scratch) {
                 return Err(format!("トラック {} の処理に失敗: {e}", *track + 1).into());
+            }
+            for (mixed, sample) in mix.iter_mut().zip(scratch.iter()) {
+                *mixed += *sample;
             }
         }
 

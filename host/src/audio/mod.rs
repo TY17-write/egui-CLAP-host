@@ -322,6 +322,16 @@ pub fn activate_vst3_track(
     class_id: &str,
     stream_config: &StreamAudioConfig,
 ) -> Result<(SharedPlugin, Box<TrackProcessor>), Box<dyn Error>> {
+    let (shared, node) = activate_vst3_node(path, class_id, stream_config)?;
+    Ok((shared, Box::new(TrackProcessor::from_node(node))))
+}
+
+/// VST3 プラグインを読み込んでチェーンの1段にする (CLAP の `activate_node` に対応)
+pub fn activate_vst3_node(
+    path: &std::path::Path,
+    class_id: &str,
+    stream_config: &StreamAudioConfig,
+) -> Result<(SharedPlugin, Node), Box<dyn Error>> {
     // ホストはインスタンス化のための入口でしかないので、ここで作って捨ててよい
     // (`Plugin` がモジュールを自分で抱える)。
     let mut vst3_host = vst3_host::host::Vst3Host::builder()
@@ -348,10 +358,7 @@ pub fn activate_vst3_track(
         stream_config,
     );
 
-    Ok((
-        shared,
-        Box::new(TrackProcessor::new(Backend::Vst3(processor))),
-    ))
+    Ok((shared, Node::new(Backend::Vst3(processor))))
 }
 
 /// 借りている VST3 の処理器を、別のサンプルレートで動かし直す。
