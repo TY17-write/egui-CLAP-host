@@ -121,6 +121,7 @@ A は「Windows のサウンド設定が 48kHz のときだけ成り立つ」も
 
 **上流へ報告済み**: <https://github.com/restsend/opus-rs/issues/11>
 (本文と再現手順は `spike/opus/upstream-issue.md` と同ディレクトリの検証コード)。
+0.1.28 での検証結果も同じ issue にコメントで投稿済み。
 
 ### 0.1.28 で直った (2026-08-17)
 
@@ -152,7 +153,8 @@ A は「Windows のサウンド設定が 48kHz のときだけ成り立つ」も
 `no_std` 向けの意図的な設計変更と思われる。**Windows のメインスレッドが
 1MiB しか無いという環境側の事情**で顕在化したもので、Linux では見えない。
 上流へは強い提言ではなく、**「遅くていいのでヒープに置く経路も欲しい」程度の
-お願い**として出す (`spike/opus/upstream-issue-stack.md`)。
+お願い**として出した: <https://github.com/restsend/opus-rs/issues/12>
+(本文は `spike/opus/upstream-issue-stack.md`)。
 
 これが効くのは、**書き出しが `export_opus` からメインスレッド上で呼ばれる**
 ため。Windows のメインスレッドは既定で 1MiB しか無い (`.cargo/config.toml` も

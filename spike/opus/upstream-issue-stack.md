@@ -1,7 +1,8 @@
 # Upstream issue 2 (restsend/opus-rs) — スタック使用量
 
-`opus-rs` 0.1.27 以降のスタック使用量について出す想定の本文。**まだ投稿して
-いない。**
+`opus-rs` 0.1.27 以降のスタック使用量について報告した本文。
+
+- **投稿先**: <https://github.com/restsend/opus-rs/issues/12> (2026-08-17)
 
 符号化の破綻 (issue #11 / `upstream-issue.md`) とは別件なので分けてある。
 

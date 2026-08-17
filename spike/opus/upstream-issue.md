@@ -6,6 +6,7 @@
 - 投稿時のタイトルは
   *"Encoded stream decodes to out-of-range samples in libopus at higher bitrates
   with tonal input; `celt_pvq_u`/`celt_pvq_v` also panic for large K"*
+- **0.1.28 の検証結果は、同じ issue へのコメントとして投稿済み** (2026-08-17)
 
 再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs` /
 `cwrs_check.rs` / `spectral_match.rs`。測定の経緯と、こちらの対処
@@ -315,9 +316,9 @@ I also did not try other sample rates, mono, or `Application` values other than
 
 ---
 
-## 追記用の本文 (2026-08-17)
+## 追記した本文 (2026-08-17)
 
-以下は**まだ投稿していない**。0.1.28 の検証結果として issue に足す想定の本文。
+0.1.28 の検証結果として issue #11 に**コメントで投稿済み**。
 日本語版の要約は上の「0.1.28 で直った」を参照。
 
 ---
