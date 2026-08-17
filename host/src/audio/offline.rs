@@ -109,8 +109,7 @@ pub fn render(processors: &mut [(usize, Box<TrackProcessor>)], setup: RenderSetu
     let _ = transport.handle_msg(TransportMsg::Play);
 
     let mut mix = vec![0.0f32; block_len];
-    let mut samples =
-        Vec::with_capacity((total_frames as usize + block_frames) * channels);
+    let mut samples = Vec::with_capacity((total_frames as usize + block_frames) * channels);
     let mut failures = FailureLog::default();
 
     // 直前まで鳴っていた音を消してから録り始める (無音から始めるため)。

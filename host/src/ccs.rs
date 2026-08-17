@@ -70,7 +70,8 @@ pub fn export(editor: &MidiEditor) -> Result<Exported, String> {
     }
 
     let notes = parts.iter().map(|part| part.notes.len()).sum();
-    let bytes = write_document(editor, &parts).map_err(|e| format!("XML を組み立てられません: {e}"))?;
+    let bytes =
+        write_document(editor, &parts).map_err(|e| format!("XML を組み立てられません: {e}"))?;
 
     Ok(Exported {
         bytes,
@@ -158,7 +159,11 @@ fn write_document(editor: &MidiEditor, parts: &[Part]) -> std::io::Result<Vec<u8
 }
 
 /// パート1つぶんの Unit (ノートとピッチの中身)
-fn write_unit<W: Write>(w: &mut Writer<W>, editor: &MidiEditor, part: &Part) -> std::io::Result<()> {
+fn write_unit<W: Write>(
+    w: &mut Writer<W>,
+    editor: &MidiEditor,
+    part: &Part,
+) -> std::io::Result<()> {
     start(
         w,
         "Unit",
@@ -583,10 +588,16 @@ mod tests {
         let unit_groups = [attr(&out, "Group", 0), attr(&out, "Group", 1)];
         assert_ne!(unit_groups[0], unit_groups[1], "UUID は段ごとに別");
         for id in &unit_groups {
-            assert!(out.contains(&format!("Id=\"{id}\"")), "Group 側にも {id} が要る");
+            assert!(
+                out.contains(&format!("Id=\"{id}\"")),
+                "Group 側にも {id} が要る"
+            );
         }
 
-        assert!(out.contains("段1") && out.contains("段2"), "段番号が名前に入る");
+        assert!(
+            out.contains("段1") && out.contains("段2"),
+            "段番号が名前に入る"
+        );
     }
 
     /// ノートの無い段は Unit を作らないこと (空パートが並ぶのを避ける)
@@ -655,7 +666,10 @@ mod tests {
         // (半音2, オクターブ9) はキー127 (範囲内) だが 69.5kHz 相当
         let too_high = note(0.0, 1.0, 2, 9, 0);
         assert!(too_high.key(scale).is_some(), "キー番号自体は範囲内");
-        assert!(written_key(scale, &too_high) > 127, "書き込む音は振り切れる");
+        assert!(
+            written_key(scale, &too_high) > 127,
+            "書き込む音は振り切れる"
+        );
 
         let mut editor = MidiEditor::default();
         editor.scale = scale;

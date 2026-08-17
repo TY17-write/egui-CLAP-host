@@ -24,8 +24,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 /// ウィンドウクラス名 (UTF-16, NUL 終端)
 const CLASS_NAME: &[u16] = &[
-    0x63, 0x6C, 0x61, 0x70, 0x5F, 0x68, 0x6F, 0x73, 0x74, 0x5F, 0x70, 0x6C, 0x75, 0x67, 0x69,
-    0x6E, 0x5F, 0x77, 0x69, 0x6E, 0x64, 0x6F, 0x77, 0x00,
+    0x63, 0x6C, 0x61, 0x70, 0x5F, 0x68, 0x6F, 0x73, 0x74, 0x5F, 0x70, 0x6C, 0x75, 0x67, 0x69, 0x6E,
+    0x5F, 0x77, 0x69, 0x6E, 0x64, 0x6F, 0x77, 0x00,
 ]; // "clap_host_plugin_window\0"
 
 /// WndProc から参照される状態。GWLP_USERDATA に Box の生ポインタとして格納し、
@@ -297,12 +297,7 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static WindowState> {
     ptr.as_ref()
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
             // CreateWindowExW の lpParam から WindowState を受け取り GWLP_USERDATA に保存

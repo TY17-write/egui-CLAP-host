@@ -114,7 +114,6 @@ impl Note {
     pub fn name(&self) -> String {
         format!("({},{})", self.semitone, self.octave)
     }
-
 }
 
 /// 新しいトラックが最初に持つ段数。
@@ -441,10 +440,7 @@ impl MidiEditor {
 
     /// 全ノートの終端 (四分音符単位)
     pub fn length_quarters(&self) -> f32 {
-        self.notes
-            .iter()
-            .map(|n| n.end_tick())
-            .fold(0.0, f32::max)
+        self.notes.iter().map(|n| n.end_tick()).fold(0.0, f32::max)
     }
 
     /// 終端を小節境界に切り上げた長さ (最低1小節)。
@@ -453,7 +449,9 @@ impl MidiEditor {
     pub fn length_quarters_bar_aligned(&self) -> f32 {
         const EPS: f32 = 1e-3;
         let bar = self.quarters_per_bar();
-        let bars = ((self.length_quarters() - EPS).max(0.0) / bar).ceil().max(1.0);
+        let bars = ((self.length_quarters() - EPS).max(0.0) / bar)
+            .ceil()
+            .max(1.0);
         bars * bar
     }
 
@@ -492,9 +490,8 @@ impl MidiEditor {
                 if note.duration <= 0.0 || !self.track_swings(note.track) {
                     return *note;
                 }
-                let shift = |tick: f32| {
-                    tick + swing::offset(tick, self.tempo, self.swing_peak_ratio)
-                };
+                let shift =
+                    |tick: f32| tick + swing::offset(tick, self.tempo, self.swing_peak_ratio);
                 let start = shift(note.start_tick);
                 // 極端に短いノートは終端が開始を追い越すので下限を設ける
                 let end = shift(note.end_tick())
@@ -711,7 +708,10 @@ mod tests {
             !editor.remove_last_normal_lane(1),
             "ノートのある段は残ること"
         );
-        assert!(!editor.remove_last_track(), "ノートのあるトラックは残ること");
+        assert!(
+            !editor.remove_last_track(),
+            "ノートのあるトラックは残ること"
+        );
 
         // 空の段は消せる
         editor.add_lane(1);
@@ -898,20 +898,23 @@ mod tests {
     fn swing_leaves_triplets_even() {
         let mut editor = swung();
         let third = 1.0 / 3.0;
-        editor.notes = vec![
-            note(third, third, 0, 4),
-            note(third * 2.0, third, 0, 4),
-        ];
+        editor.notes = vec![note(third, third, 0, 4), note(third * 2.0, third, 0, 4)];
 
         let played = editor.performed_notes();
         assert!(close(played[0].start_tick, third), "2音目は動かないこと");
-        assert!(close(played[1].start_tick, third * 2.0), "3音目も動かないこと");
+        assert!(
+            close(played[1].start_tick, third * 2.0),
+            "3音目も動かないこと"
+        );
         assert!(
             close(played[1].start_tick - played[0].start_tick, third),
             "刻みが均等のままであること"
         );
         assert!(
-            close(played[1].end_tick(), 1.0 + swing::downbeat_delay(editor.tempo)),
+            close(
+                played[1].end_tick(),
+                1.0 + swing::downbeat_delay(editor.tempo)
+            ),
             "3音目は遅れた次の拍頭まで伸びること: {}",
             played[1].end_tick()
         );
@@ -928,7 +931,10 @@ mod tests {
 
         let played = editor.performed_notes();
         assert_eq!(played[0], editor.notes[0], "何も変えないこと");
-        assert!(editor.to_events(48_000.0).is_empty(), "イベントも出ないこと");
+        assert!(
+            editor.to_events(48_000.0).is_empty(),
+            "イベントも出ないこと"
+        );
     }
 
     /// 再生用のイベントにスウィングが乗ること
@@ -1108,7 +1114,10 @@ mod tests {
         assert!((eq.frequency(9, 5) - 880.0).abs() < 1e-9, "1オクターブで倍");
         // B-P の基準キー63 = (半音3, オクターブ4)
         let bp = ScaleMode::BohlenPierce13;
-        assert!((bp.frequency(3, 4) - 311.127).abs() < 1e-9, "基準は 311.127Hz");
+        assert!(
+            (bp.frequency(3, 4) - 311.127).abs() < 1e-9,
+            "基準は 311.127Hz"
+        );
     }
 
     /// ボーレン・ピアースの1オクターブ表記が、実際にはトライターブ (3:1) であること
@@ -1321,7 +1330,11 @@ mod tests {
         assert!(editor.remove_last_normal_lane(0));
         assert_eq!(editor.lanes(0), 3);
         assert_eq!(editor.tracks[0].normal_lanes(), 2);
-        assert_eq!(editor.lane_cc(0, 2), Some(64), "CC 段は残り、繰り上がること");
+        assert_eq!(
+            editor.lane_cc(0, 2),
+            Some(64),
+            "CC 段は残り、繰り上がること"
+        );
         assert_eq!(editor.notes[0].lane, 2, "CC 段のブロックも付いてくること");
     }
 

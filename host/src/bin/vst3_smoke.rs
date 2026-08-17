@@ -52,8 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         sample_format: cpal::SampleFormat::F32,
     };
 
-    let (shared, mut processor) =
-        audio::activate_vst3_track(path, &target.id, &stream_config)?;
+    let (shared, mut processor) = audio::activate_vst3_track(path, &target.id, &stream_config)?;
 
     // ---- シーケンス: C4 のロングトーン1本 (8拍) ----
     // 途中で止めるためのものなので、検証の間ずっと鳴り続ける長さにする。
@@ -160,7 +159,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 実時間の再生が通っても、こちらが通るとは限らない。
     let mut processors = vec![(0usize, processor)];
     let setup = RenderSetup {
-        sequences: vec![editor.to_events_for_track(0, SAMPLE_RATE).into_boxed_slice()],
+        sequences: vec![editor
+            .to_events_for_track(0, SAMPLE_RATE)
+            .into_boxed_slice()],
         end_sample,
         tail_samples: (offline::TAIL_SECONDS * SAMPLE_RATE) as u64,
         block_frames: BLOCK_SIZE,
@@ -187,7 +188,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         ));
     }
     if rendered.peak < AUDIBLE {
-        failures.push(format!("書き出した内容が無音 (ピーク {:.4})", rendered.peak));
+        failures.push(format!(
+            "書き出した内容が無音 (ピーク {:.4})",
+            rendered.peak
+        ));
     }
 
     // ---- 後始末 (メインスレッドで止めてから解放する) ----

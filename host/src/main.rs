@@ -7,8 +7,7 @@
 //#![windows_subsystem = "windows"]
 
 use clap_host_test::{
-    audio, ccs, discovery, editor_ui, gui, host, midi, opus, params, project, sequencer, theme,
-    wav,
+    audio, ccs, discovery, editor_ui, gui, host, midi, opus, params, project, sequencer, theme, wav,
 };
 
 use audio::config::StreamAudioConfig;
@@ -18,18 +17,18 @@ use audio::vst3::SharedPlugin;
 use audio::GuiMsg;
 use clack_host::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
-use eframe::egui;
 use editor_ui::{EditorCommand, EditorState};
+use eframe::egui;
 use gui::{PluginGuiManager, Vst3GuiManager};
 use host::{MainThreadMessage, MiniHost, MiniHostMainThread, MiniHostShared};
 use params::ParamUi;
 use project::PluginSnapshot;
 use sequencer::SeqEvent;
-use std::sync::atomic::Ordering;
 use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// 鍵盤に表示する1オクターブ+1音 (C4〜C5) ※鍵盤 UI 無効化中のため未使用
@@ -480,7 +479,9 @@ impl App {
         if let Some(directory) = self.dialog_directory() {
             dialog = dialog.set_directory(directory);
         }
-        let Some(path) = dialog.pick_file() else { return };
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
         self.last_directory = path.parent().map(PathBuf::from);
 
         let bytes = match std::fs::read(&path) {
@@ -511,7 +512,9 @@ impl App {
                 self.editor.project_path = None;
                 self.error = None;
                 self.status = Some(if cc_lanes > 0 {
-                    format!("{name} から {count} 個のノートと {cc_lanes} 本の CC 段を読み込みました")
+                    format!(
+                        "{name} から {count} 個のノートと {cc_lanes} 本の CC 段を読み込みました"
+                    )
                 } else {
                     format!("{name} から {count} 個のノートを読み込みました")
                 });
@@ -599,7 +602,9 @@ impl App {
         if let Some(directory) = self.dialog_directory() {
             dialog = dialog.set_directory(directory);
         }
-        let Some(path) = dialog.pick_file() else { return };
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
 
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -634,10 +639,11 @@ impl App {
                     self.notice = Some(Notice::ok("プロジェクトを開きました", body));
                 } else {
                     body.push_str("\n\n次の音源は読み込めませんでした。");
-                    body.push_str("\nそのトラックは音源なしになっています (ノートは残っています)。\n");
+                    body.push_str(
+                        "\nそのトラックは音源なしになっています (ノートは残っています)。\n",
+                    );
                     body.push_str(&failures.join("\n"));
-                    self.notice =
-                        Some(Notice::error("プロジェクトを一部だけ開きました", body));
+                    self.notice = Some(Notice::error("プロジェクトを一部だけ開きました", body));
                 }
             }
             Err(e) => {
@@ -873,12 +879,8 @@ impl App {
                             failure.blocks
                         ));
                     }
-                    self.status = Some(format!(
-                        "書き出しました (一部失敗): {}",
-                        file_label(&path)
-                    ));
-                    self.notice =
-                        Some(Notice::error("WAV の一部を書き出せませんでした", body));
+                    self.status = Some(format!("書き出しました (一部失敗): {}", file_label(&path)));
+                    self.notice = Some(Notice::error("WAV の一部を書き出せませんでした", body));
                 }
             }
             Err(e) => self.fail_export(format!("保存できません:\n{e}")),
@@ -1066,13 +1068,21 @@ impl App {
                 self.notice = Some(Notice::ok("CCS を書き出しました", body));
             }
             Err(e) => {
-                self.notice = Some(Notice::error("CCS を書き出せません", format!("保存できません:\n{e}")));
+                self.notice = Some(Notice::error(
+                    "CCS を書き出せません",
+                    format!("保存できません:\n{e}"),
+                ));
             }
         }
     }
 
     /// 保存先を選ばせる。拡張子を省略されたら補う。
-    fn ask_save_path(&mut self, filter: &str, extension: &str, default_name: &str) -> Option<PathBuf> {
+    fn ask_save_path(
+        &mut self,
+        filter: &str,
+        extension: &str,
+        default_name: &str,
+    ) -> Option<PathBuf> {
         let mut dialog = rfd::FileDialog::new()
             .add_filter(filter, &[extension])
             .set_file_name(default_name);
@@ -1233,8 +1243,7 @@ impl App {
     ) -> Result<bool, String> {
         // 最初のロード時にストリームを用意する
         if self.engine.is_none() {
-            let engine =
-                start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
+            let engine = start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
             self.engine = Some(engine);
         }
 

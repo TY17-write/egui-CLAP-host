@@ -163,12 +163,31 @@ mod tests {
     /// tick の式のままだと低速側で伸びすぎる (60BPM で 117ms)。
     #[test]
     fn downbeat_delay_is_capped_in_milliseconds() {
-        assert!(close_ms(delay_ms(120), 48.958), "120BPM は無傷: {}", delay_ms(120));
-        assert!(close_ms(delay_ms(200), 21.875), "200BPM も無傷: {}", delay_ms(200));
-        assert!(close_ms(delay_ms(60), 60.0), "60BPM は頭打ち: {}", delay_ms(60));
-        assert!(close_ms(delay_ms(40), 60.0), "さらに遅くても 60ms を超えないこと");
+        assert!(
+            close_ms(delay_ms(120), 48.958),
+            "120BPM は無傷: {}",
+            delay_ms(120)
+        );
+        assert!(
+            close_ms(delay_ms(200), 21.875),
+            "200BPM も無傷: {}",
+            delay_ms(200)
+        );
+        assert!(
+            close_ms(delay_ms(60), 60.0),
+            "60BPM は頭打ち: {}",
+            delay_ms(60)
+        );
+        assert!(
+            close_ms(delay_ms(40), 60.0),
+            "さらに遅くても 60ms を超えないこと"
+        );
         // 境界は約 103BPM
-        assert!(delay_ms(100) >= 59.9, "100BPM は頭打ち側: {}", delay_ms(100));
+        assert!(
+            delay_ms(100) >= 59.9,
+            "100BPM は頭打ち側: {}",
+            delay_ms(100)
+        );
         assert!(delay_ms(110) < 60.0, "110BPM は素の式側: {}", delay_ms(110));
     }
 
@@ -192,9 +211,19 @@ mod tests {
     fn offset_moves_only_downbeats_and_offbeats() {
         let (t, c) = (120, 1.5);
         assert!(close(offset(0.0, t, c), downbeat_delay(t)), "拍頭");
-        assert!(close(offset(3.0, t, c), downbeat_delay(t)), "何拍目でも拍頭");
-        assert!(close(offset(0.5, t, c), 0.066_724), "裏拍: {}", offset(0.5, t, c));
-        assert!(close(offset(2.5, t, c), offset(0.5, t, c)), "何拍目でも裏拍");
+        assert!(
+            close(offset(3.0, t, c), downbeat_delay(t)),
+            "何拍目でも拍頭"
+        );
+        assert!(
+            close(offset(0.5, t, c), 0.066_724),
+            "裏拍: {}",
+            offset(0.5, t, c)
+        );
+        assert!(
+            close(offset(2.5, t, c), offset(0.5, t, c)),
+            "何拍目でも裏拍"
+        );
 
         assert_eq!(offset(1.0 / 3.0, t, c), 0.0, "三連符の2音目");
         assert_eq!(offset(2.0 / 3.0, t, c), 0.0, "三連符の3音目");
@@ -206,9 +235,18 @@ mod tests {
     #[test]
     fn offset_tolerates_tuplet_rounding() {
         let (t, c) = (120, 1.5);
-        assert!(close(offset(0.999_999_8, t, c), downbeat_delay(t)), "手前側の誤差");
-        assert!(close(offset(1.000_000_2, t, c), downbeat_delay(t)), "奥側の誤差");
-        assert!(close(offset(0.500_000_2, t, c), offset(0.5, t, c)), "裏拍の誤差");
+        assert!(
+            close(offset(0.999_999_8, t, c), downbeat_delay(t)),
+            "手前側の誤差"
+        );
+        assert!(
+            close(offset(1.000_000_2, t, c), downbeat_delay(t)),
+            "奥側の誤差"
+        );
+        assert!(
+            close(offset(0.500_000_2, t, c), offset(0.5, t, c)),
+            "裏拍の誤差"
+        );
         // 三連符は許容誤差の外
         assert_eq!(offset(0.333_333_3, t, c), 0.0);
     }

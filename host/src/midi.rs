@@ -4,11 +4,13 @@
 //! ここで相互変換する。段 (lane) は MIDI に存在しない概念なので、読み込み時は
 //! 重ならないように機械的に割り振る。
 
-use crate::sequencer::{MidiEditor, Note, ScaleMode, CC_RELEASE};
 #[cfg(test)]
 use crate::sequencer::TrackInfo;
-use midly::num::{u4, u7, u15, u24, u28};
-use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind};
+use crate::sequencer::{MidiEditor, Note, ScaleMode, CC_RELEASE};
+use midly::num::{u15, u24, u28, u4, u7};
+use midly::{
+    Format, Header, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
+};
 use std::collections::{BTreeMap, HashMap};
 
 /// 書き出すときの分解能 (四分音符あたりのティック数)。
@@ -251,9 +253,7 @@ pub fn from_bytes(bytes: &[u8], scale: ScaleMode) -> Result<Imported, String> {
 
     let ticks_per_quarter = match smf.header.timing {
         Timing::Metrical(tpq) => tpq.as_int() as f32,
-        Timing::Timecode(..) => {
-            return Err("SMPTE タイムコードの MIDI には未対応です".to_string())
-        }
+        Timing::Timecode(..) => return Err("SMPTE タイムコードの MIDI には未対応です".to_string()),
     };
     if ticks_per_quarter <= 0.0 {
         return Err("分解能が不正な MIDI です".to_string());
@@ -427,9 +427,7 @@ pub fn from_bytes(bytes: &[u8], scale: ScaleMode) -> Result<Imported, String> {
             // 自分で書き出したファイルは 1つの SMF トラック = 1つの段 なので、
             // 名前があって音符が無ければ**その段がそのまま CC 段**。
             // これで書き出す前の配置がそのまま戻る。
-            let named_lane = from_name
-                .map(|(_, lane)| lane)
-                .filter(|_| !had_notes);
+            let named_lane = from_name.map(|(_, lane)| lane).filter(|_| !had_notes);
             pending_ccs.push((base_track, named_lane, ccs));
         }
     }
@@ -628,10 +626,7 @@ mod tests {
 
         assert_eq!(
             seen,
-            vec![
-                (0, 64, 100),
-                (TICKS_PER_QUARTER as u32, 64, CC_RELEASE),
-            ],
+            vec![(0, 64, 100), (TICKS_PER_QUARTER as u32, 64, CC_RELEASE),],
             "頭で値、尻で解除値が並ぶこと"
         );
 
@@ -890,8 +885,7 @@ mod tests {
         editor.notes = vec![note(0.0, 1.0, 0, 5, 100)]; // key = 73
 
         let bytes = to_bytes(&editor).expect("書き出せること");
-        let imported =
-            from_bytes(&bytes, ScaleMode::BohlenPierce13).expect("読み戻せること");
+        let imported = from_bytes(&bytes, ScaleMode::BohlenPierce13).expect("読み戻せること");
         assert_eq!(imported.notes[0].semitone, 0);
         assert_eq!(imported.notes[0].octave, 5);
 

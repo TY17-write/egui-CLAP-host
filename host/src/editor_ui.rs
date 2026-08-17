@@ -7,7 +7,7 @@ use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
 use crate::swing;
 use crate::theme::palette;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, vec2,
+    self, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke,
 };
 
 /// 1四分音符の横幅の既定値 (ピクセル)。
@@ -981,7 +981,9 @@ pub enum EditorCommand {
     Commit,
     Play,
     Stop,
-    Seek { quarters: f64 },
+    Seek {
+        quarters: f64,
+    },
     SetLoop(bool),
     /// MIDI ファイルを選んで読み込む
     ImportMidi,
@@ -1000,7 +1002,9 @@ pub enum EditorCommand {
     /// 1トラック目を CeVIO のプロジェクトファイル (CCS) に書き出す
     ExportCcs,
     /// 指定トラックに音源 (.clap / .vst3) を読み込む
-    LoadPlugin { track: usize },
+    LoadPlugin {
+        track: usize,
+    },
 }
 
 /// エディタパネルを描画する。pos_quarters は現在の再生位置 (四分音符単位)。
@@ -1066,10 +1070,9 @@ pub fn editor_panel(
         if let Some(x) = state.pending_scroll_x.take() {
             grid_area = grid_area.horizontal_scroll_offset(x);
         }
-        let grid_scroll = grid_area
-            .show(ui, |ui| {
-                grid(ui, state, pos_quarters, playing, &mut commands);
-            });
+        let grid_scroll = grid_area.show(ui, |ui| {
+            grid(ui, state, pos_quarters, playing, &mut commands);
+        });
         // 次フレームで左欄を同じ位置に合わせる
         state.grid_scroll_y = grid_scroll.state.offset.y;
     });
@@ -1155,7 +1158,10 @@ pub fn editor_panel(
                     } else {
                         format!("{kbps} kbps")
                     };
-                    if ui.selectable_label(state.opus_bitrate_kbps == kbps, label).clicked() {
+                    if ui
+                        .selectable_label(state.opus_bitrate_kbps == kbps, label)
+                        .clicked()
+                    {
                         state.opus_bitrate_kbps = kbps;
                         commands.push(EditorCommand::ExportOpus);
                         ui.close_menu();
@@ -1790,7 +1796,7 @@ fn toolbar(
     ui.horizontal(|ui| {
         if let Some(idx) = state.selected {
             if let Some(note) = state.editor.notes.get_mut(idx) {
-				/* どうやってもUIがズレるので削除しました。→後続のラベルがあるため基本不要
+                /* どうやってもUIがズレるので削除しました。→後続のラベルがあるため基本不要
                 // 表示名は桁数で幅が変わる ((9,4) → (10,4)) ため、
                 // 固定幅の領域に左寄せで置いて後続のウィジェットを動かさない
                 let name = format!("選択中: {}", note.name());
@@ -1801,7 +1807,7 @@ fn toolbar(
                         ui.label(name);
                     },
                 );
-				*/
+                */
 
                 // 2桁分の幅を確保して、9→10 でレイアウトが動かないようにする
                 ui.label("半音");
@@ -1978,7 +1984,10 @@ fn grid(
         palette::BG_LIGHT,
     );
     painter.rect_filled(
-        Rect::from_min_size(origin + vec2(0.0, RULER_H), vec2(size.x, content_h - RULER_H)),
+        Rect::from_min_size(
+            origin + vec2(0.0, RULER_H),
+            vec2(size.x, content_h - RULER_H),
+        ),
         CornerRadius::ZERO,
         palette::BG_DARK,
     );
@@ -2251,7 +2260,15 @@ fn grid(
     // カーソル形状のフィードバック
     if state.drag.is_none() && state.middle_drag.is_none() {
         if let Some(hover) = response.hover_pos() {
-            match hit_note(&state.editor.notes, &row_offsets, origin, hover, left_resize, ppq, row_h) {
+            match hit_note(
+                &state.editor.notes,
+                &row_offsets,
+                origin,
+                hover,
+                left_resize,
+                ppq,
+                row_h,
+            ) {
                 Some((_, Hit::ResizeRight | Hit::ResizeLeft)) => {
                     ui.output_mut(|o| o.cursor_icon = CursorIcon::ResizeHorizontal)
                 }
@@ -2276,9 +2293,15 @@ fn grid(
                     base_selection: Vec::new(),
                     origin: to_content_pos(origin, pos, ppq, row_h),
                 });
-            } else if let Some((idx, hit)) =
-                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h)
-            {
+            } else if let Some((idx, hit)) = hit_note(
+                &state.editor.notes,
+                &row_offsets,
+                origin,
+                pos,
+                left_resize,
+                ppq,
+                row_h,
+            ) {
                 // 複数選択中のノートを掴んだら選択全体を操作する (選択は変えない)
                 let bulk = state.selection.len() > 1 && state.is_selected(idx);
                 let targets = if bulk {
@@ -2367,12 +2390,8 @@ fn grid(
                 DragKind::Resize { from_left } => {
                     // 掴んだ端を、選択全体で同じ量だけ動かす。音価を揃え直さないので
                     // 尾揃え・頭揃えで作った相対関係がそのまま保たれる。
-                    let dx = resize_delta(
-                        &drag.targets,
-                        content.x - drag.origin.x,
-                        snap,
-                        from_left,
-                    );
+                    let dx =
+                        resize_delta(&drag.targets, content.x - drag.origin.x, snap, from_left);
 
                     for (idx, orig) in &drag.targets {
                         let mut note = *orig;
@@ -2391,11 +2410,17 @@ fn grid(
                     }
                 }
                 DragKind::Marquee => {
-                    let rect = Rect::from_two_pos(to_screen_pos(origin, drag.origin, ppq, row_h), pos);
+                    let rect =
+                        Rect::from_two_pos(to_screen_pos(origin, drag.origin, ppq, row_h), pos);
                     let mut selection = drag.base_selection.clone();
                     for (idx, note) in state.editor.notes.iter().enumerate() {
-                        if rect.intersects(note_rect(origin, note_row(&row_offsets, note), note, ppq, row_h))
-                            && !selection.contains(&idx)
+                        if rect.intersects(note_rect(
+                            origin,
+                            note_row(&row_offsets, note),
+                            note,
+                            ppq,
+                            row_h,
+                        )) && !selection.contains(&idx)
                         {
                             selection.push(idx);
                         }
@@ -2454,7 +2479,15 @@ fn grid(
                     quarters: seek_quarters(pos.x),
                 });
             } else {
-                match hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h) {
+                match hit_note(
+                    &state.editor.notes,
+                    &row_offsets,
+                    origin,
+                    pos,
+                    left_resize,
+                    ppq,
+                    row_h,
+                ) {
                     // Shift+クリックは選択に追加 / 解除
                     Some((idx, _)) if ui.input(|i| i.modifiers.shift) => {
                         let mut selection = state.selection_sorted();
@@ -2477,7 +2510,16 @@ fn grid(
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if is_inside_lanes(origin, pos, content_h)
-                && hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h).is_none()
+                && hit_note(
+                    &state.editor.notes,
+                    &row_offsets,
+                    origin,
+                    pos,
+                    left_resize,
+                    ppq,
+                    row_h,
+                )
+                .is_none()
             {
                 // 最後に選択・編集したノートの設定を引き継ぐ。
                 // (ダブルクリックの1打目で選択が解除されるため state.selected は使えない)
@@ -2511,9 +2553,15 @@ fn grid(
     // 右クリックで削除 (選択中のノートを指したら選択ごと消す)
     if response.secondary_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            if let Some((idx, _)) =
-                hit_note(&state.editor.notes, &row_offsets, origin, pos, left_resize, ppq, row_h)
-            {
+            if let Some((idx, _)) = hit_note(
+                &state.editor.notes,
+                &row_offsets,
+                origin,
+                pos,
+                left_resize,
+                ppq,
+                row_h,
+            ) {
                 state.history.record(EditGroup::Once);
                 if state.is_selected(idx) {
                     state.delete_selection();
@@ -2778,7 +2826,11 @@ fn track_gutter_header(ui: &mut egui::Ui, state: &mut EditorState) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     content.set_clip_rect(rect);
-    content.label(egui::RichText::new("トラック").size(11.0).color(palette::FG_DIM));
+    content.label(
+        egui::RichText::new("トラック")
+            .size(11.0)
+            .color(palette::FG_DIM),
+    );
 
     if content
         .small_button("+")
@@ -2839,7 +2891,10 @@ fn track_gutter_content(
         let mut content = ui.new_child(
             egui::UiBuilder::new()
                 // 右端は段の帯にあけておく
-                .max_rect(rect.shrink2(vec2(6.0, pad_y)).with_max_x(rect.right() - LANE_STRIP_W - 4.0))
+                .max_rect(
+                    rect.shrink2(vec2(6.0, pad_y))
+                        .with_max_x(rect.right() - LANE_STRIP_W - 4.0),
+                )
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         content.set_clip_rect(rect);
@@ -2921,11 +2976,7 @@ fn track_gutter_content(
         });
 
         // 音源 (.clap / .vst3) の読み込み。載っていればボタンを色付きにして名前を出す
-        let plugin = state
-            .track_plugins
-            .get(track)
-            .cloned()
-            .flatten();
+        let plugin = state.track_plugins.get(track).cloned().flatten();
         let label = egui::RichText::new("♪").size(11.0).color(match &plugin {
             Some(_) => palette::GREEN,
             None => palette::FG_DIM,
@@ -3464,7 +3515,15 @@ mod tests {
     fn bulk_move_keeps_relative_positions() {
         // 0.1 だけずれた位置にあるノートも、掴んだノートと同じ移動量で動く
         let targets = vec![(0, placed(1.0, 2)), (1, placed(1.1, 3))];
-        let (dx, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.6, 1, 0.25, 16);
+        let (dx, d_lane) = move_delta(
+            &targets,
+            &single_track_rows(),
+            &single_track_editor(),
+            0.6,
+            1,
+            0.25,
+            16,
+        );
         assert_eq!(dx, 0.5, "掴んだノートが 1.5 に来るようスナップされること");
         assert_eq!(d_lane, 1);
     }
@@ -3558,8 +3617,15 @@ mod tests {
         let targets = vec![(0, placed(1.0, 14))];
 
         for requested in [-1, 1, -5, 5] {
-            let (dx, d_lane) =
-                move_delta(&targets, &single_track_rows(), &editor, 0.5, requested, 0.25, 16);
+            let (dx, d_lane) = move_delta(
+                &targets,
+                &single_track_rows(),
+                &editor,
+                0.5,
+                requested,
+                0.25,
+                16,
+            );
             assert_eq!(d_lane, 0, "段を移動できないこと (要求 {requested})");
             assert_eq!(dx, 0.5, "横方向は動かせること");
         }
@@ -3570,13 +3636,37 @@ mod tests {
     fn bulk_move_clamps_to_bounds() {
         let targets = vec![(0, placed(1.0, 1)), (1, placed(0.5, 15))];
         // 左へ大きく動かしても、先頭のノートが 0 未満にならない分しか動かない
-        let (dx, _) = move_delta(&targets, &single_track_rows(), &single_track_editor(), -5.0, 0, 0.25, 16);
+        let (dx, _) = move_delta(
+            &targets,
+            &single_track_rows(),
+            &single_track_editor(),
+            -5.0,
+            0,
+            0.25,
+            16,
+        );
         assert_eq!(dx, -0.5);
         // 下へ動かしても、最下段のノートが 15 段目に留まる
-        let (_, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.0, 5, 0.25, 16);
+        let (_, d_lane) = move_delta(
+            &targets,
+            &single_track_rows(),
+            &single_track_editor(),
+            0.0,
+            5,
+            0.25,
+            16,
+        );
         assert_eq!(d_lane, 0);
         // 上へ動かすときは最上段のノートが 0 段目で止まる
-        let (_, d_lane) = move_delta(&targets, &single_track_rows(), &single_track_editor(), 0.0, -5, 0.25, 16);
+        let (_, d_lane) = move_delta(
+            &targets,
+            &single_track_rows(),
+            &single_track_editor(),
+            0.0,
+            -5,
+            0.25,
+            16,
+        );
         assert_eq!(d_lane, -1);
     }
 
@@ -3613,7 +3703,10 @@ mod tests {
         assert!(state.align_selection_starts());
         assert_eq!(state.editor.notes[0].start_tick, 2.0, "選択内の最小は 2.0");
         assert_eq!(state.editor.notes[2].start_tick, 2.0);
-        assert_eq!(state.editor.notes[1].start_tick, 0.5, "選択外は動かないこと");
+        assert_eq!(
+            state.editor.notes[1].start_tick, 0.5,
+            "選択外は動かないこと"
+        );
 
         // 揃っていれば何もしない (無駄なアンドゥ履歴を作らないため)
         assert!(!state.align_selection_starts());
@@ -3622,7 +3715,7 @@ mod tests {
         assert!(!state.align_selection_starts());
     }
 
-/// → キー: 開始位置はそのままに、音価を伸ばして尾が揃うこと
+    /// → キー: 開始位置はそのままに、音価を伸ばして尾が揃うこと
     #[test]
     fn align_selection_ends_to_latest() {
         let mut state = EditorState::default();
@@ -3631,11 +3724,27 @@ mod tests {
         state.select_many(vec![0, 2]);
 
         assert!(state.align_selection_ends());
-        assert_eq!(state.editor.notes[0].start_tick, 2.0, "開始位置は動かさないこと");
-        assert_eq!(state.editor.notes[0].duration, 1.5, "音価を伸ばして尾を揃える");
-        assert_eq!(state.editor.notes[0].end_tick(), 3.5, "選択内の最遅の終端に揃う");
-        assert_eq!(state.editor.notes[2].duration, 0.5, "基準ノートは変わらない");
-        assert_eq!(state.editor.notes[1].duration, 0.5, "選択外は変わらないこと");
+        assert_eq!(
+            state.editor.notes[0].start_tick, 2.0,
+            "開始位置は動かさないこと"
+        );
+        assert_eq!(
+            state.editor.notes[0].duration, 1.5,
+            "音価を伸ばして尾を揃える"
+        );
+        assert_eq!(
+            state.editor.notes[0].end_tick(),
+            3.5,
+            "選択内の最遅の終端に揃う"
+        );
+        assert_eq!(
+            state.editor.notes[2].duration, 0.5,
+            "基準ノートは変わらない"
+        );
+        assert_eq!(
+            state.editor.notes[1].duration, 0.5,
+            "選択外は変わらないこと"
+        );
 
         // 揃っていれば何もしない
         assert!(!state.align_selection_ends());
@@ -3655,7 +3764,11 @@ mod tests {
             !is_inside_lanes(origin, Pos2::new(0.0, RULER_H - 1.0), content_h),
             "ルーラーの上では作らないこと"
         );
-        assert!(is_inside_lanes(origin, Pos2::new(0.0, RULER_H + 1.0), content_h));
+        assert!(is_inside_lanes(
+            origin,
+            Pos2::new(0.0, RULER_H + 1.0),
+            content_h
+        ));
         assert!(
             is_inside_lanes(origin, Pos2::new(0.0, content_h - 1.0), content_h),
             "最終段の下端までは作れること"
@@ -3667,8 +3780,16 @@ mod tests {
 
         // 原点がずれても同じ判定になること (スクロール中でも成り立つ)
         let moved = Pos2::new(30.0, 100.0);
-        assert!(is_inside_lanes(moved, moved + vec2(0.0, RULER_H + 1.0), content_h));
-        assert!(!is_inside_lanes(moved, moved + vec2(0.0, content_h + 1.0), content_h));
+        assert!(is_inside_lanes(
+            moved,
+            moved + vec2(0.0, RULER_H + 1.0),
+            content_h
+        ));
+        assert!(!is_inside_lanes(
+            moved,
+            moved + vec2(0.0, content_h + 1.0),
+            content_h
+        ));
     }
 
     /// 縦ズームは上下限で頭打ちになり、実際に変わった量を返すこと
@@ -3703,7 +3824,8 @@ mod tests {
         let anchor_x = viewport_left + 150.0;
 
         for new_ppq in [ppq * 2.0, ppq * 0.5, ppq * 8.0, ppq] {
-            let offset = horizontal_offset_for_anchor(viewport_left, anchor_x, anchor_quarters, new_ppq);
+            let offset =
+                horizontal_offset_for_anchor(viewport_left, anchor_x, anchor_quarters, new_ppq);
             // オフセットから逆算した画面上の位置が元と一致すること
             let origin_x = viewport_left - offset;
             let shown_x = origin_x + anchor_quarters * new_ppq;
@@ -3812,9 +3934,15 @@ mod tests {
 
         // 広げた2段目の中央
         let inside = Pos2::new(4.0, RULER_H + tall * 1.5);
-        assert_eq!(hit_note(&notes, &rows, origin, inside, false, PPQ, tall), Some((0, Hit::Body)));
+        assert_eq!(
+            hit_note(&notes, &rows, origin, inside, false, PPQ, tall),
+            Some((0, Hit::Body))
+        );
         // 同じ点も、既定の高さでは2段目の外なので当たらない
-        assert_eq!(hit_note(&notes, &rows, origin, inside, false, PPQ, ROW_H), None);
+        assert_eq!(
+            hit_note(&notes, &rows, origin, inside, false, PPQ, ROW_H),
+            None
+        );
     }
 
     /// 左端音価が ON でも、右端は従来どおりリサイズ領域であること。
@@ -3832,19 +3960,54 @@ mod tests {
         let right_pos = Pos2::new(17.0, y);
 
         // OFF: 左端は本体扱い (移動)、右端はリサイズ
-        assert_eq!(hit_note(&notes, &single_track_rows(), origin, left_pos, false, PPQ, ROW_H), Some((0, Hit::Body)));
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, right_pos, false, PPQ, ROW_H),
+            hit_note(
+                &notes,
+                &single_track_rows(),
+                origin,
+                left_pos,
+                false,
+                PPQ,
+                ROW_H
+            ),
+            Some((0, Hit::Body))
+        );
+        assert_eq!(
+            hit_note(
+                &notes,
+                &single_track_rows(),
+                origin,
+                right_pos,
+                false,
+                PPQ,
+                ROW_H
+            ),
             Some((0, Hit::ResizeRight))
         );
 
         // ON: 左端が左リサイズになり、右端は引き続き右リサイズ
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, left_pos, true, PPQ, ROW_H),
+            hit_note(
+                &notes,
+                &single_track_rows(),
+                origin,
+                left_pos,
+                true,
+                PPQ,
+                ROW_H
+            ),
             Some((0, Hit::ResizeLeft))
         );
         assert_eq!(
-            hit_note(&notes, &single_track_rows(), origin, right_pos, true, PPQ, ROW_H),
+            hit_note(
+                &notes,
+                &single_track_rows(),
+                origin,
+                right_pos,
+                true,
+                PPQ,
+                ROW_H
+            ),
             Some((0, Hit::ResizeRight))
         );
     }
@@ -4018,7 +4181,11 @@ mod tests {
 
         // 選択中ノートの頭が近ければそちらを優先する
         assert_eq!(seek_target(1.42, 0.5, Some(1.4), false), 1.4f32 as f64);
-        assert_eq!(seek_target(1.49, 0.5, Some(1.2), false), 1.5, "遠ければ拍が優先");
+        assert_eq!(
+            seek_target(1.49, 0.5, Some(1.2), false),
+            1.5,
+            "遠ければ拍が優先"
+        );
 
         // 負にならないこと
         assert_eq!(seek_target(-3.0, 1.0, None, false), 0.0);
@@ -4049,10 +4216,7 @@ mod tests {
         // 掴んだノート (先頭) の終端 3.5 を 4.0 へ → 全員 +0.5
         let dx = resize_delta(&targets, 0.5, 0.25, false);
         assert_eq!(dx, 0.5);
-        let ends: Vec<f32> = targets
-            .iter()
-            .map(|(_, n)| n.end_tick() + dx)
-            .collect();
+        let ends: Vec<f32> = targets.iter().map(|(_, n)| n.end_tick() + dx).collect();
         assert_eq!(ends, vec![4.0, 4.0], "終端が揃ったままであること");
 
         // 縮めすぎても、いちばん短いノートが snap を下回らない
@@ -4205,7 +4369,10 @@ mod tests {
 
         assert!(state.history.can_undo());
         assert!(state.history.undo(&mut state.editor));
-        assert_eq!(state.editor.notes[0].start_tick, 1.0, "ドラッグ全体が1回で戻ること");
+        assert_eq!(
+            state.editor.notes[0].start_tick, 1.0,
+            "ドラッグ全体が1回で戻ること"
+        );
         assert!(!state.history.can_undo());
 
         assert!(state.history.redo(&mut state.editor));

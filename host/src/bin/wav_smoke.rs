@@ -144,7 +144,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     std::fs::write(&out_path, &bytes)?;
     let written = std::fs::read(&out_path)?;
-    println!("書き出し: {} ({} バイト)", out_path.display(), written.len());
+    println!(
+        "書き出し: {} ({} バイト)",
+        out_path.display(),
+        written.len()
+    );
 
     // ---- 判定 ----
     let mut failures = Vec::new();
@@ -190,8 +194,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn instantiate(entry: &PluginEntry, plugin_id: &str) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
-    let host_info = HostInfo::new("WAV Smoke", "clap-host-test", "https://example.com", "0.1.0")?;
+fn instantiate(
+    entry: &PluginEntry,
+    plugin_id: &str,
+) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
+    let host_info = HostInfo::new(
+        "WAV Smoke",
+        "clap-host-test",
+        "https://example.com",
+        "0.1.0",
+    )?;
     let plugin_id = CString::new(plugin_id)?;
     let (sender, _receiver) = crossbeam_channel::unbounded();
 

@@ -52,7 +52,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut saved = Vec::new();
     state.save(&source.plugin_handle(), &mut saved)?;
-    println!("既定値 {before} → 変更後 {changed} / 状態 {} バイト", saved.len());
+    println!(
+        "既定値 {before} → 変更後 {changed} / 状態 {} バイト",
+        saved.len()
+    );
 
     // ---- 2. .ron へ載せて読み戻す (base64 を挟む) ----
     let snapshot = project::PluginSnapshot {
@@ -99,7 +102,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         failures.push("パスかプラグイン ID が往復で変わった".to_string());
     }
     if (fresh - before).abs() > 1e-6 {
-        failures.push(format!("新しいインスタンスが既定値で始まっていない ({fresh})"));
+        failures.push(format!(
+            "新しいインスタンスが既定値で始まっていない ({fresh})"
+        ));
     }
     if (after - TARGET_VALUE).abs() > 1e-6 {
         failures.push(format!("状態を復元できていない ({after})"));
@@ -123,7 +128,12 @@ fn state_of(instance: &mut PluginInstance<MiniHost>) -> Option<PluginState> {
 
 fn instantiate(path: &Path, id: &str) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
     let (entry, _) = discovery::load_clap_file(path)?;
-    let host_info = HostInfo::new("State Smoke", "clap-host-test", "https://example.com", "0.1.0")?;
+    let host_info = HostInfo::new(
+        "State Smoke",
+        "clap-host-test",
+        "https://example.com",
+        "0.1.0",
+    )?;
     let plugin_id = CString::new(id)?;
     let (sender, _receiver) = crossbeam_channel::unbounded();
 

@@ -40,8 +40,11 @@ impl DefaultPluginFactory for TestSinePlugin {
     fn get_descriptor() -> PluginDescriptor {
         use clack_plugin::plugin::features::*;
 
-        PluginDescriptor::new("com.example.test-sine", "Test Sine Synth")
-            .with_features([SYNTHESIZER, MONO, INSTRUMENT])
+        PluginDescriptor::new("com.example.test-sine", "Test Sine Synth").with_features([
+            SYNTHESIZER,
+            MONO,
+            INSTRUMENT,
+        ])
     }
 
     fn new_shared(_host: HostSharedHandle) -> Result<TestSineShared, PluginError> {
@@ -296,7 +299,9 @@ impl PluginStateImpl for TestSineMainThread<'_> {
         if !volume.is_finite() {
             return Err(PluginError::Message("ボリュームが数値ではありません"));
         }
-        self.shared.volume.store(volume.clamp(0.0, 1.0), Ordering::SeqCst);
+        self.shared
+            .volume
+            .store(volume.clamp(0.0, 1.0), Ordering::SeqCst);
         Ok(())
     }
 }

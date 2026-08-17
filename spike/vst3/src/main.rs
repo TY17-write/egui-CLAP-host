@@ -97,9 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(runner);
     let destroyed = control.service_teardown();
 
-    println!(
-        "ピーク: 発音前={silence_peak:.4} 発音中={sounding_peak:.4} 消音後={tail_peak:.4}"
-    );
+    println!("ピーク: 発音前={silence_peak:.4} 発音中={sounding_peak:.4} 消音後={tail_peak:.4}");
     println!("取りこぼした指示: {dropped} / 破棄完了: {destroyed}");
 
     // ---- 判定 ----

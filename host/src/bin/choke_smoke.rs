@@ -42,7 +42,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let target = &plugins[0];
     println!("プラグイン: {} ({})", target.name, target.id);
 
-    let host_info = HostInfo::new("Choke Smoke", "clap-host-test", "https://example.com", "0.1.0")?;
+    let host_info = HostInfo::new(
+        "Choke Smoke",
+        "clap-host-test",
+        "https://example.com",
+        "0.1.0",
+    )?;
     let plugin_id = CString::new(target.id.as_str())?;
     let (sender, _receiver) = crossbeam_channel::unbounded();
 

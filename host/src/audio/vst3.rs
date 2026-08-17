@@ -67,7 +67,9 @@ impl SharedPlugin {
     /// 毒された (ロック中にパニックした) 場合も中身は取り出す。VST3 の音源は
     /// COM オブジェクトで、ここで諦めると破棄する手立てが無くなる。
     pub fn lock(&self) -> MutexGuard<'_, Plugin> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 待たずに取る。オーディオスレッドと、**メインスレッドの毎フレーム処理**の両方で使う。
@@ -434,6 +436,10 @@ mod tests {
             remaining &= remaining - 1;
         }
 
-        assert_eq!(keys, vec![60, 64, 127], "立っているキーだけを昇順で拾うこと");
+        assert_eq!(
+            keys,
+            vec![60, 64, 127],
+            "立っているキーだけを昇順で拾うこと"
+        );
     }
 }

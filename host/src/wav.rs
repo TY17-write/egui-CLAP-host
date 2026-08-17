@@ -16,11 +16,7 @@ const MAX_DATA_BYTES: usize = u32::MAX as usize - HEADER_LEN;
 ///
 /// `samples` はインターリーブ済みで -1.0..=1.0 を想定する。範囲外は切り詰める
 /// (呼び出し側でピークを均してから渡すこと)。
-pub fn to_bytes_16bit(
-    samples: &[f32],
-    channels: u16,
-    sample_rate: u32,
-) -> Result<Vec<u8>, String> {
+pub fn to_bytes_16bit(samples: &[f32], channels: u16, sample_rate: u32) -> Result<Vec<u8>, String> {
     if channels == 0 {
         return Err("チャンネル数が 0 です".into());
     }

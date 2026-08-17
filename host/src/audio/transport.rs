@@ -18,8 +18,12 @@ pub enum TransportMsg {
     Play,
     Stop,
     /// 指定サンプル位置へ移動
-    Seek { sample: u64 },
-    SetLoop { enabled: bool },
+    Seek {
+        sample: u64,
+    },
+    SetLoop {
+        enabled: bool,
+    },
 }
 
 /// UI と共有する再生状態

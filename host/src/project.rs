@@ -221,8 +221,8 @@ pub fn to_string(
 /// .ron のテキストを読む。構文・意味の両方を検証してから返す。
 pub fn from_str(text: &str) -> Result<Loaded, String> {
     // 1. バージョンだけ先に見る
-    let probe: VersionProbe = ron::from_str(text)
-        .map_err(|e| format!("プロジェクトファイルとして読めません:\n{e}"))?;
+    let probe: VersionProbe =
+        ron::from_str(text).map_err(|e| format!("プロジェクトファイルとして読めません:\n{e}"))?;
     if probe.version > VERSION {
         return Err(format!(
             "このファイルはバージョン {} で保存されています。\n\
@@ -327,10 +327,7 @@ fn validate(project: &Project) -> Vec<String> {
             ));
         }
         if note.track >= project.tracks.len() {
-            problems.push(format!(
-                "{at}: トラック {} は存在しません",
-                note.track + 1
-            ));
+            problems.push(format!("{at}: トラック {} は存在しません", note.track + 1));
         } else if note.lane >= project.tracks[note.track].lanes.max(1) {
             problems.push(format!(
                 "{at}: トラック {} に段 {} はありません",
@@ -521,7 +518,11 @@ mod tests {
     fn round_trip_keeps_plugins() {
         let editor = sample(); // トラック2本
         let plugins = vec![
-            Some(snapshot("C:\\音源\\Surge XT.clap", "org.surge-synth-team.surge-xt", &[0, 1, 2, 255])),
+            Some(snapshot(
+                "C:\\音源\\Surge XT.clap",
+                "org.surge-synth-team.surge-xt",
+                &[0, 1, 2, 255],
+            )),
             None,
         ];
 
@@ -566,7 +567,7 @@ mod tests {
     #[test]
     fn plugin_list_is_resized_to_the_tracks() {
         let editor = sample(); // トラック2本
-        // 音源を3つ書いた壊れたファイル相当
+                               // 音源を3つ書いた壊れたファイル相当
         let plugins = vec![
             Some(snapshot("a.clap", "x", b"1")),
             Some(snapshot("b.clap", "y", b"2")),

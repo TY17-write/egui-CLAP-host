@@ -129,7 +129,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ---- 2. 書き出しの経路: 同じシーケンスをオフラインで回す ----
     let setup = RenderSetup {
         sequences: (0..editor.track_count())
-            .map(|track| editor.to_events_for_track(track, SAMPLE_RATE).into_boxed_slice())
+            .map(|track| {
+                editor
+                    .to_events_for_track(track, SAMPLE_RATE)
+                    .into_boxed_slice()
+            })
             .collect(),
         end_sample,
         tail_samples: (offline::TAIL_SECONDS * SAMPLE_RATE) as u64,
@@ -183,10 +187,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     for (label, peaks) in [("実時間", &realtime), ("書き出し", &offline_peaks)] {
         if peaks[0] < AUDIBLE {
-            failures.push(format!("{label}: CLAP だけの区間が無音 (トラック1 が鳴っていない)"));
+            failures.push(format!(
+                "{label}: CLAP だけの区間が無音 (トラック1 が鳴っていない)"
+            ));
         }
         if peaks[2] < AUDIBLE {
-            failures.push(format!("{label}: VST3 だけの区間が無音 (トラック2 が鳴っていない)"));
+            failures.push(format!(
+                "{label}: VST3 だけの区間が無音 (トラック2 が鳴っていない)"
+            ));
         }
         if peaks[3] > SILENT {
             failures.push(format!("{label}: 休みの区間で音が出ている"));
@@ -302,7 +310,12 @@ fn instantiate_clap(
     entry: &PluginEntry,
     plugin_id: &str,
 ) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
-    let host_info = HostInfo::new("Mixed Smoke", "clap-host-test", "https://example.com", "0.1.0")?;
+    let host_info = HostInfo::new(
+        "Mixed Smoke",
+        "clap-host-test",
+        "https://example.com",
+        "0.1.0",
+    )?;
     let plugin_id = CString::new(plugin_id)?;
     let (sender, _receiver) = crossbeam_channel::unbounded();
 
