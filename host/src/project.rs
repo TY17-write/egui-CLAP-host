@@ -14,6 +14,7 @@
 
 use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
 use crate::swing;
+use crate::waltz;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -78,6 +79,10 @@ fn default_peak_ratio() -> f32 {
     swing::DEFAULT_PEAK_RATIO
 }
 
+fn default_waltz_ratio() -> f32 {
+    waltz::DEFAULT_RATIO
+}
+
 /// ファイルに書き出すシーケンス一式
 #[derive(Serialize, Deserialize)]
 struct Project {
@@ -94,6 +99,8 @@ struct Project {
     scale: ScaleMode,
     #[serde(default = "default_peak_ratio")]
     swing_peak_ratio: f32,
+    #[serde(default = "default_waltz_ratio")]
+    waltz_ratio: f32,
     #[serde(default)]
     tracks: Vec<TrackEntry>,
     #[serde(default)]
@@ -131,6 +138,8 @@ struct TrackEntry {
     soloed: bool,
     #[serde(default)]
     swing: bool,
+    #[serde(default)]
+    waltz: bool,
     /// 段ごとの CC 番号 (`None` は音符段)。CC 段が無ければ空。
     /// これより前のバージョンのファイルには無いので `default` で空になる。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -182,6 +191,7 @@ pub fn to_string(
         beat_type: editor.beat_type,
         scale: editor.scale,
         swing_peak_ratio: editor.swing_peak_ratio,
+        waltz_ratio: editor.waltz_ratio,
         tracks: editor
             .tracks
             .iter()
@@ -191,6 +201,7 @@ pub fn to_string(
                 muted: info.muted,
                 soloed: info.soloed,
                 swing: info.swing,
+                waltz: info.waltz,
                 lane_ccs: info.lane_ccs.clone(),
             })
             .collect(),
@@ -372,6 +383,7 @@ fn build(project: Project) -> Loaded {
                 muted: entry.muted,
                 soloed: entry.soloed,
                 swing: entry.swing,
+                waltz: entry.waltz,
                 // 範囲外の CC 番号は音符段として読む (壊れたファイルで
                 // 段が丸ごと使えなくなるより、音符段に落ちるほうがまし)
                 lane_ccs: entry
@@ -388,6 +400,8 @@ fn build(project: Project) -> Loaded {
         swing_peak_ratio: project
             .swing_peak_ratio
             .clamp(swing::MIN_PEAK_RATIO, swing::MAX_PEAK_RATIO),
+        // **0 以下や NaN を通すと拍長が壊れる**ので、丸めは waltz 側に任せる
+        waltz_ratio: waltz::clamp_ratio(project.waltz_ratio),
     };
     Loaded { editor, plugins }
 }

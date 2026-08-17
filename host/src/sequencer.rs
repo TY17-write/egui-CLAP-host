@@ -2,6 +2,7 @@
 //! 時間の単位はすべて「四分音符 = 1.0」の実数 (tick と呼ぶ)。
 
 use crate::swing;
+use crate::waltz;
 
 /// 音階モード。1オクターブを何ステップに分けるかを決める。
 ///
@@ -134,6 +135,9 @@ pub struct TrackInfo {
     /// 伴奏は正確な拍のまま、ソロだけ跳ねさせる、という使い方をするので
     /// トラックごとに持つ。
     pub swing: bool,
+    /// 不均等な拍 (ウィンナ・ワルツ風) を掛けるか。
+    /// スウィングと**併用できる** (適用順は `performed_notes` を参照)。
+    pub waltz: bool,
     /// 段ごとの CC 番号。`None` の段は通常の音符段。
     ///
     /// **`lanes` より短くてよい。** 足りない分は音符段として扱うので、段を増やした
@@ -150,6 +154,7 @@ impl TrackInfo {
             muted: false,
             soloed: false,
             swing: false,
+            waltz: false,
             lane_ccs: Vec::new(),
         }
     }
@@ -207,6 +212,10 @@ pub struct MidiEditor {
     /// スウィングの強さ (200BPM 時の裏拍の比)。1.0 で直線。
     /// 掛けるかどうかはトラックごと ([`TrackInfo::swing`])。
     pub swing_peak_ratio: f32,
+    /// 不均等な拍の強さ (端の拍 ÷ 中央の拍)。1.0 で均等。
+    /// 1.0 未満が山 (2拍目が前に出る)、1.0 超が谷。
+    /// 掛けるかどうかはトラックごと ([`TrackInfo::waltz`])。
+    pub waltz_ratio: f32,
 }
 
 impl Default for MidiEditor {
@@ -219,6 +228,7 @@ impl Default for MidiEditor {
             beat_type: 4,
             scale: ScaleMode::Equal12,
             swing_peak_ratio: crate::swing::DEFAULT_PEAK_RATIO,
+            waltz_ratio: crate::waltz::DEFAULT_RATIO,
         }
     }
 }
@@ -462,38 +472,69 @@ impl MidiEditor {
 
     /// そのトラックにスウィングを掛けるか
     pub fn track_swings(&self, track: usize) -> bool {
-        self.tracks.get(track).is_some_and(|info| info.swing)
+        swing::applies_to(self.beat_type) && self.tracks.get(track).is_some_and(|info| info.swing)
     }
 
-    /// 出力用に、スウィングを適用したノート列を返す。記譜 (`self.notes`) は変えない。
+    /// そのトラックに不均等な拍を掛けるか
+    pub fn track_waltzes(&self, track: usize) -> bool {
+        waltz::applies_to(self.beats, self.beat_type)
+            && self.tracks.get(track).is_some_and(|info| info.waltz)
+    }
+
+    /// 出力用に、揺らぎを適用したノート列を返す。記譜 (`self.notes`) は変えない。
     ///
-    /// 再生・WAV・CCS・MIDI エクスポートはすべてこれを通す。記譜位置は8分の
-    /// 等分のまま保ち、跳ねは出力の直前に乗せる、という分担にしている。
+    /// 再生・WAV・CCS・MIDI エクスポートはすべてこれを通す。記譜位置は等分のまま
+    /// 保ち、揺らぎは出力の直前に乗せる、という分担にしている。
     ///
-    /// 開始と終端の**両方**に同じオフセットを掛けるので、前のノートの終端と
+    /// 開始と終端の**両方**に同じ写像を掛けるので、前のノートの終端と
     /// 次のノートの開始には必ず同じ値が乗り、重なりも隙間も生まれない。
+    ///
+    /// # 適用順は スウィング → 不均等な拍
+    ///
+    /// **この順序でなければならない。** スウィングの判定は拍頭 (整数) と裏拍
+    /// (半整数) に当たるかを見る位置ベースなので、**先に拍を伸縮すると位置が
+    /// そこから外れ、スウィングが何にも当たらなくなる**。
+    ///
+    /// 副作用として、スウィングの遅れは拍の伸縮率のぶん拡大・縮小される。
+    /// 拍に対する割合として一定になるので、望ましい挙動として受け入れる。
     pub fn performed_notes(&self) -> Vec<Note> {
-        if !swing::applies_to(self.beat_type) {
+        let any_swing = (0..self.tracks.len()).any(|track| self.track_swings(track));
+        let any_waltz = (0..self.tracks.len()).any(|track| self.track_waltzes(track));
+        if !any_swing && !any_waltz {
             return self.notes.clone();
         }
 
         // 演奏位置が記譜上の終端を超えると、トランスポートの終端フラッシュ
         // (sample_time > end_sample で打ち切る) から漏れて鳴りっぱなしになる。
         // 小節線ちょうどで終わるノートは普通にあるので、ここで頭打ちにする。
+        // (不均等な拍は小節線を動かさないので、これが要るのはスウィングのため)
         let limit = self.length_quarters_bar_aligned();
 
         self.notes
             .iter()
             .map(|note| {
+                let swinging = self.track_swings(note.track);
+                let waltzing = self.track_waltzes(note.track);
                 // 音価0以下のノートは各出力が弾く。ここで下限を掛けてしまうと
-                // スウィングの有無で弾かれ方が変わるので、触らずに返す。
-                if note.duration <= 0.0 || !self.track_swings(note.track) {
+                // 揺らぎの有無で弾かれ方が変わるので、触らずに返す。
+                if note.duration <= 0.0 || (!swinging && !waltzing) {
                     return *note;
                 }
-                let shift =
-                    |tick: f32| tick + swing::offset(tick, self.tempo, self.swing_peak_ratio);
+                let shift = |tick: f32| {
+                    let tick = if swinging {
+                        tick + swing::offset(tick, self.tempo, self.swing_peak_ratio)
+                    } else {
+                        tick
+                    };
+                    if waltzing {
+                        waltz::map(tick, self.beats, self.waltz_ratio)
+                    } else {
+                        tick
+                    }
+                };
                 let start = shift(note.start_tick);
                 // 極端に短いノートは終端が開始を追い越すので下限を設ける
+                // (追い越すのはスウィングだけ。不均等な拍の写像は狭義単調)
                 let end = shift(note.end_tick())
                     .min(limit)
                     .max(start + swing::MIN_PERFORMED_DURATION);
@@ -1092,6 +1133,168 @@ mod tests {
         editor.notes = vec![note(0.0, 0.5, 0, 4), note(0.5, 0.5, 0, 4)];
 
         assert_eq!(editor.performed_notes(), editor.notes);
+    }
+
+    /// 不均等な拍を掛けた3/4のエディタ (トラック0 のみ ON)
+    fn waltzing() -> MidiEditor {
+        let mut editor = MidiEditor::default();
+        editor.beats = 3;
+        editor.tracks[0].waltz = true;
+        editor
+    }
+
+    /// 2拍目が前に出て、3拍目が後ろへ下がること (山の形)
+    #[test]
+    fn waltz_pulls_the_second_beat_forward() {
+        let mut editor = waltzing();
+        editor.notes = vec![
+            note(0.0, 1.0, 0, 4),
+            note(1.0, 1.0, 0, 4),
+            note(2.0, 1.0, 0, 4),
+        ];
+
+        let played = editor.performed_notes();
+        assert!(close(played[0].start_tick, 0.0), "1拍目は小節線なので不動");
+        assert!(
+            close(played[1].start_tick, 0.944_444),
+            "2拍目が前へ: {}",
+            played[1].start_tick
+        );
+        assert!(
+            close(played[2].start_tick, 2.055_556),
+            "3拍目が後ろへ: {}",
+            played[2].start_tick
+        );
+    }
+
+    /// 前後のノートが繋がったままであること (隙間も重なりも作らない)
+    #[test]
+    fn waltz_keeps_notes_contiguous() {
+        let mut editor = waltzing();
+        editor.notes = (0..6).map(|i| note(i as f32 * 0.5, 0.5, 0, 4)).collect();
+
+        let played = editor.performed_notes();
+        for pair in played.windows(2) {
+            assert!(
+                close(pair[0].end_tick(), pair[1].start_tick),
+                "{} != {}",
+                pair[0].end_tick(),
+                pair[1].start_tick
+            );
+        }
+    }
+
+    /// 小節線が動かないこと。**終端が伸びないので鳴りっぱなしにならない。**
+    #[test]
+    fn waltz_leaves_bar_lines_alone() {
+        let mut editor = waltzing();
+        editor.notes = vec![note(2.0, 1.0, 0, 4)];
+
+        let played = editor.performed_notes();
+        assert!(
+            close(played[0].end_tick(), 3.0),
+            "小節線ちょうどで終わること"
+        );
+    }
+
+    /// **音価が負にならないこと。** スウィングと違い写像が狭義単調なので、
+    /// 極端に短いノートでも下限に頼らずに済む。
+    #[test]
+    fn waltz_never_shortens_a_note_to_nothing() {
+        let mut editor = waltzing();
+        // 64分音符を拍頭・拍の途中・小節末に置く
+        editor.notes = vec![
+            note(0.0, 1.0 / 16.0, 0, 4),
+            note(1.25, 1.0 / 16.0, 0, 4),
+            note(3.0 - 1.0 / 16.0, 1.0 / 16.0, 0, 4),
+        ];
+
+        for played in editor.performed_notes() {
+            assert!(played.duration > 0.0, "音価 {}", played.duration);
+        }
+    }
+
+    /// 奇数の N/4 以外では何も起きないこと
+    #[test]
+    fn waltz_is_limited_to_odd_quarter_note_meters() {
+        let mut editor = waltzing();
+        editor.notes = vec![note(0.0, 1.0, 0, 4), note(1.0, 1.0, 0, 4)];
+
+        editor.beats = 4;
+        assert_eq!(editor.performed_notes(), editor.notes, "4/4 は対象外");
+
+        editor.beats = 3;
+        editor.beat_type = 8;
+        assert_eq!(editor.performed_notes(), editor.notes, "3/8 は対象外");
+    }
+
+    /// ON にしていないトラックが1 tick も動かないこと
+    #[test]
+    fn waltz_only_touches_enabled_tracks() {
+        let mut editor = waltzing();
+        editor.tracks.push(TrackInfo::new(1));
+        editor.notes = vec![
+            Note {
+                track: 0,
+                ..note(1.0, 1.0, 0, 4)
+            },
+            Note {
+                track: 1,
+                ..note(1.0, 1.0, 0, 4)
+            },
+        ];
+
+        let played = editor.performed_notes();
+        assert!(played[0].start_tick < 1.0, "ワルツ側は前へ出ること");
+        assert_eq!(played[1].start_tick, 1.0, "OFF のトラックは動かないこと");
+        assert_eq!(played[1].duration, 1.0);
+    }
+
+    /// スウィングと併用でき、**順序が swing → ワルツ** であること。
+    ///
+    /// 逆順だと、拍を伸縮した後の位置が拍頭・裏拍から外れてスウィングが
+    /// 何にも当たらなくなる。ここが崩れると「併用すると跳ねが消える」形で出る。
+    #[test]
+    fn waltz_composes_after_swing() {
+        let mut editor = waltzing();
+        editor.tracks[0].swing = true;
+        // 2拍目の頭。スウィングの遅れが乗ったうえで拍が伸縮される
+        editor.notes = vec![note(1.0, 1.0, 0, 4)];
+
+        let expected = waltz::map(
+            1.0 + swing::offset(1.0, editor.tempo, editor.swing_peak_ratio),
+            editor.beats,
+            editor.waltz_ratio,
+        );
+        let played = editor.performed_notes();
+        assert!(
+            close(played[0].start_tick, expected),
+            "{} != {expected}",
+            played[0].start_tick
+        );
+
+        // 逆順とは一致しないこと (順序が意味を持つことの確認)
+        let reversed = waltz::map(1.0, editor.beats, editor.waltz_ratio);
+        let reversed = reversed + swing::offset(reversed, editor.tempo, editor.swing_peak_ratio);
+        assert!(!close(expected, reversed), "順序で結果が変わること");
+    }
+
+    /// 併用してもノートが繋がったままであること
+    #[test]
+    fn waltz_and_swing_keep_notes_contiguous() {
+        let mut editor = waltzing();
+        editor.tracks[0].swing = true;
+        editor.notes = (0..6).map(|i| note(i as f32 * 0.5, 0.5, 0, 4)).collect();
+
+        let played = editor.performed_notes();
+        for pair in played.windows(2) {
+            assert!(
+                close(pair[0].end_tick(), pair[1].start_tick),
+                "{} != {}",
+                pair[0].end_tick(),
+                pair[1].start_tick
+            );
+        }
     }
 
     /// 強さ 1.0 では裏拍が動かないこと (表拍の遅れは残る)
