@@ -16,4 +16,5 @@ pub mod sequencer;
 pub mod swing;
 pub mod theme;
 pub mod timers;
+pub mod waltz;
 pub mod wav;
