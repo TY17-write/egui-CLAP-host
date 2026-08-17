@@ -3,6 +3,7 @@
 `opus-rs` 0.1.27 以降のスタック使用量について報告した本文。
 
 - **投稿先**: <https://github.com/restsend/opus-rs/issues/12> (2026-08-17)
+- **0.1.29 で修正され、同日クローズ済み** (末尾のコメントを参照)
 
 符号化の破綻 (issue #11 / `upstream-issue.md`) とは別件なので分けてある。
 
@@ -46,6 +47,35 @@ release で 386KiB を要求する。**構造体の大きさから予想され�
 
 **報告はしていない。** こちらは困っておらず、直してもらった側から粗探しを
 する話でもない。**聞かれたら出せるように測っておく**という位置づけ。
+
+### 上流に出したクローズ用コメント (2026-08-17・投稿済み)
+
+**現状の報告だけにして閉じた。** 残っている `Box::new(CeltEncoder::new(..))` の
+件には触れていない (困っていないので、指摘は野暮)。
+
+以下は**実際に投稿した本文**。
+
+---
+
+Verified on my side and it resolves what I ran into. Closing.
+
+| version | `size_of::<OpusEncoder>()` | stack needed (release) | stack needed (debug) |
+|---|---|---|---|
+| 0.1.26 | 1,288 B | fits in 64 KiB | — |
+| 0.1.27 / 0.1.28 | 254,608 B | 832 KiB overflows, 864 KiB is enough | 1 MiB overflows, 2 MiB is enough |
+| **0.1.29** | **2,416 B** | **384 KiB overflows, 386 KiB is enough** | **512 KiB overflows, 544 KiB is enough** |
+
+**Output is unchanged.** I re-encoded my two test signals at 12 bitrates each
+(24 `.opus` files) with 0.1.28 and 0.1.29 and compared SHA-256 — all 24 match
+byte for byte. So the `heap` feature is purely a placement change as far as the
+bitstream is concerned.
+
+I also like that `heap` is opt-out rather than forced, so the inline layout is
+still there for `no_std` / static placement.
+
+Same environment as before: Windows 10 Pro 22H2, x86_64, rustc/cargo 1.97.1,
+default profiles. Measured with the same `stack_probe` binary from the original
+report. Thanks for turning this around so quickly.
 
 ## 投稿後に手元で確かめたこと (報告はしない)
 
