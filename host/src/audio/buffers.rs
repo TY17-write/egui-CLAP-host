@@ -2,12 +2,24 @@
 //! clack リポジトリの cpal サンプル (MIT OR Apache-2.0) をほぼそのまま利用。
 //!
 //! ここは CLAP バックエンド専用 (`audio::clap` からのみ使う)。
-//! チャンネル変換 (`mux` / `mix_mono` / `mono_to_multi`) は素のスライスを扱うので
+//! チャンネル変換 (`demux` / `to_stereo`) は素のスライスを扱うので
 //! 共有できそうに見えるが、CLAP はポートごとに連続した配置 (`[l,l,l,r,r,r]`)、
 //! VST3 はチャンネルごとの `Vec` と元の形が違う。共通化は VST3 側の要求が
 //! はっきりしてから判断する。
+//!
+//! # ステレオまで
+//!
+//! **このホストが扱うのはステレオまで。** グラフのバスは常に
+//! [`BUS_CHANNELS`] (2ch) で、プラグイン側が何チャンネルでもここで合わせる。
+//!
+//! | プラグイン | バスとのやり取り |
+//! |---|---|
+//! | モノラル (1ch) | 出力は **L と R の両方へ同じ音**。入力は L/R の平均を渡す |
+//! | ステレオ (2ch) | そのまま |
+//! | 3ch 以上 | 出力は**先頭2本を L / R として使う**。入力は L/R だけ渡し、残りは無音 |
 
 use crate::audio::config::FullAudioConfig;
+use crate::audio::graph::BUS_CHANNELS;
 use clack_host::prelude::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, InputAudioBuffers, InputChannel,
     OutputAudioBuffers,
@@ -34,14 +46,14 @@ pub struct HostAudioBuffers {
 }
 
 impl HostAudioBuffers {
+    /// バッファ一式を用意する。
+    ///
+    /// **バスは常に [`BUS_CHANNELS`] (2ch)。** 以前はここで
+    /// 「3チャンネル以上は未対応」と panic していたが、バスの幅は
+    /// `audio::bus_config` が 2 に固定するので、デバイスが何チャンネルでも
+    /// ここへ 3 以上が来ることはない。プラグイン側の 3ch 以上は
+    /// [`to_stereo`] が先頭2本に落とす。
     pub fn from_config(config: FullAudioConfig) -> Self {
-        if config.output_channel_count > 2 {
-            panic!(
-                "{}チャンネル構成は未対応です (モノラルかステレオのみ)",
-                config.output_channel_count
-            )
-        }
-
         let total_input_channel_count = config.plugin_input_port_config.total_channel_count();
         let total_output_channel_count = config.plugin_output_port_config.total_channel_count();
         let frame_count = config.max_likely_buffer_size as usize;
@@ -199,29 +211,25 @@ impl HostAudioBuffers {
         );
     }
 
-    /// プラグイン出力を CPAL 用のインターリーブ形式に整える (内部バッファへ)
+    /// プラグイン出力をバスの形 (2ch インターリーブ) に整える (内部バッファへ)。
+    ///
+    /// **このホストはステレオまでしか扱わない。**
+    ///
+    /// - モノラルの音源は **L と R の両方へ同じ音**を出す
+    /// - 3ch 以上の音源は**先頭2本を L / R として使い、残りは捨てる**
     fn muxed_output(&mut self, len: usize) -> &[f32] {
         let main_output = &self.output_port_channels
             [self.config.plugin_output_port_config.main_port_index as usize];
         let muxed = &mut self.muxed[..len];
 
-        let plugin_output_channel_count = self
+        let plugin_channels = self
             .config
             .plugin_output_port_config
             .main_port()
             .port_layout
-            .channel_count();
+            .channel_count() as usize;
 
-        match (
-            plugin_output_channel_count,
-            self.config.output_channel_count,
-        ) {
-            (1, 1) => muxed.copy_from_slice(&main_output[..len]),
-            (n, 1) => mix_mono(main_output, muxed, n as usize),
-            (1, 2) => mono_to_multi(main_output, muxed, 2),
-            (_, 2) => mux(main_output, muxed, 2),
-            (_, _) => unreachable!(),
-        }
+        to_stereo(main_output, self.actual_frame_count, plugin_channels, muxed);
         muxed
     }
 
@@ -280,54 +288,43 @@ fn demux(
                 let total: f32 = interleaved[base..base + source_channels].iter().sum();
                 *sample = total * scale;
             }
-        } else {
-            // 足りないチャンネルは最後のもので埋める
-            let source = destination.min(source_channels - 1);
+        } else if destination < source_channels {
             for (frame, sample) in out.iter_mut().enumerate() {
-                *sample = interleaved[frame * source_channels + source];
+                *sample = interleaved[frame * source_channels + destination];
             }
+        } else {
+            // **バスに無いチャンネルは無音。** ステレオまでしか扱わないので、
+            // 3本目以降を持つプラグインには L/R だけを渡す
+            // (最後の1本で埋めると、余った入力に R が入ってしまう)
+            out.fill(0.0);
         }
     }
 }
 
-/// 連続したチャンネルバッファ [l,l,l,r,r,r] を CPAL のインターリーブ形式 [l,r,l,r,l,r] に変換する
-fn mux(channels_buffer: &[f32], output: &mut [f32], channel_count: usize) {
-    assert!(channels_buffer.len() >= output.len());
-
-    let single_channel_len = channels_buffer.len() / channel_count;
-    for (muxed_index, output_sample) in output.iter_mut().enumerate() {
-        let channel_number = muxed_index % channel_count;
-        let channel_buffer_index = muxed_index / channel_count;
-        let position = (channel_number * single_channel_len) + channel_buffer_index;
-
-        *output_sample = channels_buffer[position]
+/// チャンネルごとに連続した配置 [l,l,r,r] を、2ch インターリーブ [l,r,l,r] へ移す。
+///
+/// `stride` は1チャンネル分の**確保長**。ここを出力のチャンネル数から割り出すと、
+/// 3ch 以上の音源で読む場所がずれる (以前それで R に3本目が入っていた)。
+///
+/// **ステレオまでしか扱わない。**
+/// モノラルは L と R へ複製し、3ch 以上は先頭2本だけを使う。
+fn to_stereo(channels_buffer: &[f32], stride: usize, plugin_channels: usize, output: &mut [f32]) {
+    let frames = output.len() / BUS_CHANNELS;
+    if plugin_channels == 0 || frames == 0 {
+        output.fill(0.0);
+        return;
     }
-}
+    let channel = |index: usize| {
+        let start = index.min(plugin_channels - 1) * stride;
+        &channels_buffer[start..start + frames]
+    };
 
-/// マルチチャンネルをモノラルにダウンミックスする
-fn mix_mono(channels_buffer: &[f32], mono_output: &mut [f32], channel_count: usize) {
-    assert!(channel_count > 0);
-    assert!(channels_buffer.len() >= mono_output.len() * channel_count);
-
-    let single_channel_len = channels_buffer.len() / channel_count;
-    for (index, output_sample) in mono_output.iter_mut().enumerate() {
-        let mut total = 0.0;
-        for channel_number in 0..channel_count {
-            let position = (channel_number * single_channel_len) + index;
-            total += channels_buffer[position]
-        }
-        *output_sample = total / (channel_count as f32);
-    }
-}
-
-/// モノラル入力を複数チャンネルに複製する
-fn mono_to_multi(mono_input: &[f32], multi_output: &mut [f32], channel_count: usize) {
-    assert!(channel_count > 0);
-
-    for (output_samples, input_sample) in
-        multi_output.chunks_exact_mut(channel_count).zip(mono_input)
-    {
-        output_samples.fill(*input_sample)
+    // モノラルなら左右とも同じ本を読む (`min` がそう働く)
+    let left = channel(0);
+    let right = channel(1);
+    for (frame, out) in output.chunks_exact_mut(BUS_CHANNELS).enumerate() {
+        out[0] = left[frame];
+        out[1] = right[frame];
     }
 }
 
@@ -372,11 +369,64 @@ mod tests {
         assert_eq!(out, vec![2.0, -1.0]);
     }
 
-    /// 足りないチャンネルは最後のもので埋めること (`muxed_output` と揃える)
+    /// **バスに無いチャンネルは無音になること。**
+    ///
+    /// ステレオまでしか扱わないので、3本目以降の入力を持つプラグインには
+    /// L/R だけを渡す。最後の1本で埋めると、余った入力に R が入ってしまう。
     #[test]
-    fn missing_channels_reuse_the_last_source() {
+    fn inputs_beyond_stereo_are_silent() {
         let out = run(&[1.0, -1.0], 2, 3, 1);
-        assert_eq!(out, vec![1.0, -1.0, -1.0]);
+        assert_eq!(out, vec![1.0, -1.0, 0.0]);
+    }
+
+    /// 2フレーム分をステレオへ移す (テスト用の短縮)
+    fn stereo(channels_buffer: &[f32], stride: usize, plugin_channels: usize) -> Vec<f32> {
+        let mut out = vec![0.0; 2 * BUS_CHANNELS];
+        to_stereo(channels_buffer, stride, plugin_channels, &mut out);
+        out
+    }
+
+    /// **モノラルの音源は L と R の両方へ同じ音を出すこと**
+    #[test]
+    fn mono_plugin_feeds_both_sides() {
+        let out = stereo(&[1.0, 2.0], 2, 1);
+        assert_eq!(out, vec![1.0, 1.0, 2.0, 2.0]);
+    }
+
+    /// ステレオはそのまま並ぶこと ([l,l,r,r] → [l,r,l,r])
+    #[test]
+    fn stereo_plugin_passes_through() {
+        let out = stereo(&[1.0, 2.0, -1.0, -2.0], 2, 2);
+        assert_eq!(out, vec![1.0, -1.0, 2.0, -2.0]);
+    }
+
+    /// **3ch 以上は先頭2本を L / R として使うこと。**
+    ///
+    /// 以前はチャンネルの間隔を出力側の数から割り出していたため、
+    /// 6ch の音源で R に3本目が入っていた。
+    #[test]
+    fn multichannel_plugin_uses_the_first_two() {
+        // 6ch × 2フレーム。ch0 = 1,2 / ch1 = 10,20 / 以降は使わないはずの値
+        let mut buffer = vec![0.0; 6 * 2];
+        buffer[0..2].copy_from_slice(&[1.0, 2.0]); // ch0
+        buffer[2..4].copy_from_slice(&[10.0, 20.0]); // ch1
+        buffer[4..6].copy_from_slice(&[99.0, 99.0]); // ch2 (混ざってはいけない)
+        buffer[6..8].copy_from_slice(&[77.0, 77.0]); // ch3 (同上)
+
+        let out = stereo(&buffer, 2, 6);
+        assert_eq!(out, vec![1.0, 10.0, 2.0, 20.0]);
+    }
+
+    /// 確保長がフレーム数より長くても、正しい場所から読むこと
+    #[test]
+    fn stereo_respects_the_stride() {
+        // 確保長4 に対して2フレームだけ使う。ch1 は添字4 から始まる
+        let mut buffer = vec![0.0; 2 * 4];
+        buffer[0..2].copy_from_slice(&[1.0, 2.0]);
+        buffer[4..6].copy_from_slice(&[-1.0, -2.0]);
+
+        let out = stereo(&buffer, 4, 2);
+        assert_eq!(out, vec![1.0, -1.0, 2.0, -2.0]);
     }
 
     /// 確保長より短いブロックでは、書いた先が残らないこと

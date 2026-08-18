@@ -75,12 +75,13 @@ Windows で開発・確認しています (他プラットフォームは未検�
 ```powershell
 cargo build --workspace
 
-# .clap は DLL のリネーム (先に消してからコピーすること)
-Remove-Item target\debug\test_plugin.clap -ErrorAction SilentlyContinue
-Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap
+# .clap は DLL のリネーム (先に消してからコピーすること)。
+# 置き場は target\ 直下 — target\debug\ だと cargo clean -p で消える
+Remove-Item target\test_plugin.clap -ErrorAction SilentlyContinue
+Copy-Item target\debug\test_plugin.dll target\test_plugin.clap
 
 # GUI ホストを起動 (--bin の指定が必要。検証用バイナリも同居しているため)
-cargo run -p egui-clap-host --bin egui-clap-host -- target\debug\test_plugin.clap
+cargo run -p egui-clap-host --bin egui-clap-host -- target\test_plugin.clap
 
 # ユニットテスト
 cargo test -p egui-clap-host --lib

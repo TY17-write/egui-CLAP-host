@@ -262,7 +262,10 @@ fn list_device_configs_ordered(
 }
 
 fn is_device_config_supported(config: &SupportedStreamConfigRange) -> bool {
-    if config.channels() > 2 || config.channels() < 1 {
+    // **3ch 以上も受け入れる。** 扱うのはステレオまでだが、先頭2本へ出せば
+    // 鳴らせる (`graph::write_to_device`)。以前はここで弾いていたので、
+    // マルチチャンネルしか持たないデバイスでは起動できなかった
+    if config.channels() < 1 {
         return false;
     }
     if config.max_sample_rate().0 < 44_100 {
@@ -278,9 +281,18 @@ fn compare_devices_configs(
     first: &SupportedStreamConfigRange,
     second: &SupportedStreamConfigRange,
 ) -> Ordering {
-    // ステレオ優先
-    match first.channels().cmp(&second.channels()) {
+    // **ステレオ優先。** 次に3ch 以上 (先頭2本へ出せる)、最後にモノラル。
+    //
+    // 単純にチャンネル数の多い順にすると、2ch も選べる環境で 7.1 を開いてしまう。
+    // 扱うのはステレオまでなので、開くだけ無駄になる。
+    match stereo_preference(second.channels()).cmp(&stereo_preference(first.channels())) {
         o @ (Ordering::Less | Ordering::Greater) => return o,
+        Ordering::Equal => {}
+    }
+
+    // 同じ順位なら、チャンネル数の少ないほうを選ぶ (余計な口を開けない)
+    match first.channels().cmp(&second.channels()) {
+        o @ (Ordering::Less | Ordering::Greater) => return o.reverse(),
         Ordering::Equal => {}
     }
 
@@ -298,6 +310,18 @@ fn compare_devices_configs(
         Ordering::Equal => {}
     }
     first.cmp_default_heuristics(second)
+}
+
+/// チャンネル数の望ましさ (**大きいほど良い**)。
+///
+/// ステレオがいちばん素直。3ch 以上は先頭2本へ出せば鳴らせるので次点。
+/// モノラルは鳴らせるが**ステレオ感が消える**ので最後。
+fn stereo_preference(channels: u16) -> u8 {
+    match channels {
+        2 => 2,
+        n if n > 2 => 1,
+        _ => 0,
+    }
 }
 
 /// サンプル形式の優先度 (低いほど良い)
@@ -428,5 +452,26 @@ fn find_matching_output_config(
         plugin_output_port_config,
         plugin_input_port_config,
         sample_format: best_stream_config.sample_format(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **ステレオがいちばん望ましいこと。**
+    ///
+    /// 単純にチャンネル数の多い順にすると、2ch も選べる環境で 7.1 を開いてしまう。
+    /// 扱うのはステレオまでなので、開くだけ無駄になる。
+    #[test]
+    fn stereo_is_preferred_over_multichannel_and_mono() {
+        assert!(stereo_preference(2) > stereo_preference(6));
+        assert!(stereo_preference(6) > stereo_preference(1));
+    }
+
+    /// 3ch 以上どうしは同じ順位 (あとはチャンネル数の少ないほうを選ぶ)
+    #[test]
+    fn multichannel_configs_rank_the_same() {
+        assert_eq!(stereo_preference(3), stereo_preference(8));
     }
 }

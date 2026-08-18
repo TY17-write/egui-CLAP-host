@@ -20,11 +20,14 @@ cargo build --workspace
 # 先に消してからコピーすること。cargo が DLL を作り直すと .clap 側が古いまま
 # 取り残されるうえ、-Force だけでは上書きされないことがある (直したはずの
 # プラグインで古い挙動が出たらこれを疑う)
-Remove-Item target\debug\test_plugin.clap -ErrorAction SilentlyContinue
-Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap
+#
+# 置き場は target\ の直下。target\debug\ に置くと cargo clean -p で消えるので、
+# test_plugin.vst3 と同じ場所に揃えてある
+Remove-Item target\test_plugin.clap -ErrorAction SilentlyContinue
+Copy-Item target\debug\test_plugin.dll target\test_plugin.clap
 
 # GUI ホストを起動 (--bin の指定が必要。smoke 系のバイナリも同居しているため)
-cargo run -p egui-clap-host --bin egui-clap-host -- target\debug\test_plugin.clap
+cargo run -p egui-clap-host --bin egui-clap-host -- target\test_plugin.clap
 
 # 実プラグインで起動する
 cargo run -p egui-clap-host --bin egui-clap-host -- "<音源へのパス>.clap"
@@ -37,14 +40,14 @@ cargo run -p egui-clap-host --bin egui-clap-host -- "<音源へのパス>.clap"
 `host/src/bin/` に**オーディオデバイス不要**の検証バイナリが並ぶ。
 
 ```powershell
-cargo run -p egui-clap-host --bin smoke -- target\debug\test_plugin.clap       # ロード→発音→波形確認
-cargo run -p egui-clap-host --bin seq_smoke -- target\debug\test_plugin.clap   # 再生エンジンの検証
-cargo run -p egui-clap-host --bin wav_smoke -- target\debug\test_plugin.clap   # WAV 書き出しの検証
-cargo run -p egui-clap-host --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
-cargo run -p egui-clap-host --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
-cargo run -p egui-clap-host --bin gain_smoke -- target\debug\test_plugin.clap  # 検証用エフェクトの挙動確認
-cargo run -p egui-clap-host --bin chain_smoke -- target\debug\test_plugin.clap # 音源→エフェクトのチェーンの検証
-cargo run -p egui-clap-host --bin route_smoke -- target\debug\test_plugin.clap # トラック間のルーティングの検証
+cargo run -p egui-clap-host --bin smoke -- target\test_plugin.clap       # ロード→発音→波形確認
+cargo run -p egui-clap-host --bin seq_smoke -- target\test_plugin.clap   # 再生エンジンの検証
+cargo run -p egui-clap-host --bin wav_smoke -- target\test_plugin.clap   # WAV 書き出しの検証
+cargo run -p egui-clap-host --bin choke_smoke -- target\test_plugin.clap # 停止・シークで音が止まるかの検証
+cargo run -p egui-clap-host --bin state_smoke -- target\test_plugin.clap # 音作りの保存・復元の検証
+cargo run -p egui-clap-host --bin gain_smoke -- target\test_plugin.clap  # 検証用エフェクトの挙動確認
+cargo run -p egui-clap-host --bin chain_smoke -- target\test_plugin.clap # 音源→エフェクトのチェーンの検証
+cargo run -p egui-clap-host --bin route_smoke -- target\test_plugin.clap # トラック間のルーティングの検証
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
 cargo run -p egui-clap-host --bin opus_smoke
@@ -54,7 +57,7 @@ cargo run -p egui-clap-host --bin opus_smoke -- 262144   # 256KiB のスレッ�
 cargo run -p egui-clap-host --bin vst3_smoke -- "<音源へのパス>.vst3"
 
 # CLAP と VST3 を別トラックに載せた同時再生の検証
-cargo run -p egui-clap-host --bin mixed_smoke -- target\debug\test_plugin.clap "<音源へのパス>.vst3"
+cargo run -p egui-clap-host --bin mixed_smoke -- target\test_plugin.clap "<音源へのパス>.vst3"
 
 # VST3 のエディタを開けるかだけの検証 (音は鳴らさない。GUI ウィンドウが一瞬出る)
 cargo run -p egui-clap-host --bin editor_smoke -- "<音源へのパス>.vst3"
@@ -105,8 +108,8 @@ VST3 版は**同名の .clap を CLAP の探索パスから探して読み込む
 システムにインストールせずに済ませるため、`CLAP_PATH` で場所を教える。
 
 ```powershell
-$env:CLAP_PATH = "$PWD\target\debug"
-cargo run -p egui-clap-host --bin mixed_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3 --same-plugin
+$env:CLAP_PATH = "$PWD\target"
+cargo run -p egui-clap-host --bin mixed_smoke -- target\test_plugin.clap target\test_plugin.vst3 --same-plugin
 ```
 
 `--same-plugin` を付けると、片方だけ鳴る区間の音量が両形式で一致することまで
@@ -117,7 +120,7 @@ cargo run -p egui-clap-host --bin mixed_smoke -- target\debug\test_plugin.clap t
 突き合わせられるので、チェーンの検証はこちらも通しておくとよい。
 
 ```powershell
-cargo run -p egui-clap-host --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
+cargo run -p egui-clap-host --bin chain_smoke -- target\test_plugin.clap target\test_plugin.vst3
 ```
 
 依存は VST3 SDK 3.8.0 の `base` / `public.sdk` / `pluginterfaces` / `cmake` だけを
@@ -510,6 +513,23 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 
 - **出力ストリームは1本だけ**。音源はリングバッファ経由で載せ替えるのでストリームを作り直さない。
   トランスポートが1つなのでトラック間のズレが原理的に発生しない
+
+### チャンネルはステレオまで
+
+**グラフの中は常に 2ch。** デバイスやプラグインが何チャンネルでも、境目で合わせる。
+デバイスに合わせないのは、**モノラル出力の環境で書き出しまでモノラルになる**のを
+避けるため (書き出しは常にステレオ)。
+
+| 相手 | 扱い |
+|---|---|
+| デバイスがステレオ | そのまま |
+| デバイスがモノラル | 左右を平均して落とす |
+| デバイスが 3ch 以上 | **先頭2本へ L / R を出し、残りは無音**。断らずに鳴らす |
+| プラグインがモノラル | 出力は **L と R の両方へ同じ音**。入力は L/R の平均を渡す |
+| プラグインが 3ch 以上 | 出力は**先頭2本を L / R として使う**。入力は L/R だけ渡し、残りは無音 |
+
+デバイスは **ステレオ → 3ch 以上 → モノラル**の順に選ぶ。単純にチャンネル数の
+多い順にすると、2ch も選べる環境で 7.1 を開いてしまう。
 - オーディオスレッドではロック・アロケーションなし (リングバッファ + 事前確保バッファ)。
   イベント発行は「クロックの前進」と「トラック別の発行」に分けて固定長で持ち回る
 - 音源の解放は必ずメインスレッド (外した処理器はトラック番号付きで返す)
@@ -569,7 +589,7 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 - **音声の書き出し中は画面が固まる**: メインスレッドで処理するため。進捗表示もない。
   Opus はレートの切り替えが両端に入るぶん、さらに長くなる
 - 書き出せる形式は **16bit PCM の WAV** と **Ogg/Opus** だけ
-- **Opus はモノラル / ステレオのみ**。3ch 以上の出力構成では書き出せない
+- **書き出しは常にステレオ**。デバイスが何チャンネルでも変わらない
 - **Opus のビットレートは可変 (VBR)** で、指定した値に張り付くわけではない
 - **clap.tail 拡張が未対応**: 書き出しの残響は終端から3秒で打ち切られる
 - **CCS 書き出しは1トラック目のみ**。ベロシティと歌詞は渡さない (歌詞は「ラ」固定)。

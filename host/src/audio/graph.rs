@@ -724,9 +724,12 @@ pub fn write_to_device<S: FromSample<f32>>(bus: &[f32], device: &mut [S], device
             let value = if channels == 1 {
                 // 左右を平均して落とす
                 bus[base..base + BUS_CHANNELS].iter().sum::<f32>() / BUS_CHANNELS as f32
+            } else if channel < BUS_CHANNELS {
+                bus[base + channel]
             } else {
-                // 足りないチャンネルは最後のもので埋める (`buffers.rs` と同じ方針)
-                bus[base + channel.min(BUS_CHANNELS - 1)]
+                // **3ch 以上のデバイスへは先頭2本だけ出す。** 余りは無音。
+                // 最後の1本で埋めると、リアなどから R が鳴ってしまう
+                0.0
             };
             *sample = FromSample::from_sample_(value);
         }
@@ -1083,5 +1086,22 @@ mod tests {
         let mut device = [0.0; 4];
         write_to_device(&bus, &mut device, 2);
         assert_eq!(device, bus);
+    }
+
+    /// **3ch 以上のデバイスへは先頭2本だけ出し、余りは無音にすること。**
+    ///
+    /// 最後の1本で埋めると、リアなどから R が鳴ってしまう。
+    #[test]
+    fn multichannel_device_gets_stereo_and_silence() {
+        let bus = [1.0, -1.0, 0.25, 0.5];
+        let mut device = [9.0; 12]; // 6ch × 2フレーム
+        write_to_device(&bus, &mut device, 6);
+
+        assert_eq!(device[0], 1.0);
+        assert_eq!(device[1], -1.0);
+        assert_eq!(&device[2..6], &[0.0; 4], "3本目以降は無音");
+        assert_eq!(device[6], 0.25);
+        assert_eq!(device[7], 0.5);
+        assert_eq!(&device[8..12], &[0.0; 4]);
     }
 }

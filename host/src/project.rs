@@ -695,8 +695,6 @@ mod tests {
         assert_eq!(restored.notes, original.notes);
     }
 
-    /// スウィングの設定が保存されること (MIDI では持てなかったもの)
-    #[test]
     /// CC 段の割り当てが保存・復元されること。
     ///
     /// 落ちると、開き直したときに CC 段が音符段に戻り、**ペダルのつもりの

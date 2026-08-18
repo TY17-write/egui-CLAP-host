@@ -288,12 +288,17 @@ fn feed_input(buffers: &mut AudioBuffers, buf: &[f32], channels: usize, frames: 
                 *sample = buf[base..base + channels].iter().sum::<f32>() * scale;
             }
         }
-        // 足りないチャンネルは最後のもので埋める
         _ => {
             for (index, input) in inputs.iter_mut().enumerate() {
-                let source = index.min(channels - 1);
+                if index >= channels {
+                    // **バスに無いチャンネルは無音。** ステレオまでしか扱わない
+                    // (最後の1本で埋めると、余った入力に R が入ってしまう)
+                    let end = frames.min(input.len());
+                    input[..end].fill(0.0);
+                    continue;
+                }
                 for (frame, sample) in input.iter_mut().take(frames).enumerate() {
-                    *sample = buf[frame * channels + source];
+                    *sample = buf[frame * channels + index];
                 }
             }
         }

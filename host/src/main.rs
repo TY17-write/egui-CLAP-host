@@ -1196,14 +1196,11 @@ impl App {
             self.fail_opus("音源が載っているトラックがありません。");
             return;
         }
-        // 符号化まで進んでから断ると、レートの切り替えを無駄に往復することになる
-        if config.output_channel_count != 1 && config.output_channel_count != 2 {
-            self.fail_opus(format!(
-                "Opus で書き出せるのはモノラルかステレオだけです ({}ch)",
-                config.output_channel_count
-            ));
-            return;
-        }
+        // **デバイスのチャンネル数では断らない。** 書き出しはグラフの出力
+        // (常にステレオ) をそのまま符号化するので、デバイスが何チャンネルでも
+        // Opus に載る。以前はここでデバイスを見ており、3ch 以上のデバイスでは
+        // ステレオしか書かないのに断っていた。
+        debug_assert!(graph::BUS_CHANNELS <= 2, "Opus はステレオまで");
 
         // 時間のかかる処理に入る前に保存先を聞く
         let Some(path) = self.ask_save_path("Opus ファイル", "opus", "mix.opus") else {
