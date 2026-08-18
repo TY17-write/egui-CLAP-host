@@ -373,6 +373,18 @@ fn notice_window(ctx: &egui::Context, notice: &mut Option<Notice>) {
 /// Windows で VST3 が置かれる標準の場所 (ダイアログの初期位置に使う)
 const VST3_STANDARD_DIRECTORY: &str = r"C:\Program Files\Common Files\VST3";
 
+/// オーディオトラック一覧で、名前と送り先に取る幅。
+///
+/// **固定にしてある。** 中身の文字数で幅が変わると、行ごとに音量や M/S の
+/// 位置がずれて押しにくくなる。入りきらない名前は端を詰めて、
+/// ホバーで全体を出す。
+const TRACK_NAME_W: f32 = 118.0;
+const TRACK_SENDS_W: f32 = 74.0;
+
+/// 詳細ウィンドウで、段の名前とチャンネル表記に取る幅 (理由は上と同じ)
+const NODE_NAME_W: f32 = 150.0;
+const NODE_CHANNELS_W: f32 = 56.0;
+
 /// 「♪」で聞く音源の選び方。
 ///
 /// ダイアログの出し方が形式ごとに違うので、開く前に決めてもらう必要がある。
@@ -427,9 +439,10 @@ struct App {
     project_path: Option<PathBuf>,
     /// 最後に読み書きしたフォルダ (ダイアログの初期位置)
     last_directory: Option<PathBuf>,
-    /// 保存・読み込みの結果メッセージ
-    status: Option<String>,
-    /// 画面中央に出す結果通知 (閉じるまで残る)
+    /// 画面中央に出す結果通知 (閉じるまで残る)。
+    ///
+    /// **結果の知らせはここに一本化してある。** 以前は上部に status 行を出して
+    /// いたが、同じ内容を通知にも出していたうえ、上部パネルごと畳んだため。
     notice: Option<Notice>,
 }
 
@@ -564,13 +577,16 @@ impl App {
                 self.project_path = None;
                 self.editor.project_path = None;
                 self.error = None;
-                self.status = Some(if cc_lanes > 0 {
-                    format!(
-                        "{name} から {count} 個のノートと {cc_lanes} 本の CC 段を読み込みました"
-                    )
-                } else {
-                    format!("{name} から {count} 個のノートを読み込みました")
-                });
+                self.notice = Some(Notice::ok(
+                    "MIDI を読み込みました",
+                    if cc_lanes > 0 {
+                        format!(
+                            "{name}\n\n{count} 個のノートと {cc_lanes} 本の CC 段を読み込みました"
+                        )
+                    } else {
+                        format!("{name}\n\n{count} 個のノートを読み込みました")
+                    },
+                ));
             }
             Err(e) => {
                 self.notice = Some(Notice::error(
@@ -600,7 +616,6 @@ impl App {
             Ok(()) => {
                 self.last_directory = path.parent().map(PathBuf::from);
                 self.error = None;
-                self.status = Some(format!("書き出しました: {}", file_label(&path)));
             }
             Err(e) => {
                 self.notice = Some(Notice::error(
@@ -637,7 +652,6 @@ impl App {
             Ok(()) => {
                 self.set_project_path(path.clone());
                 self.error = None;
-                self.status = Some(format!("保存しました: {}", file_label(&path)));
             }
             Err(e) => {
                 self.notice = Some(Notice::error(
@@ -688,7 +702,6 @@ impl App {
 
                 self.set_project_path(path.clone());
                 self.error = None;
-                self.status = Some(format!("開きました: {}", file_label(&path)));
 
                 let mut body = format!(
                     "{}\n\n{tracks} トラック / {notes} ノート / 音源 {} 個",
@@ -1065,7 +1078,6 @@ impl App {
                 // 音源の処理に失敗したトラックは無音のまま混ざっている。
                 // ファイルは残すが、成功として見せると欠けたまま気付けない。
                 if rendered.failures.is_empty() {
-                    self.status = Some(format!("書き出しました: {}", file_label(&path)));
                     self.notice = Some(Notice::ok("WAV を書き出しました", body));
                 } else {
                     body.push_str(
@@ -1079,7 +1091,6 @@ impl App {
                             failure.blocks
                         ));
                     }
-                    self.status = Some(format!("書き出しました (一部失敗): {}", file_label(&path)));
                     self.notice = Some(Notice::error("WAV の一部を書き出せませんでした", body));
                 }
             }
@@ -1159,7 +1170,6 @@ impl App {
                 self.last_directory = path.parent().map(PathBuf::from);
                 self.error = None;
                 self.notice = Some(self.opus_result_notice(&path, &rendered, bitrate, &dropped));
-                self.status = Some(format!("書き出しました: {}", file_label(&path)));
             }
             Err(e) => self.fail_opus(format!("保存できません:\n{e}")),
         }
@@ -1264,7 +1274,6 @@ impl App {
                         exported.skipped
                     ));
                 }
-                self.status = Some(format!("書き出しました: {}", file_label(&path)));
                 self.notice = Some(Notice::ok("CCS を書き出しました", body));
             }
             Err(e) => {
@@ -1597,6 +1606,137 @@ impl App {
         self.editor.dirty = true;
     }
 
+    /// 音源の形式を選ばせるポップアップ。
+    ///
+    /// ダイアログの出し方が形式で違うので先に決めてもらう
+    /// (.clap はファイル、.vst3 はバンドルディレクトリと単体ファイルの2通り)。
+    ///
+    /// **画面中央に出す。** 上部に行として出していたときは、押す場所が
+    /// 画面の隅にあって遠かった。
+    fn load_choice_popup(&mut self, ctx: &egui::Context) -> Option<LoadChoice> {
+        let track = self.pending_load?;
+        let mut chosen = None;
+
+        egui::Window::new("音源を読み込む")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                ui.label(format!(
+                    "オーディオトラック {} の {} 段目に読み込みます。",
+                    track.track,
+                    track.at + 1
+                ));
+                ui.add_space(6.0);
+                ui.weak("形式によってダイアログの出し方が違うので、先に選んでください");
+                ui.add_space(8.0);
+
+                if ui
+                    .add_sized([340.0, 26.0], egui::Button::new("CLAP (.clap ファイル)"))
+                    .clicked()
+                {
+                    chosen = Some(LoadChoice::Clap);
+                }
+                if ui
+                    .add_sized([340.0, 26.0], egui::Button::new("VST3 (.vst3 フォルダ)"))
+                    .on_hover_text("現行の標準。フォルダ選択が開きます")
+                    .clicked()
+                {
+                    chosen = Some(LoadChoice::Vst3Bundle);
+                }
+                if ui
+                    .add_sized(
+                        [340.0, 26.0],
+                        egui::Button::new("VST3 (.vst3 単体ファイル)"),
+                    )
+                    .on_hover_text(
+                        "フォルダになっていない古い形式。\
+                         バンドルの中の DLL を直接指すのにも使えます",
+                    )
+                    .clicked()
+                {
+                    chosen = Some(LoadChoice::Vst3File);
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                if ui.button("やめる").clicked() {
+                    chosen = Some(LoadChoice::Cancel);
+                }
+                ui.weak("(Esc でも閉じます)");
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            chosen = Some(LoadChoice::Cancel);
+        }
+        chosen
+    }
+
+    /// 1つのファイルに複数入っていたときの選択ポップアップ。
+    /// 1つだけのファイルは選ばせずにそのまま載るので出さない。
+    fn plugin_choice_popup(&mut self, ctx: &egui::Context) {
+        let Some(candidates) = self
+            .candidates
+            .as_ref()
+            .filter(|candidates| candidates.plugins.len() > 1)
+        else {
+            return;
+        };
+        let target = candidates.target_track;
+        let file = file_label(&candidates.path);
+        let plugins: Vec<(String, String)> = candidates
+            .plugins
+            .iter()
+            .map(|plugin| (plugin.name.clone(), plugin.id.clone()))
+            .collect();
+
+        let mut chosen = None;
+        let mut cancel = false;
+
+        egui::Window::new("プラグインを選ぶ")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(format!(
+                    "オーディオトラック {} の {} 段目 — {file}",
+                    target.track,
+                    target.at + 1
+                ));
+                ui.weak("このファイルには複数のプラグインが入っています");
+                ui.add_space(8.0);
+
+                for (index, (name, id)) in plugins.iter().enumerate() {
+                    if ui
+                        .add_sized([400.0, 26.0], egui::Button::new(format!("▶ {name}")))
+                        .on_hover_text(id)
+                        .clicked()
+                    {
+                        chosen = Some(index);
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                if ui.button("やめる").clicked() {
+                    cancel = true;
+                }
+                ui.weak("(Esc でも閉じます)");
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if let Some(index) = chosen {
+            self.instantiate(index, target);
+            self.candidates = None;
+        } else if cancel {
+            self.candidates = None;
+        }
+    }
+
     /// オーディオトラックの窓を出す。
     ///
     /// 一覧は常設で**ルーティング・音量・パン・ミュート/ソロ**だけを扱い、
@@ -1611,8 +1751,17 @@ impl App {
         let mut toggle_send = None;
         let mut mixer_changed = false;
 
+        // **初期位置は右上。** 既定 (左上) だとエディタのツールバーに重なる。
+        // `default_pos` なので、動かしたあとはその場所を覚える
+        const LIST_W: f32 = 430.0;
+        let right_top = {
+            let screen = ctx.screen_rect();
+            egui::pos2(screen.right() - LIST_W - 12.0, screen.top() + 12.0)
+        };
+
         egui::Window::new("オーディオトラック")
-            .default_width(430.0)
+            .default_width(LIST_W)
+            .default_pos(right_top)
             .show(ctx, |ui| {
                 ui.weak("0 はマスター。ここの出力がそのまま最終出力になる");
                 ui.add_space(4.0);
@@ -1636,16 +1785,26 @@ impl App {
                                 let track = &mut self.audio_tracks[index];
                                 ui.monospace(format!("{index:>2}"));
 
+                                // **幅を固定する。** 名前の長さで後ろのつまみが
+                                // 動くと、行ごとに押す位置が変わって使いづらい
+                                let name = track.label().to_string();
                                 if ui
-                                    .button(track.label())
-                                    .on_hover_text("詳細 (音源とエフェクトの管理)")
+                                    .add_sized(
+                                        [TRACK_NAME_W, 20.0],
+                                        egui::Button::new(egui::RichText::new(&name).size(12.0))
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(format!("{name} (クリックで詳細)"))
                                     .clicked()
                                 {
                                     open_detail = Some(index);
                                 }
 
-                                // 送り先。マスターは送り側にならないので出さない
-                                if index != graph::MASTER {
+                                // 送り先。マスターは送り側にならないので出さないが、
+                                // **場所は空けておく** (列がずれないように)
+                                if index == graph::MASTER {
+                                    ui.add_space(TRACK_SENDS_W + ui.spacing().item_spacing.x);
+                                } else {
                                     let label = if track.sends.is_empty() {
                                         "→ なし".to_string()
                                     } else {
@@ -1653,19 +1812,25 @@ impl App {
                                             track.sends.iter().map(|to| to.to_string()).collect();
                                         format!("→ {}", list.join(","))
                                     };
-                                    ui.menu_button(label, |ui| {
-                                        for target in 0..graph::AUDIO_TRACKS {
-                                            if target == index {
-                                                continue;
+                                    let sends = &track.sends;
+                                    ui.allocate_ui(egui::vec2(TRACK_SENDS_W, 20.0), |ui| {
+                                        ui.menu_button(label, |ui| {
+                                            for target in 0..graph::AUDIO_TRACKS {
+                                                if target == index {
+                                                    continue;
+                                                }
+                                                let mut on = sends.contains(&target);
+                                                if ui
+                                                    .checkbox(&mut on, format!("{target}"))
+                                                    .changed()
+                                                {
+                                                    toggle_send = Some((index, target));
+                                                }
                                             }
-                                            let mut on = track.sends.contains(&target);
-                                            if ui.checkbox(&mut on, format!("{target}")).changed() {
-                                                toggle_send = Some((index, target));
-                                            }
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text("送り先 (複数選ぶと足し合わさる)");
+                                        })
+                                        .response
+                                        .on_hover_text("送り先 (複数選ぶと足し合わさる)");
+                                    });
                                 }
 
                                 // 音量とパン
@@ -1749,8 +1914,19 @@ impl App {
         let mut gui_error = None;
         let mut open = true;
 
+        // 一覧の左隣に出す (一覧は右上なので、重ならない位置)
+        const DETAIL_W: f32 = 420.0;
+        let beside_list = {
+            let screen = ctx.screen_rect();
+            egui::pos2(
+                (screen.right() - 430.0 - DETAIL_W - 24.0).max(screen.left() + 12.0),
+                screen.top() + 12.0,
+            )
+        };
+
         egui::Window::new(format!("オーディオトラック {index}"))
-            .default_width(380.0)
+            .default_width(DETAIL_W)
+            .default_pos(beside_list)
             .open(&mut open)
             .show(ctx, |ui| {
                 // ---- MIDI の割り当て ----
@@ -1801,9 +1977,24 @@ impl App {
                     let node = &mut self.audio_tracks[index].nodes[at];
                     ui.horizontal(|ui| {
                         ui.monospace(format!("{}.", at + 1));
-                        ui.label(node.name.clone());
+                        // 幅を固定して、名前の長さでボタンの位置が動かないようにする
+                        let name = node.name.clone();
+                        ui.add_sized(
+                            [NODE_NAME_W, 20.0],
+                            egui::Label::new(&name).truncate().halign(egui::Align::LEFT),
+                        )
+                        .on_hover_text(&name);
                         // **どこでステレオが潰れるかを見えるように**
-                        ui.weak(format!("({}→{}ch)", node.channels.0, node.channels.1));
+                        ui.add_sized(
+                            [NODE_CHANNELS_W, 20.0],
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{}→{}ch",
+                                    node.channels.0, node.channels.1
+                                ))
+                                .weak(),
+                            ),
+                        );
 
                         let mut bypassed = node.bypassed;
                         if ui
@@ -2288,95 +2479,17 @@ impl eframe::App for App {
             }
         }
 
+        // エラーは通知へ寄せる (上部の状態行は畳んだ)
+        if let Some(error) = self.error.take() {
+            self.notice = Some(Notice::error("エラー", error));
+        }
+
+        // 音源の形式とプラグインの選択。**画面中央のポップアップで出す。**
+        // 上部に行として出していたときは、押す場所が画面の隅で遠かった
+        let chosen_kind = self.load_choice_popup(ctx);
+        self.plugin_choice_popup(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // ヘッダー行 (状態表示)
-            ui.horizontal(|ui| {
-                ui.heading("CLAP ミニホスト");
-                ui.separator();
-                // .clap のロードはトラック欄の「♪」から行うので、ここでは出さない
-                /*
-                if ui.button(".clap ファイルを開く…").clicked() {
-                    // ヘッダーからのロードはトラック1へ
-                    self.open_file_dialog(0);
-                }
-                */
-                if let Some(error) = &self.error {
-                    ui.colored_label(egui::Color32::RED, error);
-                }
-                if let Some(status) = &self.status {
-                    ui.weak(status);
-                }
-            });
-
-            // 音源の形式の選択。ダイアログの出し方が形式で違うので先に決めてもらう
-            // (.clap はファイル、.vst3 はバンドルディレクトリと単体ファイルの2通り)。
-            let mut chosen_kind = None;
-            if let Some(track) = self.pending_load {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!(
-                        "オーディオトラック {} の {} 段目に読み込む音源の形式:",
-                        track.track,
-                        track.at + 1
-                    ));
-                    if ui.button("CLAP (.clap ファイル)").clicked() {
-                        chosen_kind = Some(LoadChoice::Clap);
-                    }
-                    if ui
-                        .button("VST3 (.vst3 フォルダ)")
-                        .on_hover_text("現行の標準。フォルダ選択が開きます")
-                        .clicked()
-                    {
-                        chosen_kind = Some(LoadChoice::Vst3Bundle);
-                    }
-                    if ui
-                        .button("VST3 (.vst3 単体ファイル)")
-                        .on_hover_text(
-                            "フォルダになっていない古い形式。\
-                             バンドルの中の DLL を直接指すのにも使えます",
-                        )
-                        .clicked()
-                    {
-                        chosen_kind = Some(LoadChoice::Vst3File);
-                    }
-                    if ui.button("やめる").clicked() {
-                        chosen_kind = Some(LoadChoice::Cancel);
-                    }
-                });
-            }
-
-            // プラグイン選択。1つの .clap に複数入っていて、まだ選んでいないときだけ出す
-            // (1つだけのファイルは選ばせずにそのまま載るので出さない)。
-            let mut instantiate_index = None;
-            if let Some(candidates) = self
-                .candidates
-                .as_ref()
-                .filter(|candidates| candidates.plugins.len() > 1)
-            {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!(
-                        "オーディオトラック {} の {} 段目に読み込むプラグインを選択 ({}):",
-                        candidates.target_track.track,
-                        candidates.target_track.at + 1,
-                        file_label(&candidates.path)
-                    ));
-                    for (i, plugin) in candidates.plugins.iter().enumerate() {
-                        if ui
-                            .button(format!("▶ {} ({})", plugin.name, plugin.id))
-                            .clicked()
-                        {
-                            instantiate_index = Some(i);
-                        }
-                    }
-                });
-            }
-            if let Some(i) = instantiate_index {
-                if let Some(track) = self.candidates.as_ref().map(|c| c.target_track) {
-                    self.instantiate(i, track);
-                }
-                // 選び終わったら候補を片付ける (選択行を残さない)
-                self.candidates = None;
-            }
-
             // 音源の操作はオーディオトラックの窓へ移した (下の `audio_track_windows`)
             {
 
