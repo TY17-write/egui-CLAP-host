@@ -418,6 +418,11 @@ pub struct Graph {
     buffers: Vec<f32>,
     /// いま確保してあるフレーム数
     capacity_frames: usize,
+    /// トランスポートから取り出したイベントの受け皿 (打ち込み1本ぶん)。
+    ///
+    /// **同じ打ち込みを複数のトラックへ配るために要る**
+    /// ([`emit_from`](Self::emit_from) を参照)。容量は確保済み。
+    emit_scratch: BlockEvents,
 }
 
 impl Default for Graph {
@@ -433,6 +438,7 @@ impl Graph {
             mixer: Mixer::default(),
             buffers: Vec::new(),
             capacity_frames: 0,
+            emit_scratch: BlockEvents::with_capacity(128),
         }
     }
 
@@ -536,7 +542,11 @@ impl Graph {
     ///
     /// **打ち込みトラックとオーディオトラックは番号が違う。** どの打ち込みを
     /// 取るかはオーディオトラックごとに決まっているので、その対応で配る。
-    /// 1つの打ち込みを複数のオーディオトラックが見ていれば、どれにも届く。
+    ///
+    /// **1つの打ち込みは、それを見ている全トラックへ届く** (同じ打ち込みを
+    /// 複数の音源で重ねられる)。ただし [`Transport::emit_track`] は取り出しながら
+    /// カーソルを進めるので、**同じ打ち込みに2度聞くと2度目は空になる**。
+    /// そこで打ち込み1本につき1回だけ取り出し、受け皿から配る。
     ///
     /// 再生・書き出し・検証バイナリのすべてがここを通る
     /// (配り方が食い違うと、経路によって鳴る音が変わる)。
@@ -547,14 +557,38 @@ impl Graph {
         if plan.is_empty() {
             return;
         }
+        // 受け皿とトラックを同時に触るので、フィールドを個別に借りる
+        let Self {
+            tracks,
+            emit_scratch,
+            ..
+        } = self;
+
         for index in 0..AUDIO_TRACKS {
-            let Some(midi_track) = self.track(index).and_then(|slot| slot.midi_track) else {
+            let Some(midi_track) = tracks[index].midi_track else {
                 continue;
             };
-            let Some(events) = self.events_mut(index) else {
+            // 同じ打ち込みを見ているトラックが先にあれば、そこで配り済み
+            let first = (0..index).all(|earlier| tracks[earlier].midi_track != Some(midi_track));
+            if !first {
                 continue;
-            };
-            transport.emit_track(midi_track, plan, events);
+            }
+
+            emit_scratch.clear();
+            transport.emit_track(midi_track, plan, emit_scratch);
+            if emit_scratch.is_empty() {
+                continue;
+            }
+
+            for target in tracks.iter_mut().skip(index) {
+                if target.midi_track != Some(midi_track) {
+                    continue;
+                }
+                let events = target.processor.events_mut();
+                for event in emit_scratch.iter() {
+                    events.push(*event);
+                }
+            }
         }
     }
 
@@ -904,6 +938,82 @@ mod tests {
         let mixer = mixer(&[(1, MASTER), (2, MASTER)], 0, 0);
         assert!(mixer.is_audible(1));
         assert!(mixer.is_audible(2));
+    }
+
+    /// **MIDI の割り当てどおりに配ること。**
+    ///
+    /// 実際にここで音が出なくなった: 割り当てがオーディオスレッドへ届いておらず、
+    /// 画面には「トラック1」と出ているのに `midi_track` は `None` のままだった。
+    /// 割り当てが無いトラックへイベントが行かないことを、ここで縛っておく。
+    #[test]
+    fn events_go_to_the_assigned_midi_track_only() {
+        use crate::audio::transport::{Transport, TransportMsg, TransportShared};
+        use crate::sequencer::{SeqEvent, SeqEventKind};
+
+        let mut transport = Transport::new(TransportShared::new());
+        let _ = transport.handle_msg(TransportMsg::SetSequence {
+            track: 0,
+            events: vec![SeqEvent {
+                sample_time: 0,
+                kind: SeqEventKind::NoteOn {
+                    key: 60,
+                    velocity: 1.0,
+                },
+            }]
+            .into_boxed_slice(),
+            end_sample: 4096,
+        });
+        let _ = transport.handle_msg(TransportMsg::Play);
+
+        let mut graph = Graph::new();
+        graph.set_midi_track(1, Some(0)); // 打ち込み0 を鳴らす
+        graph.set_midi_track(2, None); // 未割り当て
+
+        let plan = transport.plan_block(512);
+        graph.clear_events();
+        graph.emit_from(&mut transport, &plan);
+
+        assert!(
+            !graph.events_mut(1).unwrap().is_empty(),
+            "割り当てたトラックには届くこと"
+        );
+        assert!(
+            graph.events_mut(2).unwrap().is_empty(),
+            "未割り当てのトラックには届かないこと"
+        );
+    }
+
+    /// 1つの打ち込みを複数のオーディオトラックが見ていれば、どれにも届くこと
+    #[test]
+    fn one_midi_track_can_feed_several_audio_tracks() {
+        use crate::audio::transport::{Transport, TransportMsg, TransportShared};
+        use crate::sequencer::{SeqEvent, SeqEventKind};
+
+        let mut transport = Transport::new(TransportShared::new());
+        let _ = transport.handle_msg(TransportMsg::SetSequence {
+            track: 3,
+            events: vec![SeqEvent {
+                sample_time: 0,
+                kind: SeqEventKind::NoteOn {
+                    key: 64,
+                    velocity: 1.0,
+                },
+            }]
+            .into_boxed_slice(),
+            end_sample: 4096,
+        });
+        let _ = transport.handle_msg(TransportMsg::Play);
+
+        let mut graph = Graph::new();
+        graph.set_midi_track(1, Some(3));
+        graph.set_midi_track(5, Some(3));
+
+        let plan = transport.plan_block(512);
+        graph.clear_events();
+        graph.emit_from(&mut transport, &plan);
+
+        assert!(!graph.events_mut(1).unwrap().is_empty());
+        assert!(!graph.events_mut(5).unwrap().is_empty());
     }
 
     /// NaN や負の音量を通さないこと (以降のブロックすべてに波及する)

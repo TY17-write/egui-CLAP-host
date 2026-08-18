@@ -421,6 +421,12 @@ struct App {
     audio_tracks: Vec<AudioTrackUi>,
     /// 詳細ウィンドウを出しているオーディオトラック
     detail_track: Option<usize>,
+    /// オーディオトラックの一覧を出しているか。
+    ///
+    /// **閉じられるようにしてある。** 常設だと画面のどこかを必ず塞ぐので、
+    /// 上部のボタンで出し入れする。`Default` は false なので、
+    /// 起動時に開くのは [`ensure_audio_tracks`](App::ensure_audio_tracks) で決める。
+    show_audio_tracks: bool,
     /// 外したが、まだノードが返ってきていないインスタンス。
     /// 返却時に正しいインスタンスへ deactivate するため、ここで生かしておく。
     /// 添字は**オーディオトラック番号**で、同じトラック内では入れた順に返る。
@@ -695,8 +701,8 @@ impl App {
                 // 音源はシーケンスを入れ替えたあとに載せる
                 // (トラック数が揃ってからでないと行き先が決まらない)
                 let mut failures = self.restore_audio_tracks(loaded.audio_tracks);
-                // 音源を載せる過程でエンジンが起きるので、そのあとに送る
-                self.push_routing();
+                // 音源を載せる過程でエンジンが起きるので、そのあとに丸ごと送り直す
+                self.push_engine_state();
                 // 16本に収まらず載せられなかったぶんも同じ扱いで知らせる
                 failures.extend(loaded.overflow);
 
@@ -764,6 +770,8 @@ impl App {
             return;
         }
         self.audio_tracks = (0..graph::AUDIO_TRACKS).map(AudioTrackUi::new).collect();
+        // 起動直後は開いておく (ここが音源を載せる唯一の入口なので)
+        self.show_audio_tracks = true;
     }
 
     /// 繋ぎ方・音量・ミュート/ソロをまとめたもの。
@@ -835,11 +843,41 @@ impl App {
     /// 繋ぎ方と音量をオーディオスレッドへ送る。
     ///
     /// **音源を載せ替えても繋ぎ方は変わらない**ので、送るのは繋ぎ方が
-    /// 変わったときとエンジンを起こしたときだけでよい。
+    /// 変わったときだけでよい。
     fn push_routing(&mut self) {
         let mixer = self.mixer();
         if let Some(engine) = self.engine.as_mut() {
             let _ = engine.producer.push(GuiMsg::SetMixer(mixer));
+        }
+    }
+
+    /// 今の設定を丸ごとオーディオスレッドへ送り直す。
+    ///
+    /// **エンジンを起こした直後に必ず呼ぶこと。** 設定を触るメソッドは
+    /// 「エンジンが無ければ送らない」で済ませているので、**エンジンが立つ前に
+    /// 決めたことは向こうに届いていない**。
+    ///
+    /// 実際にこれで音が出なくなった: 音源を載せる前に MIDI の割り当てだけ
+    /// 済ませると、エンジンが起きたときに割り当てが再送されず、画面には
+    /// 「トラック1」と出ているのにオーディオスレッド側は未割り当てのままだった。
+    fn push_engine_state(&mut self) {
+        self.ensure_audio_tracks();
+        let mixer = self.mixer();
+        let assignments: Vec<(usize, Option<usize>)> = self
+            .audio_tracks
+            .iter()
+            .enumerate()
+            .map(|(track, slot)| (track, slot.midi_track))
+            .collect();
+
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let _ = engine.producer.push(GuiMsg::SetMixer(mixer));
+        for (track, midi_track) in assignments {
+            let _ = engine
+                .producer
+                .push(GuiMsg::SetMidiTrack { track, midi_track });
         }
     }
 
@@ -1482,8 +1520,9 @@ impl App {
         if self.engine.is_none() {
             let engine = start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
             self.engine = Some(engine);
-            // 起こしたばかりのエンジンは既定の繋ぎ方なので、今のものを送る
-            self.push_routing();
+            // **起こしたばかりのエンジンは何も知らない。**
+            // 立つ前に決めた繋ぎ方と MIDI の割り当てを丸ごと送り直す
+            self.push_engine_state();
         }
 
         // 名前は選択 UI に出したものと同じにしたいので、ここでも数え上げる
@@ -1759,9 +1798,11 @@ impl App {
             egui::pos2(screen.right() - LIST_W - 12.0, screen.top() + 12.0)
         };
 
+        let mut list_open = self.show_audio_tracks;
         egui::Window::new("オーディオトラック")
             .default_width(LIST_W)
             .default_pos(right_top)
+            .open(&mut list_open)
             .show(ctx, |ui| {
                 ui.weak("0 はマスター。ここの出力がそのまま最終出力になる");
                 ui.add_space(4.0);
@@ -1878,6 +1919,8 @@ impl App {
                     }
                 });
             });
+
+        self.show_audio_tracks = list_open;
 
         if let Some((from, to)) = toggle_send {
             if let Err(problems) = self.toggle_send(from, to) {
@@ -2488,6 +2531,27 @@ impl eframe::App for App {
         // 上部に行として出していたときは、押す場所が画面の隅で遠かった
         let chosen_kind = self.load_choice_popup(ctx);
         self.plugin_choice_popup(ctx);
+
+        // **オーディオトラックの窓を呼び戻すためだけの帯。**
+        // 窓は閉じられるので、閉じたあとに開き直す口が要る
+        // (音源を載せる唯一の入口なので、行き止まりにできない)。
+        self.ensure_audio_tracks();
+        egui::TopBottomPanel::top("audio_track_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let loaded = self
+                    .audio_tracks
+                    .iter()
+                    .filter(|track| !track.nodes.is_empty())
+                    .count();
+                ui.toggle_value(&mut self.show_audio_tracks, "オーディオトラック")
+                    .on_hover_text("音源とエフェクトの管理・ルーティング");
+                if loaded == 0 {
+                    ui.weak("音源が1つも載っていません");
+                } else {
+                    ui.weak(format!("{loaded} 本に音源が載っています"));
+                }
+            });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // 音源の操作はオーディオトラックの窓へ移した (下の `audio_track_windows`)
