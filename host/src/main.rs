@@ -396,19 +396,6 @@ struct App {
     track_soloed: u16,
 }
 
-/// 既定の繋ぎ方: マスター以外はマスターへ1本
-fn default_routing_sends() -> Vec<Vec<usize>> {
-    (0..graph::AUDIO_TRACKS)
-        .map(|index| {
-            if index == graph::MASTER {
-                Vec::new()
-            } else {
-                vec![graph::MASTER]
-            }
-        })
-        .collect()
-}
-
 impl App {
     /// .clap を選ばせて候補を読み込む。
     /// 戻り値は「候補を新しく読み込めたか」。キャンセルや失敗では false を返し、

@@ -2068,7 +2068,7 @@ fn grid(
     }
 
     // ---- 段の区切り線 ----
-    let lane_stroke = Stroke::new(0.5, palette::BG_SELECT.gamma_multiply(0.7));
+    let lane_stroke = Stroke::new(0.5_f32, palette::BG_SELECT.gamma_multiply(0.7));
     for row in 0..=display_rows {
         let y = origin.y + RULER_H + row as f32 * row_h;
         painter.line_segment(
@@ -2078,7 +2078,7 @@ fn grid(
     }
 
     // ---- トラックの区切り線 (段の線より目立たせる) ----
-    let track_stroke = Stroke::new(1.5, palette::FG_DIM);
+    let track_stroke = Stroke::new(1.5_f32, palette::FG_DIM);
     for offset in row_offsets.iter().skip(1) {
         let y = origin.y + RULER_H + *offset as f32 * row_h;
         painter.line_segment(
@@ -2091,7 +2091,7 @@ fn grid(
     // 拍線・小節線より先に描いて、重なる位置は上から塗り潰させる
     let unit = state.snap_unit();
     if state.tuplet > 1 && unit * ppq >= 6.0 {
-        let tuplet_stroke = Stroke::new(0.5, palette::PURPLE.gamma_multiply(0.45));
+        let tuplet_stroke = Stroke::new(0.5_f32, palette::PURPLE.gamma_multiply(0.45));
         let mut q = unit;
         while q <= total_quarters {
             let x = to_x(q);
@@ -2108,8 +2108,8 @@ fn grid(
 
     // ---- 拍線・小節線 ----
     let qpbeat = state.editor.quarters_per_beat();
-    let beat_stroke = Stroke::new(1.0, palette::BG_SELECT);
-    let bar_stroke = Stroke::new(1.5, palette::FG_DIM);
+    let beat_stroke = Stroke::new(1.0_f32, palette::BG_SELECT);
+    let bar_stroke = Stroke::new(1.5_f32, palette::FG_DIM);
 
     let mut q = 0.0f32;
     let mut beat_index = 0u32;
@@ -2175,7 +2175,7 @@ fn grid(
             painter.rect_stroke(
                 rect,
                 CornerRadius::same(4),
-                Stroke::new(2.0, palette::FG),
+                Stroke::new(2.0_f32, palette::FG),
                 egui::StrokeKind::Outside,
             );
         }
@@ -2211,7 +2211,7 @@ fn grid(
             Pos2::new(playhead_x, origin.y),
             Pos2::new(playhead_x, origin.y + content_h),
         ],
-        Stroke::new(2.0, palette::RED),
+        Stroke::new(2.0_f32, palette::RED),
     );
 
     // 再生中は再生線が見えるように追従スクロール
@@ -2479,7 +2479,7 @@ fn grid(
                     painter.rect_stroke(
                         rect,
                         CornerRadius::same(2),
-                        Stroke::new(1.0, palette::FG_DIM),
+                        Stroke::new(1.0_f32, palette::FG_DIM),
                         egui::StrokeKind::Inside,
                     );
                     // 選択枠はノートより後に描くので、次フレームで囲みを反映させる
@@ -2923,7 +2923,7 @@ fn track_gutter_content(
         painter.rect_filled(rect, CornerRadius::ZERO, palette::BG_LIGHT);
         painter.line_segment(
             [rect.left_top(), rect.right_top()],
-            Stroke::new(1.5, palette::FG_DIM),
+            Stroke::new(1.5_f32, palette::FG_DIM),
         );
 
         // 段の帯 (トラック欄といちばん左の小節の間)。段ごとに1本ずつ。

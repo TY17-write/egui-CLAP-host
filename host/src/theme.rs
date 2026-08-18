@@ -54,9 +54,9 @@ pub fn apply(ctx: &egui::Context) {
     visuals.error_fg_color = RED;
 
     visuals.selection.bg_fill = BG_SELECT;
-    visuals.selection.stroke = Stroke::new(1.0, CYAN);
+    visuals.selection.stroke = Stroke::new(1.0_f32, CYAN);
 
-    visuals.window_stroke = Stroke::new(1.0, BG_SELECT);
+    visuals.window_stroke = Stroke::new(1.0_f32, BG_SELECT);
     visuals.window_corner_radius = CornerRadius::same(4);
 
     let widgets = &mut visuals.widgets;
@@ -64,32 +64,32 @@ pub fn apply(ctx: &egui::Context) {
     // 非対話 (ラベル・区切り線など)
     widgets.noninteractive.bg_fill = BG;
     widgets.noninteractive.weak_bg_fill = BG;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0, BG_SELECT);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0, FG_DIM);
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BG_SELECT);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, FG_DIM);
 
     // 通常状態のボタン等
     widgets.inactive.bg_fill = BG_LIGHT;
     widgets.inactive.weak_bg_fill = BG_LIGHT;
-    widgets.inactive.bg_stroke = Stroke::new(1.0, BG_SELECT);
-    widgets.inactive.fg_stroke = Stroke::new(1.0, FG);
+    widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BG_SELECT);
+    widgets.inactive.fg_stroke = Stroke::new(1.0_f32, FG);
 
     // ホバー
     widgets.hovered.bg_fill = BG_SELECT;
     widgets.hovered.weak_bg_fill = BG_SELECT;
-    widgets.hovered.bg_stroke = Stroke::new(1.0, BG_HOVER);
-    widgets.hovered.fg_stroke = Stroke::new(1.5, CYAN);
+    widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BG_HOVER);
+    widgets.hovered.fg_stroke = Stroke::new(1.5_f32, CYAN);
 
     // 押下・選択中
     widgets.active.bg_fill = BG_HOVER;
     widgets.active.weak_bg_fill = BG_HOVER;
-    widgets.active.bg_stroke = Stroke::new(1.0, CYAN);
-    widgets.active.fg_stroke = Stroke::new(2.0, FG);
+    widgets.active.bg_stroke = Stroke::new(1.0_f32, CYAN);
+    widgets.active.fg_stroke = Stroke::new(2.0_f32, FG);
 
     // 開いているコンボボックス等
     widgets.open.bg_fill = BG_LIGHT;
     widgets.open.weak_bg_fill = BG_LIGHT;
-    widgets.open.bg_stroke = Stroke::new(1.0, BG_HOVER);
-    widgets.open.fg_stroke = Stroke::new(1.0, FG);
+    widgets.open.bg_stroke = Stroke::new(1.0_f32, BG_HOVER);
+    widgets.open.fg_stroke = Stroke::new(1.0_f32, FG);
 
     for widget in [
         &mut widgets.noninteractive,
