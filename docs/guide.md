@@ -48,6 +48,7 @@ cargo run -p egui-clap-host --bin state_smoke -- target\test_plugin.clap # 音�
 cargo run -p egui-clap-host --bin gain_smoke -- target\test_plugin.clap  # 検証用エフェクトの挙動確認
 cargo run -p egui-clap-host --bin chain_smoke -- target\test_plugin.clap # 音源→エフェクトのチェーンの検証
 cargo run -p egui-clap-host --bin route_smoke -- target\test_plugin.clap # トラック間のルーティングの検証
+cargo run -p egui-clap-host --bin loop_smoke -- target\test_plugin.clap  # ループの折り返しの検証
 cargo run -p egui-clap-host --bin meter_smoke -- target\test_plugin.clap # ラウドネス・スペクトルの検証
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
@@ -84,6 +85,12 @@ cargo test -p egui-clap-host --lib
 最初の1つを取る検証バイナリは今まで通り音源を掴む。
 
 画面から読み込むと**候補が2つ出る**ので、どちらかを選ぶことになる。
+
+**サイン波音源にはエンベロープが無い。** ノートオンで位相を 0 に戻し、ノートオフで
+振幅そのままの状態から即座に止まるので、**ノートの切れ目で「プツッ」と鳴る**
+(音の終わりや再生の終了で顕著)。検証に使う波形を素直に保つためで、不具合ではない。
+実際のプラグインはどれもリリースを持っているので起きない。
+段差を測っている `loop_smoke` にも、この分がそのまま出る。
 
 ### テスト治具: test-plugin の VST3 版
 
