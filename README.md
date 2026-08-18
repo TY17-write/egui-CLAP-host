@@ -96,6 +96,8 @@ cargo test -p egui-clap-host --lib
 | [docs/guide.md](docs/guide.md) | **使い方・機能の詳細・アーキテクチャ・制限事項** |
 | [docs/vst3_host_plan.md](docs/vst3_host_plan.md) | VST3 対応の設計と実測 (フォークした理由、エディタまわりの調査) |
 | [docs/export_rate_plan.md](docs/export_rate_plan.md) | Opus 書き出しの設計と、ビットレートを絞った理由 |
+| [docs/refactor_plan.md](docs/refactor_plan.md) | モジュール分割の記録と、`cargo coupling` の読み方 |
+| [docs/routing_plan.md](docs/routing_plan.md) | 音声ルーティングの設計 (オーディオトラックと繋ぎ方) |
 | [docs/swing-plan.md](docs/swing-plan.md) | スウィングの実装計画 |
 | [docs/waltz-plan.md](docs/waltz-plan.md) | 不均等な拍 (ウィンナ・ワルツ風) の実装計画 |
 

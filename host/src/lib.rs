@@ -1,6 +1,10 @@
 //! egui-CLAP-host のライブラリ部分。
 //! main.rs (GUI) と bin/smoke.rs (オフライン検証) の両方から使う。
+//!
+//! **GUI アプリの中身も [`app`] としてここに置いてある。** バイナリ側に残すと
+//! `cargo test --lib` から外れるため。`main.rs` は起動だけを受け持つ。
 
+pub mod app;
 pub mod audio;
 pub mod ccs;
 pub mod discovery;

@@ -548,6 +548,21 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 
 設計の経緯と実測は [vst3_host_plan.md](vst3_host_plan.md) に残してある。
 
+### ソースの置き場
+
+`host/src/main.rs` は**起動だけ**で、中身は全部ライブラリ側にある
+(こうすると `cargo test --lib` に全部乗る)。
+
+| | 中身 |
+|---|---|
+| `app/` | アプリの状態と毎フレームの処理。`mod.rs` が `App` と `update`、以下 `routing` (繋ぎ方と音量) / `plugins` (音源の読み込み) / `project_io` (保存と MIDI) / `render` (書き出し) / `mixer_ui` (オーディオトラックの窓) / `track` / `notice` |
+| `editor_ui/` | ピアノロール。`grid` (描画と操作) / `geometry` (座標と当たり判定・テストの大半) / `state` (選択と編集) / `history` / `gutter` / `toolbar` / `color` / `help` / `metrics` |
+| `audio/` | オーディオスレッド側。`graph` (ルーティングとミキサ) / `transport` / `buffers` / `clap` / `vst3` / `offline` (書き出し) |
+| その他 | `sequencer` (ノートとトラックの型) / `project` (.ron) / `midi` / `wav` / `opus` / `ccs` / `discovery` / `gui` / `host` / `theme` |
+
+分割の判断と、`cargo coupling` の点をどう読んだかは
+[refactor_plan.md](refactor_plan.md) に残してある。
+
 ## プラグイン独自 GUI
 
 音源を読み込むと、画面上部に「エディタを開く」ボタンが出る。**Win32 ネイティブ
