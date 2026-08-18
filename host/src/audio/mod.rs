@@ -101,25 +101,38 @@ pub enum GuiMsg {
         value: f64,
     },
     Transport(TransportMsg),
-    /// オーディオトラックに音源を載せる (差し替え時は古い方を retired へ返す)。
-    ///
-    /// `midi_track` はそのトラックが MIDI を取る打ち込みトラック
-    /// (`None` は入力なし = バス用)。
-    SetTrack {
+    /// チェーンの `at` 段目を差し替える。段数と同じ位置なら末尾へ足す。
+    /// 押し出された段は retired へ返る。
+    SetNode {
+        addr: NodeAddr,
+        node: Box<Node>,
+    },
+    /// チェーンの `at` 段目を外す (retired へ返る)
+    RemoveNode {
+        addr: NodeAddr,
+    },
+    /// チェーンの段を並べ替える
+    MoveNode {
+        track: usize,
+        from: usize,
+        to: usize,
+    },
+    /// 段を素通しにするか
+    SetBypassed {
+        addr: NodeAddr,
+        bypassed: bool,
+    },
+    /// そのトラックが MIDI を取る打ち込みトラック (`None` は未割り当て)
+    SetMidiTrack {
         track: usize,
         midi_track: Option<usize>,
-        processor: Box<TrackProcessor>,
     },
-    /// オーディオトラックの音源を外す
-    ClearTrack {
-        track: usize,
-    },
-    /// 繋ぎ方と処理順を丸ごと差し替える。
+    /// 繋ぎ方・音量・パン・ミュート/ソロを丸ごと差し替える。
     ///
-    /// **メインスレッドで組み立て済みのものだけを送る。** 輪になっていないことは
-    /// 組み立ての時点で確かめてあるので、オーディオスレッドは何も検査しない。
-    /// [`graph::Routing`] は `Copy` なので、ここで確保も解放も起きない。
-    SetRouting(graph::Routing),
+    /// **メインスレッドで組み立て済みのものだけを送る。** 輪になっていないことも
+    /// ソロの範囲も組み立ての時点で解いてあるので、オーディオスレッドは
+    /// 何も検査しない。[`graph::Mixer`] は `Copy` なので確保も解放も起きない。
+    SetMixer(graph::Mixer),
 }
 
 /// 音源の形式ごとの処理器。
@@ -139,11 +152,38 @@ pub enum Backend {
 /// チェーンの途中に置けばそこまでの音が消える。
 pub struct Node {
     backend: Backend,
+    /// 処理を飛ばして音を素通しする。
+    ///
+    /// **無音にはしない。** 入力ポートを持たないノード (音源) をバイパスすると、
+    /// そこまでの音がそのまま通る (チェーンの先頭なら無音)。
+    ///
+    /// 処理そのものを飛ばすので、**戻した瞬間は内部状態が古い**
+    /// (ディレイやリバーブは溜まりが無い状態から始まる)。
+    bypassed: bool,
+}
+
+/// チェーンの1段を指す
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeAddr {
+    pub track: usize,
+    /// チェーンの何段目か (0 が先頭)
+    pub at: usize,
 }
 
 impl Node {
     pub fn new(backend: Backend) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            bypassed: false,
+        }
+    }
+
+    pub fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed;
+    }
+
+    pub fn is_bypassed(&self) -> bool {
+        self.bypassed
     }
 
     /// メインスレッドへ返せる形にする (このメソッド自体もメインスレッドで呼ぶ)
@@ -156,6 +196,8 @@ impl Node {
 
     /// 1ブロック処理して `buf` を置き換える。
     /// `index` はチェーンの何段目か (自分宛てのパラメータを拾うために使う)。
+    ///
+    /// **バイパス中は何もしない。** `buf` に入っている音がそのまま次段へ渡る。
     fn process(
         &mut self,
         events: &BlockEvents,
@@ -163,6 +205,9 @@ impl Node {
         steady: u64,
         buf: &mut [f32],
     ) -> Result<(), ProcessError> {
+        if self.bypassed {
+            return Ok(());
+        }
         match &mut self.backend {
             Backend::Clap(processor) => processor.process(events, index, steady, buf),
             Backend::Vst3(processor) => processor.process(events, index, buf),
@@ -201,19 +246,72 @@ impl TrackProcessor {
 
     /// 1段だけのトラックを作る
     pub fn from_node(node: Node) -> Self {
+        let mut track = Self::empty(1);
+        track.nodes.push(node);
+        track
+    }
+
+    /// 空のチェーン。`capacity` 段まで**確保せずに**足せる。
+    ///
+    /// オーディオスレッドでノードを足すので、器を先に取っておく必要がある。
+    pub fn empty(capacity: usize) -> Self {
         Self {
             events: BlockEvents::with_capacity(128),
-            nodes: vec![node],
+            nodes: Vec::with_capacity(capacity),
         }
     }
 
-    /// チェーンの末尾に足す。**メインスレッドで組み立てること** (確保が起きる)
+    /// チェーンの末尾に足す。**メインスレッドで組み立てること** (確保が起きうる)
     pub fn push_node(&mut self, node: Node) {
         self.nodes.push(node);
     }
 
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// `at` 段目を差し替える。段数と同じ位置なら末尾へ足す。
+    /// 押し出されたノードを返す。**容量を超える追加は受け付けない**
+    /// (確保が起きるため、そのまま返す)。
+    pub fn set_node(&mut self, at: usize, node: Node) -> Option<Node> {
+        if at < self.nodes.len() {
+            return Some(std::mem::replace(&mut self.nodes[at], node));
+        }
+        if self.nodes.len() < self.nodes.capacity() {
+            self.nodes.push(node);
+            return None;
+        }
+        Some(node)
+    }
+
+    /// `at` 段目を外す。後ろの段が繰り上がる
+    pub fn remove_node(&mut self, at: usize) -> Option<Node> {
+        (at < self.nodes.len()).then(|| self.nodes.remove(at))
+    }
+
+    /// `from` 段目を `to` 段目へ動かす。
+    ///
+    /// **パラメータの宛先は段の番号**なので、動かすとイベントの行き先も変わる。
+    /// 送るのはメインスレッドなので、次のブロックからは新しい番号で届く。
+    pub fn move_node(&mut self, from: usize, to: usize) {
+        let len = self.nodes.len();
+        if from >= len || to >= len || from == to {
+            return;
+        }
+        let node = self.nodes.remove(from);
+        self.nodes.insert(to, node);
+    }
+
+    pub fn set_bypassed(&mut self, at: usize, bypassed: bool) {
+        if let Some(node) = self.nodes.get_mut(at) {
+            node.set_bypassed(bypassed);
+        }
+    }
+
+    /// 載っているノードを全部取り出す (上から順)。
+    /// **`drain` なので器 (容量) は残る** (`mem::take` だと容量ごと持って行かれる)
+    pub fn take_nodes(&mut self) -> Vec<Node> {
+        self.nodes.drain(..).collect()
     }
 
     /// チェーンの全ノードを上から順に、メインスレッドへ返せる形にする
@@ -268,7 +366,7 @@ impl TrackProcessor {
 /// 解放しないため)。
 pub fn start_engine(
     gui_events: Consumer<GuiMsg>,
-    retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
+    retired: rtrb::Producer<(NodeAddr, Node)>,
     transport_shared: TransportShared,
 ) -> Result<(Stream, StreamAudioConfig), Box<dyn Error>> {
     let cpal_host = cpal::default_host();
@@ -408,6 +506,18 @@ pub fn reconfigure_vst3_track(
     shared: SharedPlugin,
     stream_config: &StreamAudioConfig,
 ) -> Result<Box<TrackProcessor>, Box<dyn Error>> {
+    Ok(Box::new(TrackProcessor::from_node(reconfigure_vst3_node(
+        shared,
+        stream_config,
+    )?)))
+}
+
+/// 借りている VST3 のノードを、別のサンプルレートで動かし直す
+/// ([`reconfigure_vst3_track`] のノード版)
+pub fn reconfigure_vst3_node(
+    shared: SharedPlugin,
+    stream_config: &StreamAudioConfig,
+) -> Result<Node, Box<dyn Error>> {
     let bus = bus_config(stream_config);
     let plugin_channels = {
         let mut plugin = shared.lock();
@@ -418,8 +528,11 @@ pub fn reconfigure_vst3_track(
         plugin.output_channel_count()
     };
 
-    Ok(Box::new(TrackProcessor::new(Backend::Vst3(
-        Vst3Processor::new(shared, plugin_channels, bus.output_channel_count, &bus),
+    Ok(Node::new(Backend::Vst3(Vst3Processor::new(
+        shared,
+        plugin_channels,
+        bus.output_channel_count,
+        &bus,
     ))))
 }
 
@@ -479,7 +592,7 @@ struct StreamAudioProcessor {
     graph: Graph,
     /// 外した音源を (オーディオトラック番号, 音源) でメインスレッドへ返す口。
     /// どのインスタンスへ返すか分かるようトラック番号を添える。
-    retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
+    retired: rtrb::Producer<(NodeAddr, Node)>,
     gui_events: Consumer<GuiMsg>,
     /// デバイスのチャンネル数。**グラフの中とは別**
     /// (グラフは常に [`graph::BUS_CHANNELS`])
@@ -491,7 +604,7 @@ struct StreamAudioProcessor {
 impl StreamAudioProcessor {
     fn new(
         gui_events: Consumer<GuiMsg>,
-        retired: rtrb::Producer<(usize, Box<TrackProcessor>)>,
+        retired: rtrb::Producer<(NodeAddr, Node)>,
         transport_shared: TransportShared,
         output_channel_count: usize,
         max_frames: usize,
@@ -510,11 +623,13 @@ impl StreamAudioProcessor {
         }
     }
 
-    /// 外した音源をメインスレッドへ返す。返せなければやむなくここで解放する
+    /// 外したノードをメインスレッドへ返す。返せなければやむなくここで解放する
     /// (リングバッファが詰まるのは異常時だけ)。
-    fn retire(&mut self, track: usize, processor: Option<Box<TrackProcessor>>) {
-        if let Some(processor) = processor {
-            let _ = self.retired.push((track, processor));
+    ///
+    /// **値のまま載せる。** ここで `Box` に包むとオーディオスレッドで確保が起きる。
+    fn retire(&mut self, addr: NodeAddr, node: Option<Node>) {
+        if let Some(node) = node {
+            let _ = self.retired.push((addr, node));
         }
     }
 
@@ -569,29 +684,23 @@ impl StreamAudioProcessor {
                         }
                     }
                 }
-                GuiMsg::SetTrack {
-                    track,
-                    midi_track,
-                    processor,
-                } => {
-                    if self.graph.track(track).is_none() {
-                        // 範囲外。処理器はここで落とさずメインスレッドへ返す
-                        self.retire(track, Some(processor));
-                        continue;
-                    }
-                    // 繋ぎ方には触らない (`SetRouting` が別に決める)
-                    let previous = self.graph.place(track, midi_track, processor);
-                    self.retire(track, previous);
+                GuiMsg::SetNode { addr, node } => {
+                    let pushed_out = self.graph.set_node(addr.track, addr.at, *node);
+                    self.retire(addr, pushed_out);
                 }
-                // 繋ぎ方を丸ごと差し替える。組み立て済みなので検査は要らない
-                GuiMsg::SetRouting(routing) => self.graph.set_routing(routing),
-                GuiMsg::ClearTrack { track } => {
-                    let previous = self
-                        .graph
-                        .track_mut(track)
-                        .and_then(|slot| slot.processor.take());
-                    self.retire(track, previous);
+                GuiMsg::RemoveNode { addr } => {
+                    let removed = self.graph.remove_node(addr.track, addr.at);
+                    self.retire(addr, removed);
                 }
+                GuiMsg::MoveNode { track, from, to } => self.graph.move_node(track, from, to),
+                GuiMsg::SetBypassed { addr, bypassed } => {
+                    self.graph.set_bypassed(addr.track, addr.at, bypassed)
+                }
+                GuiMsg::SetMidiTrack { track, midi_track } => {
+                    self.graph.set_midi_track(track, midi_track)
+                }
+                // 丸ごと差し替える。組み立て済みなので検査は要らない
+                GuiMsg::SetMixer(mixer) => self.graph.set_mixer(mixer),
             }
         }
 

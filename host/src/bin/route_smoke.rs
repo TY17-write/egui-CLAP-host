@@ -20,10 +20,10 @@
 //! ```
 
 use clack_host::prelude::*;
+use clap_host_test::audio;
 use clap_host_test::audio::config::StreamAudioConfig;
 use clap_host_test::audio::events::BlockEvent;
-use clap_host_test::audio::graph::{self, Graph, Routing};
-use clap_host_test::audio::{self, TrackProcessor};
+use clap_host_test::audio::graph::{self, Graph, Mixer, Routing};
 use clap_host_test::discovery;
 use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use std::error::Error;
@@ -184,7 +184,14 @@ fn run(
     }
 
     let mut graph = Graph::new();
-    graph.set_routing(routing);
+    // 音量・パンは既定 (等倍・中央・全部鳴る)。見たいのは繋ぎ方だけ
+    graph.set_mixer(Mixer::build(
+        routing,
+        &[1.0; graph::AUDIO_TRACKS],
+        &[0.0; graph::AUDIO_TRACKS],
+        0,
+        0,
+    ));
     graph.reserve(BLOCK_SIZE);
 
     // トラック1 だけ音源。他はエフェクト (マスターには何も載せない)
@@ -198,7 +205,7 @@ fn run(
         let node = audio::activate_node(&mut instance, stream_config)?;
         // 音源だけが MIDI を受け取る
         let midi_track = (index == 1).then_some(0);
-        graph.place(index, midi_track, Box::new(TrackProcessor::from_node(node)));
+        graph.place_chain(index, midi_track, vec![node]);
         instances.push((index, instance));
     }
 
@@ -233,15 +240,15 @@ fn run(
     }
 
     // 借りた処理器をインスタンスへ返す (返さないと解放できない)
-    let mut retired: Vec<_> = graph.take_processors();
+    let mut retired = graph.take_nodes();
     for (index, mut instance) in instances {
         let at = retired
             .iter()
-            .position(|(track, _)| *track == index)
+            .position(|(addr, _)| addr.track == index)
             .ok_or("処理器が戻ってこなかった")?;
-        let (_, processor) = retired.remove(at);
-        let Some(audio::RetiredProcessor::Clap(stopped)) = processor.into_single_retired() else {
-            return Err("CLAP 1段を載せたのに別のものが返ってきた".into());
+        let (_, node) = retired.remove(at);
+        let audio::RetiredProcessor::Clap(stopped) = node.into_retired() else {
+            return Err("CLAP を載せたのに別形式が返ってきた".into());
         };
         instance.deactivate(stopped);
     }

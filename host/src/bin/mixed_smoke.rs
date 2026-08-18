@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         clap_target.name, clap_target.id
     );
     let mut clap_instance = instantiate_clap(&entry, &clap_target.id)?;
-    let clap_processor = audio::activate_track(&mut clap_instance, &stream_config)?;
+    let clap_node = audio::activate_node(&mut clap_instance, &stream_config)?;
 
     // ---- トラック1: VST3 ----
     let vst3_path = Path::new(&vst3_path);
@@ -89,13 +89,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         "トラック2 (VST3): {} ({})",
         vst3_target.name, vst3_target.id
     );
-    let (vst3_shared, vst3_processor) =
-        audio::activate_vst3_track(vst3_path, &vst3_target.id, &stream_config)?;
+    let (vst3_shared, vst3_node) =
+        audio::activate_vst3_node(vst3_path, &vst3_target.id, &stream_config)?;
 
     // オーディオトラックは 0 がマスターなので、打ち込み 0/1 は 1/2 に載る
     let mut graph = Graph::new();
-    graph.place(1, Some(0), clap_processor);
-    graph.place(2, Some(1), vst3_processor);
+    graph.place_chain(1, Some(0), vec![clap_node]);
+    graph.place_chain(2, Some(1), vec![vst3_node]);
 
     // ---- シーケンス ----
     // 0〜1拍: CLAP だけ / 1〜2拍: 両方 / 2〜3拍: VST3 だけ / 3〜4拍: 休み
@@ -148,14 +148,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- 後始末: 形式ごとに返し方が違う ----
     let mut clap_stopped = None;
-    for (track, processor) in graph.take_processors() {
-        let Some(retired) = processor.into_single_retired() else {
-            return Err("1段だけ載せたのに別のものが返ってきた".into());
-        };
-        match retired {
+    for (addr, node) in graph.take_nodes() {
+        match node.into_retired() {
             audio::RetiredProcessor::Clap(stopped) => clap_stopped = Some(stopped),
             audio::RetiredProcessor::Vst3(shared) => {
-                if track != 2 {
+                if addr.track != 2 {
                     return Err("VST3 の処理器がオーディオトラック2 以外から返ってきた".into());
                 }
                 shared.lock().stop_processing()?;

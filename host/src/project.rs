@@ -48,21 +48,44 @@ pub struct PluginSnapshot {
     pub id: String,
     /// 音源が書き出した状態。中身は不透明なバイト列。
     pub state: Vec<u8>,
+    /// 処理を飛ばして音を素通しするか
+    pub bypassed: bool,
 }
 
 /// 保存するオーディオトラック1本ぶん。
 ///
 /// 打ち込み側の「トラック」とは別物 (`audio::graph` を参照)。
 /// 番号は並び順そのもので、**常に [`AUDIO_TRACKS`] 本**ある。
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AudioTrackSnapshot {
     pub name: String,
     /// 上から順に通す音源とエフェクト
     pub nodes: Vec<PluginSnapshot>,
-    /// MIDI をどの打ち込みトラックから取るか。`None` は入力なし (バス用)
+    /// MIDI をどの打ち込みトラックから取るか。`None` は未割り当て
     pub midi_track: Option<usize>,
     /// 送り先のオーディオトラック番号。**マスター (0) では常に空**
     pub sends: Vec<usize>,
+    /// チェーンの後に掛かる音量 (線形)。すべての送りに効く
+    pub gain: f32,
+    /// パン `-1.0` (左) 〜 `1.0` (右)
+    pub pan: f32,
+    pub muted: bool,
+    pub soloed: bool,
+}
+
+impl Default for AudioTrackSnapshot {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            nodes: Vec::new(),
+            midi_track: None,
+            sends: Vec::new(),
+            gain: 1.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+        }
+    }
 }
 
 /// オーディオトラックの本数 (`audio::graph::AUDIO_TRACKS` と同じ)。
@@ -143,17 +166,30 @@ struct Project {
     audio_tracks: Vec<AudioTrackEntry>,
 }
 
+fn default_gain() -> f32 {
+    1.0
+}
+
 #[derive(Serialize, Deserialize)]
 struct AudioTrackEntry {
     #[serde(default)]
     name: String,
-    /// `None` は入力なし (バス用)
+    /// `None` は未割り当て
     #[serde(default)]
     midi_track: Option<usize>,
     /// 送り先。**片側だけ書く。** 両側に書くと「A は→B と言い、B は何も
     /// 言っていない」という矛盾したファイルが作れてしまう
     #[serde(default)]
     sends: Vec<SendEntry>,
+    /// 線形の音量。**バージョン3 の初版には無い**ので既定は等倍
+    #[serde(default = "default_gain")]
+    gain: f32,
+    #[serde(default)]
+    pan: f32,
+    #[serde(default)]
+    muted: bool,
+    #[serde(default)]
+    soloed: bool,
     /// 上から順に通す音源とエフェクト
     #[serde(default)]
     nodes: Vec<PluginEntry>,
@@ -181,6 +217,9 @@ struct PluginEntry {
     /// RON では数値の配列になってしまう。
     #[serde(default)]
     state: String,
+    /// 処理を飛ばして音を素通しするか
+    #[serde(default)]
+    bypassed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -235,6 +274,7 @@ pub fn to_string(
         path: plugin.path.to_string_lossy().into_owned(),
         id: plugin.id.clone(),
         state: base64.encode(&plugin.state),
+        bypassed: plugin.bypassed,
     };
 
     let project = Project {
@@ -250,6 +290,10 @@ pub fn to_string(
                     } else {
                         track.sends.iter().map(|to| SendEntry { to: *to }).collect()
                     },
+                    gain: track.gain,
+                    pan: track.pan,
+                    muted: track.muted,
+                    soloed: track.soloed,
                     nodes: track.nodes.iter().map(node_entry).collect(),
                 }
             })
@@ -344,6 +388,7 @@ fn build_node(entry: PluginEntry) -> Option<PluginSnapshot> {
         path: PathBuf::from(entry.path),
         id: entry.id,
         state: base64.decode(&entry.state).unwrap_or_default(),
+        bypassed: entry.bypassed,
     })
 }
 
@@ -375,10 +420,10 @@ fn migrate_plugins(entries: Vec<Option<PluginEntry>>) -> (Vec<AudioTrackSnapshot
             continue;
         }
         tracks[audio_track] = AudioTrackSnapshot {
-            name: String::new(),
             nodes: vec![node],
             midi_track: Some(midi_track),
             sends: vec![MASTER],
+            ..Default::default()
         };
     }
 
@@ -510,6 +555,19 @@ fn build(project: Project) -> Loaded {
                 } else {
                     entry.sends.into_iter().map(|send| send.to).collect()
                 },
+                // **NaN や負の値を通すと以降の計算すべてに波及する**
+                gain: if entry.gain.is_finite() {
+                    entry.gain.max(0.0)
+                } else {
+                    1.0
+                },
+                pan: if entry.pan.is_finite() {
+                    entry.pan.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                },
+                muted: entry.muted,
+                soloed: entry.soloed,
             };
         }
         (tracks, Vec::new())
@@ -735,16 +793,17 @@ mod tests {
             path: PathBuf::from(path),
             id: id.into(),
             state: state.to_vec(),
+            bypassed: false,
         }
     }
 
     /// 打ち込みトラック `midi` の音源を、オーディオトラック `midi + 1` に載せる
     fn audio_track(midi: usize, path: &str, id: &str, state: &[u8]) -> AudioTrackSnapshot {
         AudioTrackSnapshot {
-            name: String::new(),
             nodes: vec![snapshot(path, id, state)],
             midi_track: Some(midi),
             sends: vec![MASTER],
+            ..Default::default()
         }
     }
 

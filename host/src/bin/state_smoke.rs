@@ -63,16 +63,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         path: path.clone(),
         id: id.clone(),
         state: saved.clone(),
+        bypassed: false,
     };
     // オーディオトラック1 (0 はマスター) の1段目に載せる
     let mut tracks: Vec<project::AudioTrackSnapshot> = (0..project::AUDIO_TRACKS)
         .map(|_| project::AudioTrackSnapshot::default())
         .collect();
     tracks[1] = project::AudioTrackSnapshot {
-        name: String::new(),
         nodes: vec![snapshot],
         midi_track: Some(0),
         sends: vec![project::MASTER],
+        ..Default::default()
     };
 
     let text = project::to_string(&MidiEditor::default(), &tracks)?;

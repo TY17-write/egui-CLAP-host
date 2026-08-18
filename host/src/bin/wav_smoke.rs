@@ -9,7 +9,7 @@
 //! 使い方: cargo run -p clap-host-test --bin wav_smoke -- <path\to\plugin.clap> [out.wav]
 
 use clack_host::prelude::*;
-use clap_host_test::audio::activate_track;
+use clap_host_test::audio::activate_node;
 use clap_host_test::audio::config::StreamAudioConfig;
 use clap_host_test::audio::graph::{self, Graph};
 use clap_host_test::audio::offline::{self, RenderSetup};
@@ -58,9 +58,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut graph = Graph::new();
     for midi_track in 0..2 {
         let mut instance = instantiate(&entry, &target.id)?;
-        let processor = activate_track(&mut instance, &stream_config)?;
+        let node = activate_node(&mut instance, &stream_config)?;
         let audio_track = graph::audio_track_for(midi_track).expect("2本なら収まる");
-        graph.place(audio_track, Some(midi_track), processor);
+        graph.place_chain(audio_track, Some(midi_track), vec![node]);
         instances.push(instance);
     }
 
@@ -105,11 +105,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rendered = offline::render(&mut graph, setup);
 
     // 使い終わった処理器はメインスレッドで停止・解放する
-    for ((_, processor), mut instance) in graph.take_processors().into_iter().zip(instances) {
-        let Some(clap_host_test::audio::RetiredProcessor::Clap(stopped)) =
-            processor.into_single_retired()
-        else {
-            return Err("CLAP 1段を載せたのに別のものが返ってきた".into());
+    for ((_, node), mut instance) in graph.take_nodes().into_iter().zip(instances) {
+        let clap_host_test::audio::RetiredProcessor::Clap(stopped) = node.into_retired() else {
+            return Err("CLAP を載せたのに別形式が返ってきた".into());
         };
         instance.deactivate(stopped);
     }

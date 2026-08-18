@@ -122,7 +122,7 @@ struct Engine {
     producer: rtrb::Producer<GuiMsg>,
     /// オーディオスレッドから返ってきた音源 (メインスレッドで deactivate する)。
     /// どのインスタンスへ返すか分かるようトラック番号が付く。
-    retired: rtrb::Consumer<(usize, Box<audio::TrackProcessor>)>,
+    retired: rtrb::Consumer<(audio::NodeAddr, audio::Node)>,
     /// 再生位置・再生中フラグの共有
     transport_shared: TransportShared,
     /// 全プラグイン共通のストリーム構成
@@ -381,9 +381,19 @@ struct App {
     notice: Option<Notice>,
     /// オーディオトラックの送り先 (番号順、[`graph::AUDIO_TRACKS`] 本)。
     ///
-    /// **画面から繋ぎ替える手段はまだ無い** (フェーズ4)。今は既定の
+    /// **画面から繋ぎ替える手段はまだ無い。** 今は既定の
     /// 「全部マスターへ直結」か、`.ron` に書かれていたものが入る。
     routing_sends: Vec<Vec<usize>>,
+    /// オーディオトラックごとの音量 (線形) とパン。
+    ///
+    /// **空のときは既定 (等倍・中央)。** `App` は `Default` で作られるので、
+    /// 固定長配列にすると音量が 0 で埋まってしまう (全部無音になる)。
+    /// `routing_sends` と同じく「空 = 既定」で扱う。
+    track_gain: Vec<f32>,
+    track_pan: Vec<f32>,
+    /// ミュート/ソロ。ビット位置がオーディオトラック番号
+    track_muted: u16,
+    track_soloed: u16,
 }
 
 /// 既定の繋ぎ方: マスター以外はマスターへ1本
@@ -712,30 +722,54 @@ impl App {
         })
     }
 
-    /// 繋ぎ方をオーディオスレッドへ送る。
+    /// 繋ぎ方・音量・ミュート/ソロをまとめたもの。
+    ///
+    /// **これらを触る画面はまだ無い**ので、今は保存されている値
+    /// (既定は等倍・中央・全部鳴る) をそのまま組み立てている。
+    fn mixer(&self) -> graph::Mixer {
+        let mut gain = [1.0f32; graph::AUDIO_TRACKS];
+        let mut pan = [0.0f32; graph::AUDIO_TRACKS];
+        for (index, value) in self.track_gain.iter().take(graph::AUDIO_TRACKS).enumerate() {
+            gain[index] = *value;
+        }
+        for (index, value) in self.track_pan.iter().take(graph::AUDIO_TRACKS).enumerate() {
+            pan[index] = *value;
+        }
+        graph::Mixer::build(
+            self.routing(),
+            &gain,
+            &pan,
+            self.track_muted,
+            self.track_soloed,
+        )
+    }
+
+    /// 繋ぎ方と音量をオーディオスレッドへ送る。
     ///
     /// **音源を載せ替えても繋ぎ方は変わらない**ので、送るのは繋ぎ方が
     /// 変わったときとエンジンを起こしたときだけでよい。
     fn push_routing(&mut self) {
-        let routing = self.routing();
+        let mixer = self.mixer();
         if let Some(engine) = self.engine.as_mut() {
-            let _ = engine.producer.push(GuiMsg::SetRouting(routing));
+            let _ = engine.producer.push(GuiMsg::SetMixer(mixer));
         }
     }
 
-    /// 借りた処理器をオーディオスレッドへ返す。
+    /// 借りたノードをオーディオスレッドへ返す。
     ///
     /// **返さないと音が出なくなる。** 途中で諦めるときも必ず通ること。
-    /// `processors` の番号は**オーディオトラック**のもの。
-    fn return_processors(&mut self, processors: Vec<(usize, Box<audio::TrackProcessor>)>) {
+    fn return_processors(&mut self, nodes: Vec<(audio::NodeAddr, audio::Node)>) {
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
-        for (track, processor) in processors {
-            let _ = engine.producer.push(GuiMsg::SetTrack {
-                track,
-                midi_track: graph::midi_track_for(track),
-                processor,
+        for (addr, node) in nodes {
+            let _ = engine.producer.push(GuiMsg::SetMidiTrack {
+                track: addr.track,
+                midi_track: graph::midi_track_for(addr.track),
+            });
+            let _ = engine.producer.push(GuiMsg::SetNode {
+                addr,
+                node: Box::new(node),
             });
         }
     }
@@ -800,8 +834,14 @@ impl App {
                 return Err("音源が未ロードです。".into());
             };
             let _ = engine.producer.push(GuiMsg::Transport(TransportMsg::Stop));
+            // 画面から作れるトラックはまだ1段だけなので、先頭の段だけ借りる
             for track in &loaded {
-                let _ = engine.producer.push(GuiMsg::ClearTrack { track: *track });
+                let _ = engine.producer.push(GuiMsg::RemoveNode {
+                    addr: audio::NodeAddr {
+                        track: *track,
+                        at: 0,
+                    },
+                });
             }
             collect_processors(engine, loaded.len())
         };
@@ -821,14 +861,14 @@ impl App {
         // 借りた処理器をグラフへ載せて回す。**再生と同じ経路を通すため**
         let setup = self.render_setup(&export_config);
         let mut graph = audio::graph::Graph::new();
-        // **繋ぎ方も再生と同じにする。** ここを既定のままにすると、
+        // **繋ぎ方も音量も再生と同じにする。** ここを既定のままにすると、
         // 繋ぎ替えたときに鳴っている音と書き出した音が食い違う
-        graph.set_routing(self.routing());
-        for (track, processor) in processors {
-            graph.place(track, graph::midi_track_for(track), processor);
+        graph.set_mixer(self.mixer());
+        for (addr, node) in processors {
+            graph.place_chain(addr.track, graph::midi_track_for(addr.track), vec![node]);
         }
         let rendered = audio::offline::render(&mut graph, setup);
-        let mut processors = graph.take_processors();
+        let mut processors = graph.take_nodes();
 
         // ---- 元のレートへ戻す ----
         // **ここを飛ばすと、書き出し後に再生できなくなる。**
@@ -1188,16 +1228,16 @@ impl App {
     /// (黙って鳴らないままにしない)。
     fn switch_processors_rate(
         &mut self,
-        processors: Vec<(usize, Box<audio::TrackProcessor>)>,
+        nodes: Vec<(audio::NodeAddr, audio::Node)>,
         config: &StreamAudioConfig,
-    ) -> (Vec<(usize, Box<audio::TrackProcessor>)>, Vec<usize>) {
-        let mut switched = Vec::with_capacity(processors.len());
+    ) -> (Vec<(audio::NodeAddr, audio::Node)>, Vec<usize>) {
+        let mut switched = Vec::with_capacity(nodes.len());
         let mut failed = Vec::new();
 
-        for (track, processor) in processors {
-            let midi_track = graph::midi_track_for(track).unwrap_or(0);
-            match self.switch_one_rate(track, processor, config) {
-                Ok(processor) => switched.push((track, processor)),
+        for (addr, node) in nodes {
+            let midi_track = graph::midi_track_for(addr.track).unwrap_or(0);
+            match self.switch_one_rate(addr.track, node, config) {
+                Ok(node) => switched.push((addr, node)),
                 Err(e) => {
                     eprintln!("トラック {} のレート切り替えに失敗: {e}", midi_track + 1);
                     failed.push(midi_track);
@@ -1215,9 +1255,9 @@ impl App {
     fn switch_one_rate(
         &mut self,
         track: usize,
-        processor: Box<audio::TrackProcessor>,
+        node: audio::Node,
         config: &StreamAudioConfig,
-    ) -> Result<Box<audio::TrackProcessor>, Box<dyn Error>> {
+    ) -> Result<audio::Node, Box<dyn Error>> {
         // `track` はオーディオトラック番号。`self.tracks` は打ち込み番号で並ぶ
         let midi_track = graph::midi_track_for(track).ok_or("マスターには音源がありません")?;
         let Some(audio) = self
@@ -1228,18 +1268,13 @@ impl App {
             return Err("このトラックに音源がありません".into());
         };
 
-        // 画面から作れるトラックはまだ1段だけ。段数が増えたらここも組み直す
-        let Some(retired) = processor.into_single_retired() else {
-            return Err("1段だけのトラックのはずが、そうなっていません".into());
-        };
-
-        match (retired, &mut audio.plugin) {
+        match (node.into_retired(), &mut audio.plugin) {
             (audio::RetiredProcessor::Clap(stopped), TrackPlugin::Clap(clap)) => {
                 clap.instance.deactivate(stopped);
-                audio::activate_track(&mut clap.instance, config)
+                audio::activate_node(&mut clap.instance, config)
             }
             (audio::RetiredProcessor::Vst3(shared), TrackPlugin::Vst3(_)) => {
-                audio::reconfigure_vst3_track(shared, config)
+                audio::reconfigure_vst3_node(shared, config)
             }
             // 形式が食い違うことは無いはずだが、ここで取り違えると
             // 処理器を失ったまま気付けないので明示的に落とす
@@ -1255,10 +1290,10 @@ impl App {
         let Some(engine) = &mut self.engine else {
             return;
         };
-        while let Ok((audio_track, processor)) = engine.retired.pop() {
+        while let Ok((addr, node)) = engine.retired.pop() {
             // **返ってくるのはオーディオトラック番号。** `self.tracks` と
             // `self.retiring` は打ち込みトラック番号で並ぶので直す
-            let track = graph::midi_track_for(audio_track).unwrap_or(0);
+            let track = graph::midi_track_for(addr.track).unwrap_or(0);
 
             // 差し替えで外したインスタンスが待っていればそちらへ返す。
             // 待っていない場合 (書き出しの借り出しが時間切れになったときなど) は
@@ -1270,20 +1305,14 @@ impl App {
                 None => self.tracks.get_mut(track).and_then(|slot| slot.take()),
             };
 
-            // CLAP は処理器をインスタンスへ返して初めて解放できる。
-            // **`owner` が抱えるインスタンスは1つ**なので、返せるのも1段ぶん。
-            // `take` で1回に限る (画面から作れるトラックはまだ1段だけ。
-            // 段数が増えたら `owner` 側も段ごとに持つ必要がある)。
-            let mut clap_owner = owner.as_mut().and_then(|track| match &mut track.plugin {
-                TrackPlugin::Clap(clap) => Some(clap),
-                TrackPlugin::Vst3(_) => None,
-            });
-
-            // 形式ごとに始末の仕方が違う。**チェーンの全段が返ってくる**
-            for retired in processor.into_retired() {
-                match retired {
+            // 形式ごとに始末の仕方が違う。**返ってくるのは1段ぶん**
+            {
+                match node.into_retired() {
                     audio::RetiredProcessor::Clap(stopped) => {
-                        if let Some(clap) = clap_owner.take() {
+                        // CLAP は処理器をインスタンスへ返して初めて解放できる
+                        if let Some(TrackPlugin::Clap(clap)) =
+                            owner.as_mut().map(|track| &mut track.plugin)
+                        {
                             clap.instance.deactivate(stopped);
                         }
                     }
@@ -1378,7 +1407,7 @@ impl App {
             return Err("オーディオを開始できません".into());
         };
 
-        let (mut audio_track, processor) = match kind {
+        let (mut audio_track, node) = match kind {
             project::PluginKind::Clap => instantiate_clap(path, id, &name, &engine.config),
             project::PluginKind::Vst3 => instantiate_vst3(path, id, &name, &engine.config),
         }
@@ -1391,10 +1420,17 @@ impl App {
             None => true,
         };
 
-        let _ = engine.producer.push(GuiMsg::SetTrack {
+        let _ = engine.producer.push(GuiMsg::SetMidiTrack {
             track: audio_index,
             midi_track: Some(track),
-            processor,
+        });
+        // 画面から作れるのはまだ1段だけなので、先頭の段に載せる
+        let _ = engine.producer.push(GuiMsg::SetNode {
+            addr: audio::NodeAddr {
+                track: audio_index,
+                at: 0,
+            },
+            node: Box::new(node),
         });
 
         // 未ロード中に動かした再生ヘッドの位置を引き継ぐ
@@ -1441,19 +1477,20 @@ impl App {
                 continue;
             };
             tracks[index] = project::AudioTrackSnapshot {
-                name: String::new(),
                 nodes: vec![PluginSnapshot {
                     kind: audio.kind(),
                     path: audio.path.clone(),
                     id: audio.id.clone(),
                     state: audio.capture_state(),
+                    bypassed: false,
                 }],
                 midi_track: Some(midi_track),
                 sends: Vec::new(), // 下でまとめて入れる
+                ..Default::default()
             };
         }
 
-        // **繋ぎ方は音源の有無と無関係。** 空のトラックの送りも残す
+        // **繋ぎ方と音量は音源の有無と無関係。** 空のトラックのぶんも残す
         // (繋ぎ替えてから音源を外しても、繋ぎ方は保たれる)
         for (index, track) in tracks.iter_mut().enumerate() {
             track.sends = self.routing_sends.get(index).cloned().unwrap_or_else(|| {
@@ -1463,6 +1500,10 @@ impl App {
                     vec![project::MASTER]
                 }
             });
+            track.gain = self.track_gain.get(index).copied().unwrap_or(1.0);
+            track.pan = self.track_pan.get(index).copied().unwrap_or(0.0);
+            track.muted = self.track_muted & (1 << index) != 0;
+            track.soloed = self.track_soloed & (1 << index) != 0;
         }
         tracks
     }
@@ -1475,7 +1516,13 @@ impl App {
         for track in 0..self.tracks.len() {
             if let Some(previous) = self.tracks[track].take() {
                 if let Some(index) = graph::audio_track_for(track) {
-                    let _ = engine.producer.push(GuiMsg::ClearTrack { track: index });
+                    // 画面から作れるのはまだ1段だけ
+                    let _ = engine.producer.push(GuiMsg::RemoveNode {
+                        addr: audio::NodeAddr {
+                            track: index,
+                            at: 0,
+                        },
+                    });
                 }
                 // 処理器が返ってくるまで生かしておく (解放はメインスレッド)
                 self.retiring.push_back((track, previous));
@@ -1534,10 +1581,7 @@ impl App {
 ///
 /// オーディオコールバックが回っている前提なので、普通は1〜2ブロック分で揃う。
 /// 揃わないまま時間切れになったら、集まったぶんだけ返す (呼び出し側が戻す)。
-fn collect_processors(
-    engine: &mut Engine,
-    expected: usize,
-) -> Vec<(usize, Box<audio::TrackProcessor>)> {
+fn collect_processors(engine: &mut Engine, expected: usize) -> Vec<(audio::NodeAddr, audio::Node)> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut collected = Vec::with_capacity(expected);
 
@@ -1576,7 +1620,7 @@ fn instantiate_clap(
     plugin_id: &str,
     plugin_name: &str,
     stream_config: &StreamAudioConfig,
-) -> Result<(TrackAudio, Box<audio::TrackProcessor>), Box<dyn Error>> {
+) -> Result<(TrackAudio, audio::Node), Box<dyn Error>> {
     // clack は PluginInstance の中で DLL を生かすので、ここで開き直してよい
     let (entry, _) = discovery::load_clap_file(path)?;
 
@@ -1597,7 +1641,7 @@ fn instantiate_clap(
         &host_info,
     )?;
 
-    let processor = audio::activate_track(&mut instance, stream_config)?;
+    let node = audio::activate_node(&mut instance, stream_config)?;
     let params = params::read_params(&mut instance);
 
     // gui 拡張があれば GUI マネージャを用意する
@@ -1618,7 +1662,7 @@ fn instantiate_clap(
                 gui,
             }),
         },
-        processor,
+        node,
     ))
 }
 
@@ -1631,8 +1675,8 @@ fn instantiate_vst3(
     class_id: &str,
     plugin_name: &str,
     stream_config: &StreamAudioConfig,
-) -> Result<(TrackAudio, Box<audio::TrackProcessor>), Box<dyn Error>> {
-    let (plugin, processor) = audio::activate_vst3_track(path, class_id, stream_config)?;
+) -> Result<(TrackAudio, audio::Node), Box<dyn Error>> {
+    let (plugin, node) = audio::activate_vst3_node(path, class_id, stream_config)?;
 
     let gui = Vst3GuiManager::new(&plugin.lock());
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -1650,7 +1694,7 @@ fn instantiate_vst3(
                 gui,
             }),
         },
-        processor,
+        node,
     ))
 }
 

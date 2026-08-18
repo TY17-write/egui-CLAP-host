@@ -25,7 +25,7 @@
 
 use super::events::BlockEvents;
 use super::transport::{BlockPlan, Transport};
-use super::{ProcessError, TrackProcessor};
+use super::{Node, NodeAddr, ProcessError, TrackProcessor};
 use cpal::FromSample;
 
 /// オーディオトラックの本数。0番がマスター
@@ -55,13 +55,28 @@ pub fn midi_track_for(audio_track: usize) -> Option<usize> {
 /// グラフの中を流れるチャンネル数。**デバイスとは独立**
 pub const BUS_CHANNELS: usize = 2;
 
+/// 1本のオーディオトラックに刺せるノードの上限。
+///
+/// **オーディオスレッドで確保しないために要る。** チェーンの列をこの数だけ
+/// 先に取っておけば、ノードを足すときに伸びない。
+pub const MAX_NODES: usize = 16;
+
 /// オーディオトラック1本
-#[derive(Default)]
 pub struct AudioTrack {
-    /// 載っている音源とエフェクトの列。空なら何も鳴らない
-    pub processor: Option<Box<TrackProcessor>>,
-    /// MIDI をどの打ち込みトラックから取るか。`None` は入力なし (バス用)
+    /// 載っている音源とエフェクトの列。**空でも器はある** (ノードを足す先として)
+    pub processor: Box<TrackProcessor>,
+    /// MIDI をどの打ち込みトラックから取るか。`None` は未割り当て
     pub midi_track: Option<usize>,
+}
+
+impl AudioTrack {
+    /// 空のトラック。**チェーンの容量を先に取っておく**
+    fn new() -> Self {
+        Self {
+            processor: Box::new(TrackProcessor::empty(MAX_NODES)),
+            midi_track: None,
+        }
+    }
 }
 
 /// 繋ぎ方と処理順。**メインスレッドで組み立てて丸ごと差し替える。**
@@ -221,11 +236,135 @@ fn targets(bits: u16) -> impl Iterator<Item = usize> {
     (0..AUDIO_TRACKS).filter(move |index| bits & (1 << index) != 0)
 }
 
+/// 繋ぎ方に音量・パン・ミュート/ソロを足したもの。
+///
+/// [`Routing`] と同じく**メインスレッドで組み立てて丸ごと差し替える** `Copy` な値。
+/// ミュートとソロは**解決済みのビット列**として持つので、オーディオスレッドは
+/// ビットを見るだけでよい (ソロは経路を辿る必要があり、実行中にやる話ではない)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mixer {
+    pub routing: Routing,
+    /// チェーンの後に掛かる音量 (線形)。**すべての送りに効く**
+    gain: [f32; AUDIO_TRACKS],
+    /// パン `-1.0` (左) 〜 `1.0` (右)
+    pan: [f32; AUDIO_TRACKS],
+    /// 鳴らすトラック。ミュートとソロを解いた結果
+    audible: u16,
+}
+
+impl Default for Mixer {
+    fn default() -> Self {
+        Self {
+            routing: Routing::default(),
+            gain: [1.0; AUDIO_TRACKS],
+            pan: [0.0; AUDIO_TRACKS],
+            audible: u16::MAX,
+        }
+    }
+}
+
+impl Mixer {
+    /// 繋ぎ方と、トラックごとの音量・パン・ミュート・ソロから組み立てる。
+    ///
+    /// # ソロの意味
+    ///
+    /// **ソロにしたトラックがマスターへ至る経路を阻害しない。** そのトラックと、
+    /// そこから送りを辿って届くトラック (バスやマスター) を鳴らす。
+    /// こうしないと、リバーブ用のバスへ送っているトラックをソロにした瞬間に
+    /// リバーブが切れて、**ソロにしただけで音が変わる**。
+    ///
+    /// ミュートはソロより強い。ミュートしたトラックは経路上でも鳴らない
+    /// (バスをミュートすれば、そこを通る音は止まる)。
+    pub fn build(
+        routing: Routing,
+        gain: &[f32; AUDIO_TRACKS],
+        pan: &[f32; AUDIO_TRACKS],
+        muted: u16,
+        soloed: u16,
+    ) -> Self {
+        let audible = if soloed == 0 {
+            // ソロが1つも無ければ、ミュート以外は全部鳴る
+            !muted
+        } else {
+            // ソロにしたトラックから送りを前向きに辿って広げる
+            let mut reached = soloed;
+            loop {
+                let mut added = false;
+                for from in targets(reached) {
+                    for to in routing.sends_of(from) {
+                        if reached & (1 << to) == 0 {
+                            reached |= 1 << to;
+                            added = true;
+                        }
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+            reached & !muted
+        };
+
+        // NaN や負の値を通すと、以降のブロックすべてに波及する
+        let mut safe_gain = [1.0f32; AUDIO_TRACKS];
+        let mut safe_pan = [0.0f32; AUDIO_TRACKS];
+        for index in 0..AUDIO_TRACKS {
+            safe_gain[index] = if gain[index].is_finite() {
+                gain[index].max(0.0)
+            } else {
+                1.0
+            };
+            safe_pan[index] = if pan[index].is_finite() {
+                pan[index].clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+
+        Self {
+            routing,
+            gain: safe_gain,
+            pan: safe_pan,
+            audible,
+        }
+    }
+
+    /// そのトラックが鳴るか
+    pub fn is_audible(&self, index: usize) -> bool {
+        self.audible & (1 << index) != 0
+    }
+
+    /// チェーンの後に掛ける左右の係数。
+    ///
+    /// **パンは定パワーだが、中央を等倍に揃えてある。**
+    ///
+    /// 素の定パワー (`cos`/`sin`) は中央で `1/√2` になる。それをそのまま使うと
+    /// **パンを触っていないトラックまで -3dB 下がる**ので、`√2` を掛けて
+    /// 中央を `1.0` にする。振り切ると片側が `√2` (+3dB) まで上がるが、
+    /// 「既定が素通し」であることのほうが大事。
+    ///
+    /// 鳴らないトラック (ミュート・ソロで外れたもの) は 0 を返す。
+    pub fn channel_gains(&self, index: usize) -> (f32, f32) {
+        if !self.is_audible(index) {
+            return (0.0, 0.0);
+        }
+        let gain = self.gain.get(index).copied().unwrap_or(1.0);
+        let pan = self.pan.get(index).copied().unwrap_or(0.0);
+        // -1.0 → 0、0.0 → π/4、1.0 → π/2
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        let normalize = std::f32::consts::SQRT_2;
+        (
+            gain * angle.cos() * normalize,
+            gain * angle.sin() * normalize,
+        )
+    }
+}
+
 /// 送り元が送り先より先に来る順を求める。輪があれば `None`。
 ///
 /// 深さ優先で1周するだけ (16本しかないので、確保も再帰の深さも問題にならない)。
 fn topological_order(sends: &[u16; AUDIO_TRACKS]) -> Option<([u8; AUDIO_TRACKS], u8)> {
-    /// 0: 未訪問 / 1: 訪問中 / 2: 済
+    // 0: 未訪問 / 1: 訪問中 / 2: 済
     let mut mark = [0u8; AUDIO_TRACKS];
     let mut order = [0u8; AUDIO_TRACKS];
     let mut len = 0usize;
@@ -273,8 +412,8 @@ fn topological_order(sends: &[u16; AUDIO_TRACKS]) -> Option<([u8; AUDIO_TRACKS],
 /// 256KiB しかないので、使っていないトラックのぶんを惜しむ理由がない。
 pub struct Graph {
     tracks: Vec<AudioTrack>,
-    /// 繋ぎ方と処理順。**丸ごと差し替える**
-    routing: Routing,
+    /// 繋ぎ方・音量・ミュート/ソロ。**丸ごと差し替える**
+    mixer: Mixer,
     /// トラックごとの出力 (2ch インターリーブ)。`frames` ごとに区切って使う
     buffers: Vec<f32>,
     /// いま確保してあるフレーム数
@@ -290,21 +429,21 @@ impl Default for Graph {
 impl Graph {
     pub fn new() -> Self {
         Self {
-            tracks: (0..AUDIO_TRACKS).map(|_| AudioTrack::default()).collect(),
-            routing: Routing::default(),
+            tracks: (0..AUDIO_TRACKS).map(|_| AudioTrack::new()).collect(),
+            mixer: Mixer::default(),
             buffers: Vec::new(),
             capacity_frames: 0,
         }
     }
 
-    /// 繋ぎ方を差し替える。**組み立て済みのものしか受け取らない**ので、
+    /// 繋ぎ方と音量を差し替える。**組み立て済みのものしか受け取らない**ので、
     /// ここで検査することは何も無い。
-    pub fn set_routing(&mut self, routing: Routing) {
-        self.routing = routing;
+    pub fn set_mixer(&mut self, mixer: Mixer) {
+        self.mixer = mixer;
     }
 
-    pub fn routing(&self) -> &Routing {
-        &self.routing
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
     }
 
     pub fn track(&self, index: usize) -> Option<&AudioTrack> {
@@ -315,49 +454,82 @@ impl Graph {
         self.tracks.get_mut(index)
     }
 
-    /// オーディオトラックに処理器を載せる。既に載っていたものを返す。
+    /// どの打ち込みトラックから MIDI を取るかを決める
+    pub fn set_midi_track(&mut self, index: usize, midi_track: Option<usize>) {
+        if let Some(slot) = self.tracks.get_mut(index) {
+            slot.midi_track = midi_track;
+        }
+    }
+
+    /// チェーンの `at` 段目を差し替える。段数と同じ位置なら末尾へ足す。
+    /// 押し出されたノードを返す (**メインスレッドで始末する**)。
+    pub fn set_node(&mut self, index: usize, at: usize, node: Node) -> Option<Node> {
+        match self.tracks.get_mut(index) {
+            Some(slot) => slot.processor.set_node(at, node),
+            // 範囲外。落とさずに呼び出し側へ返す
+            None => Some(node),
+        }
+    }
+
+    /// チェーンの `at` 段目を外す
+    pub fn remove_node(&mut self, index: usize, at: usize) -> Option<Node> {
+        self.tracks.get_mut(index)?.processor.remove_node(at)
+    }
+
+    /// チェーンの `from` 段目を `to` 段目へ動かす (並べ替え)
+    pub fn move_node(&mut self, index: usize, from: usize, to: usize) {
+        if let Some(slot) = self.tracks.get_mut(index) {
+            slot.processor.move_node(from, to);
+        }
+    }
+
+    /// チェーンの `at` 段目を素通しにするか
+    pub fn set_bypassed(&mut self, index: usize, at: usize, bypassed: bool) {
+        if let Some(slot) = self.tracks.get_mut(index) {
+            slot.processor.set_bypassed(at, bypassed);
+        }
+    }
+
+    /// トラックへチェーンを丸ごと載せる。
     ///
-    /// **繋ぎ方には触らない。** 繋ぎ方は [`set_routing`](Self::set_routing) で
-    /// 丸ごと差し替えるもので、音源の載せ降ろしとは独立している。
-    pub fn place(
-        &mut self,
-        index: usize,
-        midi_track: Option<usize>,
-        processor: Box<TrackProcessor>,
-    ) -> Option<Box<TrackProcessor>> {
+    /// **メインスレッド専用** (確保が起きうる)。書き出しのために借りたものを
+    /// 組み直すときと、検証バイナリが使う。再生中の載せ替えは
+    /// [`set_node`](Self::set_node) のほう。
+    pub fn place_chain(&mut self, index: usize, midi_track: Option<usize>, nodes: Vec<Node>) {
         let Some(slot) = self.tracks.get_mut(index) else {
-            return Some(processor);
+            return;
         };
         slot.midi_track = midi_track;
-        slot.processor.replace(processor)
+        let _ = slot.processor.take_nodes();
+        for node in nodes {
+            slot.processor.push_node(node);
+        }
     }
 
-    /// 載っている処理器を全部取り出す (トラック番号の昇順)。
+    /// 載っているノードを全部取り出す (トラック番号・段の昇順)。
     ///
     /// **書き出しのために借りたものを戻すときに使う。**
-    pub fn take_processors(&mut self) -> Vec<(usize, Box<TrackProcessor>)> {
-        self.tracks
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, track)| track.processor.take().map(|p| (index, p)))
-            .collect()
+    pub fn take_nodes(&mut self) -> Vec<(NodeAddr, Node)> {
+        let mut taken = Vec::new();
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            for (at, node) in track.processor.take_nodes().into_iter().enumerate() {
+                taken.push((NodeAddr { track: index, at }, node));
+            }
+        }
+        taken
     }
 
-    /// 載っている処理器を (トラック番号, 処理器) で順に見る
+    /// 全トラックの処理器を (トラック番号, 処理器) で順に見る
     pub fn processors_mut(&mut self) -> impl Iterator<Item = (usize, &mut Box<TrackProcessor>)> {
         self.tracks
             .iter_mut()
             .enumerate()
-            .filter_map(|(index, track)| track.processor.as_mut().map(|p| (index, p)))
+            .map(|(index, track)| (index, &mut track.processor))
     }
 
     /// そのオーディオトラックのイベント置き場 (呼び出し側が積む)
     pub fn events_mut(&mut self, index: usize) -> Option<&mut BlockEvents> {
-        self.tracks
-            .get_mut(index)?
-            .processor
-            .as_mut()
-            .map(|p| p.events_mut())
+        Some(self.tracks.get_mut(index)?.processor.events_mut())
     }
 
     /// トランスポートの計画を各トラックへ配る。
@@ -389,9 +561,7 @@ impl Graph {
     /// 全トラックのイベントを空にする
     pub fn clear_events(&mut self) {
         for track in self.tracks.iter_mut() {
-            if let Some(processor) = track.processor.as_mut() {
-                processor.events_mut().clear();
-            }
+            track.processor.events_mut().clear();
         }
     }
 
@@ -430,12 +600,26 @@ impl Graph {
             self.buffer_mut(index, len).fill(0.0);
         }
 
-        let routing = self.routing;
-        for index in routing.order() {
+        let mixer = self.mixer;
+        for index in mixer.routing.order() {
             self.run_track(index, steady, len, on_error);
 
+            // チェーンの後に音量とパンを掛ける。**送りに入る前**なので、
+            // すべての送り先に同じように効く。
+            // 鳴らさないトラック (ミュート・ソロで外れたもの) はここで 0 になる。
+            //
+            // 等倍のときに飛ばす細工はしない。浮動小数の一致で分岐すると
+            // 「掛かるはずが飛ばされた」が起きうるわりに、省ける手間は
+            // 1フレーム2回の掛け算しかない
+            let (left, right) = mixer.channel_gains(index);
+            let buffer = self.buffer_mut(index, len);
+            for frame in buffer.chunks_exact_mut(BUS_CHANNELS) {
+                frame[0] *= left;
+                frame[1] *= right;
+            }
+
             // 送り先へ足す。**加算コピー**なので、複数から送られれば混ざる
-            for target in routing.sends_of(index) {
+            for target in mixer.routing.sends_of(index) {
                 self.add_into(index, target, len);
             }
         }
@@ -456,9 +640,10 @@ impl Graph {
         on_error: &mut dyn FnMut(usize, ProcessError),
     ) {
         let stride = self.capacity_frames * BUS_CHANNELS;
-        let Some(processor) = self.tracks[index].processor.as_mut() else {
-            return;
-        };
+        let processor = &mut self.tracks[index].processor;
+        if processor.node_count() == 0 {
+            return; // 何も刺さっていない。入ってきた音をそのまま流す
+        }
         let buffer = &mut self.buffers[index * stride..][..len];
         if let Err(e) = processor.process(steady, buffer) {
             on_error(index, e);
@@ -639,6 +824,103 @@ mod tests {
     fn reaching_master_follows_the_whole_path() {
         let routing = routing(&[(4, 2), (2, MASTER)]).unwrap();
         assert!(routing.reaches_master(4));
+    }
+
+    /// 既定 (等倍・中央・ミュートなし) で組む
+    fn mixer(edges: &[(usize, usize)], muted: u16, soloed: u16) -> Mixer {
+        Mixer::build(
+            routing(edges).unwrap(),
+            &[1.0; AUDIO_TRACKS],
+            &[0.0; AUDIO_TRACKS],
+            muted,
+            soloed,
+        )
+    }
+
+    /// **既定のパンは素通しであること。**
+    ///
+    /// 素の定パワーは中央で `1/√2` になる。それをそのまま使うと、パンを
+    /// 触っていないトラックまで -3dB 下がる (実際に mixed_smoke が半分になった)。
+    #[test]
+    fn centre_pan_is_unity() {
+        let mixer = mixer(&[(1, MASTER)], 0, 0);
+        let (left, right) = mixer.channel_gains(1);
+        assert!((left - 1.0).abs() < 1e-6, "左が等倍でない: {left}");
+        assert!((right - 1.0).abs() < 1e-6, "右が等倍でない: {right}");
+    }
+
+    /// 振り切ると片側が消え、定パワーが保たれること
+    #[test]
+    fn hard_pan_silences_one_side_and_keeps_power() {
+        let mut pan = [0.0f32; AUDIO_TRACKS];
+        pan[1] = -1.0;
+        let mixer = Mixer::build(
+            routing(&[(1, MASTER)]).unwrap(),
+            &[1.0; AUDIO_TRACKS],
+            &pan,
+            0,
+            0,
+        );
+        let (left, right) = mixer.channel_gains(1);
+        assert!(right.abs() < 1e-6, "右が消えること: {right}");
+        // 左右の二乗和は中央と同じ (1^2 + 1^2 = 2)
+        assert!((left * left + right * right - 2.0).abs() < 1e-5);
+    }
+
+    /// ミュートしたトラックは 0 になること
+    #[test]
+    fn muted_tracks_are_silenced() {
+        let mixer = mixer(&[(1, MASTER), (2, MASTER)], 1 << 1, 0);
+        assert_eq!(mixer.channel_gains(1), (0.0, 0.0));
+        assert!(mixer.is_audible(2));
+    }
+
+    /// **ソロは経路を辿って残すこと。**
+    ///
+    /// バスへ送っているトラックをソロにしたとき、バスも鳴らないと
+    /// ソロにしただけでリバーブが切れて音が変わってしまう。
+    #[test]
+    fn solo_keeps_the_path_to_master() {
+        // 1 → 3 (バス) → 0、2 → 0。1 をソロにする
+        let mixer = mixer(&[(1, 3), (3, MASTER), (2, MASTER)], 0, 1 << 1);
+
+        assert!(mixer.is_audible(1), "ソロにした本人");
+        assert!(mixer.is_audible(3), "経路上のバスは残る");
+        assert!(mixer.is_audible(MASTER), "マスターは残る");
+        assert!(!mixer.is_audible(2), "経路外は黙る");
+    }
+
+    /// ミュートはソロより強いこと (バスを止めれば通る音も止まる)
+    #[test]
+    fn mute_wins_over_solo() {
+        let mixer = mixer(&[(1, 3), (3, MASTER)], 1 << 3, 1 << 1);
+        assert!(mixer.is_audible(1));
+        assert!(!mixer.is_audible(3), "ミュートしたバスは経路上でも黙る");
+    }
+
+    /// ソロが1つも無ければ、ミュート以外は全部鳴ること
+    #[test]
+    fn without_solo_everything_but_muted_sounds() {
+        let mixer = mixer(&[(1, MASTER), (2, MASTER)], 0, 0);
+        assert!(mixer.is_audible(1));
+        assert!(mixer.is_audible(2));
+    }
+
+    /// NaN や負の音量を通さないこと (以降のブロックすべてに波及する)
+    #[test]
+    fn broken_gain_falls_back() {
+        let mut gain = [1.0f32; AUDIO_TRACKS];
+        gain[1] = f32::NAN;
+        gain[2] = -1.0;
+        let mixer = Mixer::build(
+            routing(&[(1, MASTER), (2, MASTER)]).unwrap(),
+            &gain,
+            &[0.0; AUDIO_TRACKS],
+            0,
+            0,
+        );
+        assert!(mixer.channel_gains(1).0.is_finite());
+        assert!(mixer.channel_gains(2).0 >= 0.0);
     }
 
     /// 送りは加算で混ざること (上書きしない)

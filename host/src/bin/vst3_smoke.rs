@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 実時間の再生が通っても、こちらが通るとは限らない。
     // オーディオトラックは 0 がマスターなので、打ち込み0 は 1 に載る
     let mut graph = Graph::new();
-    graph.place(1, Some(0), processor);
+    graph.place_chain(1, Some(0), processor.take_nodes());
     let setup = RenderSetup {
         sequences: vec![editor
             .to_events_for_track(0, SAMPLE_RATE)
@@ -175,10 +175,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         sample_rate: SAMPLE_RATE as u32,
     };
     let rendered = offline::render(&mut graph, setup);
-    let processor = graph
-        .take_processors()
+    let node = graph
+        .take_nodes()
         .pop()
-        .map(|(_, processor)| processor)
+        .map(|(_, node)| node)
         .ok_or("借りた処理器が戻ってこなかった")?;
 
     println!(
@@ -202,8 +202,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // ---- 後始末 (メインスレッドで止めてから解放する) ----
-    let Some(audio::RetiredProcessor::Vst3(retired)) = processor.into_single_retired() else {
-        return Err("VST3 1段を載せたのに別のものが返ってきた".into());
+    let audio::RetiredProcessor::Vst3(retired) = node.into_retired() else {
+        return Err("VST3 を載せたのに別形式が返ってきた".into());
     };
     retired.lock().stop_processing()?;
     drop(retired);
