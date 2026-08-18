@@ -25,30 +25,11 @@ use host::{MainThreadMessage, MiniHost, MiniHostMainThread, MiniHostShared};
 use params::ParamUi;
 use project::PluginSnapshot;
 use sequencer::SeqEvent;
-use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-
-/// 鍵盤に表示する1オクターブ+1音 (C4〜C5) ※鍵盤 UI 無効化中のため未使用
-#[allow(dead_code)]
-const KEYS: [(u16, &str, bool); 13] = [
-    (60, "C4", false),
-    (61, "C#", true),
-    (62, "D", false),
-    (63, "D#", true),
-    (64, "E", false),
-    (65, "F", false),
-    (66, "F#", true),
-    (67, "G", false),
-    (68, "G#", true),
-    (69, "A", false),
-    (70, "A#", true),
-    (71, "B", false),
-    (72, "C5", false),
-];
 
 fn main() -> eframe::Result {
     // 検証用 CLI: egui-clap-host.exe [plugin.clap] [--open-gui]
@@ -138,8 +119,6 @@ struct TrackAudio {
     /// CLAP のプラグイン ID / VST3 のクラス UID。
     /// 1つのファイルに複数入りうるので、パスだけでは足りない。
     id: String,
-    #[allow(dead_code)] // 鍵盤 UI 無効化中
-    pressed_keys: HashSet<u16>,
     /// 処理を飛ばして素通しするか
     bypassed: bool,
     /// 入力・出力のチャンネル数。**どこでステレオが潰れるかを画面に出す**ために持つ
@@ -2371,7 +2350,6 @@ fn instantiate_clap(
             name: plugin_name.to_string(),
             path: path.to_path_buf(),
             id: plugin_id.to_string(),
-            pressed_keys: HashSet::new(),
             bypassed: false,
             channels,
             plugin: TrackPlugin::Clap(ClapTrack {
@@ -2413,7 +2391,6 @@ fn instantiate_vst3(
             name: plugin_name.to_string(),
             path: path.to_path_buf(),
             id: class_id.to_string(),
-            pressed_keys: HashSet::new(),
             bypassed: false,
             channels,
             plugin: TrackPlugin::Vst3(Vst3Track {
@@ -2624,50 +2601,6 @@ impl eframe::App for App {
                             }
                         });
                 }
-                */
-
-                // 鍵盤 (一時的に無効化中)
-                /*
-                ui.add_space(12.0);
-                ui.separator();
-                ui.label("鍵盤 (クリックで発音):");
-                ui.horizontal(|ui| {
-                    for (key, label, is_black) in KEYS {
-                        let color = if is_black {
-                            egui::Color32::from_gray(40)
-                        } else {
-                            egui::Color32::from_gray(230)
-                        };
-                        let text_color = if is_black {
-                            egui::Color32::WHITE
-                        } else {
-                            egui::Color32::BLACK
-                        };
-                        let button = egui::Button::new(
-                            egui::RichText::new(label).color(text_color).size(11.0),
-                        )
-                        .fill(color)
-                        .min_size(egui::vec2(34.0, 90.0));
-
-                        let response = ui.add(button);
-                        let is_down = response.is_pointer_button_down_on();
-                        let was_down = loaded.pressed_keys.contains(&key);
-
-                        if is_down && !was_down {
-                            loaded.pressed_keys.insert(key);
-                            let _ = loaded.producer.push(GuiMsg::NoteOn {
-                                track: 0,
-                                key,
-                                velocity: 0.8,
-                            });
-                        } else if !is_down && was_down {
-                            loaded.pressed_keys.remove(&key);
-                            let _ = loaded
-                                .producer
-                                .push(GuiMsg::NoteOff { track: 0, key });
-                        }
-                    }
-                });
                 */
             }
 
