@@ -560,8 +560,9 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 | `audio/` | オーディオスレッド側。`graph` (ルーティングとミキサ) / `transport` / `buffers` / `clap` / `vst3` / `offline` (書き出し) |
 | その他 | `sequencer` (ノートとトラックの型) / `project` (.ron) / `midi` / `wav` / `opus` / `ccs` / `discovery` / `gui` / `host` / `theme` |
 
-分割の判断と、`cargo coupling` の点をどう読んだかは
-[refactor_plan.md](refactor_plan.md) に残してある。
+**この構成で確定している。** ファイルの行数を理由にこれ以上割らないこと
+(`sequencer` や `audio` の被参照数を減らす、`grid` をさらに分ける、といった
+静的解析ツールの助言も同様に採らない。判断済み)。
 
 ## プラグイン独自 GUI
 
