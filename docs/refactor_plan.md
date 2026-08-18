@@ -96,24 +96,32 @@ smoke の数値一致が一番効く。過去4件の実害 (上書き/足し込�
 
 ---
 
-## フェーズ1: `editor_ui.rs` → `editor_ui/`
+## フェーズ1: `editor_ui.rs` → `editor_ui/` — 済
 
 外から使われているのは **`EditorState` / `EditorCommand` / `editor_panel` の3つだけ**
 (`main.rs` から)。**公開面が極端に小さいので、割っても外への影響が無い。**
 
-| 新ファイル | 移すもの (現在の行) | 目安 |
-|---|---|---|
-| `mod.rs` | `EditorCommand` (984-1011)、`editor_panel` (1012-1205)、`pub use` | 250 |
-| `metrics.rs` | 画面寸法の定数 (16-65) のうち複数箇所で使うもの | 60 |
-| `color.rs` | `note_fill` ほか OKLCH 変換 (80-206) | 130 |
-| `state.rs` | `NoteDefaults`・`EditorState`・`MiddleDrag`・`impl EditorState` (207-366, 500-813) | 480 |
-| `history.rs` | `Snapshot`・`EditGroup`・`History` (814-938) | 125 |
-| `geometry.rs` | 座標・当たり判定の純関数 (939-983, 2681-2861, 3268-3379) | 340 |
-| `grid.rs` | `grid` (1965-2680) | 720 |
-| `gutter.rs` | 左のトラック欄と段の帯 (367-467, 2862-3267) | 500 |
-| `toolbar.rs` | `toolbar`・`groove_toolbar`・ラベル (1588-1964) | 375 |
-| `shortcuts.rs` | `Shortcuts`・`shortcuts`・再生の開始停止・クリップボード (468-499, 1344-1587) | 275 |
-| `help.rs` | 操作ガイド (1206-1343) | 140 |
+4545行の1ファイルを11ファイルに割った (テストを含む実測):
+
+| ファイル | 内容 | 行 | テスト |
+|---|---|---:|---:|
+| `metrics.rs` | 複数箇所で使う画面寸法とズームの上下限 | 34 | – |
+| `history.rs` | `Snapshot`・`EditGroup`・`History` | 135 | – |
+| `help.rs` | 操作ガイド | 143 | – |
+| `mod.rs` | `EditorCommand`・`editor_panel`・`pub use` | 243 | – |
+| `shortcuts.rs` | ショートカット・再生の開始停止・クリップボード | 268 | – |
+| `color.rs` | `note_fill` ほか Oklch 変換 | 331 | 7 |
+| `toolbar.rs` | 上部ツールバーと揺らぎの行 | 371 | – |
+| `gutter.rs` | 左のトラック欄・段の帯・CC 段の一覧 | 542 | – |
+| `grid.rs` | `grid` と `take_wheel_notches` | 771 | – |
+| `geometry.rs` | 座標変換・当たり判定・移動量の算出 | 835 | 19 |
+| `state.rs` | `EditorState`・`NoteDefaults`・選択と編集 | 1014 | 20 |
+
+テストは 46 件のまま、`cargo test --lib` は 229 件のまま。
+
+**アンドゥのテスト3件だけは `state.rs` に置いた。** `EditorState::history` は
+private のままにしたかったので、フィールドを持つ側に寄せている
+(`history.rs` を機構だけのファイルに保てる)。
 
 定数は**使う場所が1箇所ならそのファイルへ、複数なら `metrics.rs` へ**。確認済み:
 
@@ -132,14 +140,35 @@ egui の描画に触らない純関数の塊なので、**一番安全で、一�
 `shortcuts.rs` → `toolbar.rs` → `gutter.rs` → `grid.rs`。
 **依存の葉から順に出す**ので、途中で `mod.rs` が壊れない。
 
-### `grid` (716行) をさらに割るかは保留
+### 割ったら `cargo coupling` の点が下がった (指標の限界)
 
-`grid` 1つで 716 行あり、中は「背景 → 地色 → 区切り線 → ノート → 再生線 →
+分割後にもう一度測ると、**God Module は消えたが総合点は 0.89 → 0.85 に落ちた**。
+
+| 分割前 | 分割後 |
+|---|---|
+| God Module: `editor_ui` (48関数/30) | **消えた** |
+| — | High Efferent: `editor_ui::grid` → 32依存 |
+| — | High Afferent: `editor_ui::metrics` ← 27依存 |
+
+**これは指標の作りによるもので、コードが悪くなったのではない。** 1ファイルに
+入っていたときは関数どうしの参照が `use` として現れないので、依存の辺が0本に
+見えていた。割れば必ず辺が生える。
+
+- `metrics.rs` は**定数を置いただけのファイル**で、全員が使うのは当然
+- `grid.rs` の32依存は、その大半が `geometry` から取る算出関数
+
+助言どおり `MetricsInterface` トレイトを作るのも、`grid` をさらに割るのも、
+**辺を隠して点を上げるだけ**で読みやすさには寄与しない。採らない。
+
+### `grid` (771行) をさらに割るかは保留 → **割らないと決めた**
+
+`grid` の中は「背景 → 地色 → 区切り線 → ノート → 再生線 →
 操作 → ドラッグ」と節に分かれている。描画部と操作部で割れそうに見える。
 
 **が、これは移動ではなく分解**になる。`grid` の中は `ui`・`state`・スクロール位置を
 共有しながら上から下へ流れており、割るには引数の設計が要る。
-**フェーズ1では触らず、1ファイルに収まった状態を見てから判断する。**
+
+**ユーザーの判断で、割らないことにした。** 1ファイルに収まった今の形を維持する。
 
 ---
 
