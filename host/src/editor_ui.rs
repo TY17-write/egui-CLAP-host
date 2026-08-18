@@ -265,7 +265,11 @@ pub struct EditorState {
     ppq: f32,
     /// プロジェクトの保存先 (表示用。実際のパス管理は main 側)
     pub project_path: Option<String>,
-    /// トラックごとに載っている音源の名前 (表示用。main 側が毎フレーム更新する)
+    /// 打ち込みトラックごとに、**それを鳴らすオーディオトラックの一覧**
+    /// (表示用。main 側が毎フレーム更新する)。
+    ///
+    /// `None` は「どこからも参照されていない = 書いても鳴らない」。
+    /// 音源は打ち込みトラックではなくオーディオトラックに載る。
     pub track_plugins: Vec<Option<String>>,
     /// 再生を始めたときの再生ヘッド位置。停止・終端到達でここへ戻す。
     play_return: Option<f64>,
@@ -1002,10 +1006,6 @@ pub enum EditorCommand {
     ExportOpus,
     /// 1トラック目を CeVIO のプロジェクトファイル (CCS) に書き出す
     ExportCcs,
-    /// 指定トラックに音源 (.clap / .vst3) を読み込む
-    LoadPlugin {
-        track: usize,
-    },
 }
 
 /// エディタパネルを描画する。pos_quarters は現在の再生位置 (四分音符単位)。
@@ -1054,7 +1054,7 @@ pub fn editor_panel(
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .vertical_scroll_offset(state.grid_scroll_y)
                 .show(ui, |ui| {
-                    track_gutter(ui, state, &mut commands);
+                    track_gutter(ui, state);
                 });
         });
 
@@ -2901,17 +2901,13 @@ fn track_gutter_header(ui: &mut egui::Ui, state: &mut EditorState) {
 
 /// 左のトラック欄。トラックごとに名前と段の増減ボタンを、
 /// グリッドの段と同じ高さで並べる (行の位置が揃うようにするため)。
-fn track_gutter(ui: &mut egui::Ui, state: &mut EditorState, commands: &mut Vec<EditorCommand>) {
+fn track_gutter(ui: &mut egui::Ui, state: &mut EditorState) {
     // ScrollArea の中身は親のレイアウトを引き継ぐ (ここは横並びの中なので)。
     // 縦並びを明示しないとトラックが横に並んでしまう。
-    ui.vertical(|ui| track_gutter_content(ui, state, commands));
+    ui.vertical(|ui| track_gutter_content(ui, state));
 }
 
-fn track_gutter_content(
-    ui: &mut egui::Ui,
-    state: &mut EditorState,
-    commands: &mut Vec<EditorCommand>,
-) {
+fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
     for track in 0..state.editor.track_count() {
         let lanes = state.editor.lanes(track);
         // グリッドの段と行の位置が揃うよう、縦ズームに追従させる
@@ -3045,19 +3041,22 @@ fn track_gutter_content(
             );
         });
 
-        // 音源 (.clap / .vst3) の読み込み。載っていればボタンを色付きにして名前を出す
-        let plugin = state.track_plugins.get(track).cloned().flatten();
-        let label = egui::RichText::new("♪").size(11.0).color(match &plugin {
+        // **このトラックを鳴らすオーディオトラックがあるか。**
+        //
+        // 音源は打ち込みトラックではなくオーディオトラックに載る。ここを見ている
+        // オーディオトラックが1つも無ければ、**書いても鳴らない**ので印を出す
+        // (割り当ては「オーディオトラック」の窓で行う)。
+        let users = state.track_plugins.get(track).cloned().flatten();
+        let label = egui::RichText::new("♪").size(11.0).color(match &users {
             Some(_) => palette::GREEN,
-            None => palette::FG_DIM,
+            None => palette::RED,
         });
-        let response = content.add(egui::Button::new(label).small());
-        if response.clicked() {
-            commands.push(EditorCommand::LoadPlugin { track });
-        }
-        response.on_hover_text(match &plugin {
-            Some(name) => format!("音源: {name} (クリックで差し替え)"),
-            None => "音源 (.clap / .vst3) を読み込む".to_string(),
+        let response = content.add(egui::Label::new(label));
+        response.on_hover_text(match &users {
+            Some(names) => format!("鳴らすオーディオトラック: {names}"),
+            None => "どのオーディオトラックからも参照されていません (鳴りません)。\
+                     「オーディオトラック」の窓で割り当ててください"
+                .to_string(),
         });
 
         // 段の増減は2段目へ回す。1行に詰めると 200px に収まらないうえ、

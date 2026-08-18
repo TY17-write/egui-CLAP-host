@@ -111,8 +111,8 @@ struct Candidates {
     kind: project::PluginKind,
     path: PathBuf,
     plugins: Vec<discovery::FoundPlugin>,
-    /// この候補から選んだプラグインを載せるトラック
-    target_track: usize,
+    /// この候補から選んだプラグインを載せる段
+    target_track: audio::NodeAddr,
 }
 
 /// オーディオエンジン (出力ストリーム1本と、それを操作する口)。
@@ -129,7 +129,7 @@ struct Engine {
     config: StreamAudioConfig,
 }
 
-/// トラック1本にロードされた音源。
+/// チェーンの1段にロードされた音源。
 /// 形式に依らない情報だけをここに持ち、中身は [`TrackPlugin`] が形式ごとに抱える。
 struct TrackAudio {
     name: String,
@@ -140,7 +140,55 @@ struct TrackAudio {
     id: String,
     #[allow(dead_code)] // 鍵盤 UI 無効化中
     pressed_keys: HashSet<u16>,
+    /// 処理を飛ばして素通しするか
+    bypassed: bool,
+    /// 入力・出力のチャンネル数。**どこでステレオが潰れるかを画面に出す**ために持つ
+    /// (載せた時点でしか分からないので控えておく)。
+    channels: (u16, u16),
     plugin: TrackPlugin,
+}
+
+/// オーディオトラック1本ぶんの、メインスレッド側の持ち物。
+///
+/// オーディオスレッド側の [`graph::AudioTrack`](audio::graph::AudioTrack) と
+/// 対になる。**こちらが正**で、変更は必ずメッセージで向こうへ伝える。
+#[derive(Default)]
+struct AudioTrackUi {
+    /// 上から順に通す。空なら何も鳴らない
+    nodes: Vec<TrackAudio>,
+    /// MIDI をどの打ち込みトラックから取るか。**`None` が未割り当て**
+    /// (起動直後は全部これ)
+    midi_track: Option<usize>,
+    /// 送り先のオーディオトラック番号
+    sends: Vec<usize>,
+    gain: f32,
+    /// `-1.0` (左) 〜 `1.0` (右)
+    pan: f32,
+    muted: bool,
+    soloed: bool,
+}
+
+impl AudioTrackUi {
+    /// 空のトラック。マスター以外はマスターへ送る
+    fn new(index: usize) -> Self {
+        Self {
+            sends: if index == graph::MASTER {
+                Vec::new()
+            } else {
+                vec![graph::MASTER]
+            },
+            gain: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// 画面に出す名前 (先頭の段の音源名)
+    fn label(&self) -> &str {
+        match self.nodes.first() {
+            Some(node) => &node.name,
+            None => "—",
+        }
+    }
 }
 
 /// 音源のうち、メインスレッドに残る側。
@@ -350,16 +398,20 @@ fn file_label(path: &std::path::Path) -> String {
 
 #[derive(Default)]
 struct App {
-    /// 「♪」を押したあと、音源の形式を選んでもらっている最中のトラック。
+    /// 「+」を押したあと、音源の形式を選んでもらっている最中の段。
     /// 形式ごとにダイアログの出し方が違うので、先に [`LoadChoice`] を決める必要がある。
-    pending_load: Option<usize>,
+    pending_load: Option<audio::NodeAddr>,
     candidates: Option<Candidates>,
     // 宣言順にドロップされるため、ストリームをインスタンスより先に止める
     engine: Option<Engine>,
-    /// トラックごとの音源 (エディタのトラック数に合わせて伸ばす)
-    tracks: Vec<Option<TrackAudio>>,
-    /// 差し替えで外したが、まだ処理器が返ってきていないインスタンス。
+    /// オーディオトラック ([`graph::AUDIO_TRACKS`] 本)。空のときは
+    /// [`ensure_audio_tracks`](App::ensure_audio_tracks) が用意する
+    audio_tracks: Vec<AudioTrackUi>,
+    /// 詳細ウィンドウを出しているオーディオトラック
+    detail_track: Option<usize>,
+    /// 外したが、まだノードが返ってきていないインスタンス。
     /// 返却時に正しいインスタンスへ deactivate するため、ここで生かしておく。
+    /// 添字は**オーディオトラック番号**で、同じトラック内では入れた順に返る。
     retiring: std::collections::VecDeque<(usize, TrackAudio)>,
     error: Option<String>,
     /// 起動時に自動ロードする .clap ファイル (パス, GUI も開くか)
@@ -379,28 +431,13 @@ struct App {
     status: Option<String>,
     /// 画面中央に出す結果通知 (閉じるまで残る)
     notice: Option<Notice>,
-    /// オーディオトラックの送り先 (番号順、[`graph::AUDIO_TRACKS`] 本)。
-    ///
-    /// **画面から繋ぎ替える手段はまだ無い。** 今は既定の
-    /// 「全部マスターへ直結」か、`.ron` に書かれていたものが入る。
-    routing_sends: Vec<Vec<usize>>,
-    /// オーディオトラックごとの音量 (線形) とパン。
-    ///
-    /// **空のときは既定 (等倍・中央)。** `App` は `Default` で作られるので、
-    /// 固定長配列にすると音量が 0 で埋まってしまう (全部無音になる)。
-    /// `routing_sends` と同じく「空 = 既定」で扱う。
-    track_gain: Vec<f32>,
-    track_pan: Vec<f32>,
-    /// ミュート/ソロ。ビット位置がオーディオトラック番号
-    track_muted: u16,
-    track_soloed: u16,
 }
 
 impl App {
     /// .clap を選ばせて候補を読み込む。
     /// 戻り値は「候補を新しく読み込めたか」。キャンセルや失敗では false を返し、
     /// 前回の候補には触れない (キャンセルで前のプラグインが載らないようにするため)。
-    fn open_clap_dialog(&mut self, target_track: usize) -> bool {
+    fn open_clap_dialog(&mut self, target_track: audio::NodeAddr) -> bool {
         let picked = rfd::FileDialog::new()
             .add_filter("CLAP プラグイン", &["clap"])
             .pick_file();
@@ -430,7 +467,7 @@ impl App {
     ///
     /// なお、ファイル選択でもバンドルディレクトリには**入っていける**ので、
     /// 中の DLL を直接指してもよい (バンドルの場所を渡すのと同じ結果になる)。
-    fn open_vst3_dialog(&mut self, target_track: usize, bundle: bool) -> bool {
+    fn open_vst3_dialog(&mut self, target_track: audio::NodeAddr, bundle: bool) -> bool {
         let mut dialog = rfd::FileDialog::new();
         // 標準の置き場から始める。無ければダイアログの既定に任せる
         let standard = std::path::Path::new(VST3_STANDARD_DIRECTORY);
@@ -454,10 +491,10 @@ impl App {
     /// 開いている間は、その窓がこちらと同じスレッドのメッセージループに乗る。
     /// 再描画の間隔を決めるのに使う (`update` の末尾を参照)。
     fn any_editor_open(&self) -> bool {
-        self.tracks
+        self.audio_tracks
             .iter()
-            .flatten()
-            .any(|track| match &track.plugin {
+            .flat_map(|track| track.nodes.iter())
+            .any(|node| match &node.plugin {
                 TrackPlugin::Clap(clap) => clap.gui.as_ref().is_some_and(|gui| gui.is_open),
                 TrackPlugin::Vst3(vst3) => vst3.gui.is_open,
             })
@@ -468,7 +505,7 @@ impl App {
         &mut self,
         kind: project::PluginKind,
         path: PathBuf,
-        target_track: usize,
+        target_track: audio::NodeAddr,
         found: Result<Vec<discovery::FoundPlugin>, Box<dyn Error>>,
     ) -> bool {
         match found {
@@ -641,12 +678,6 @@ impl App {
                     .count();
 
                 self.editor.replace_project(loaded.editor);
-                // **繋ぎ方はファイルのものを使う。** 検証は読み込みで済んでいる
-                self.routing_sends = loaded
-                    .audio_tracks
-                    .iter()
-                    .map(|track| track.sends.clone())
-                    .collect();
                 // 音源はシーケンスを入れ替えたあとに載せる
                 // (トラック数が揃ってからでないと行き先が決まらない)
                 let mut failures = self.restore_audio_tracks(loaded.audio_tracks);
@@ -697,16 +728,29 @@ impl App {
     /// **組めなければ既定 (全部マスターへ直結) に戻す。** 読み込みの時点で
     /// 検証してあるので普通は起きないが、鳴らなくなるより既定で鳴るほうがよい。
     fn routing(&self) -> graph::Routing {
-        if self.routing_sends.is_empty() {
+        if self.audio_tracks.is_empty() {
             return graph::Routing::default();
         }
-        graph::Routing::from_lists(&self.routing_sends).unwrap_or_else(|problems| {
+        let lists: Vec<Vec<usize>> = self
+            .audio_tracks
+            .iter()
+            .map(|track| track.sends.clone())
+            .collect();
+        graph::Routing::from_lists(&lists).unwrap_or_else(|problems| {
             eprintln!(
                 "繋ぎ方を組めないので既定に戻します:\n{}",
                 problems.join("\n")
             );
             graph::Routing::default()
         })
+    }
+
+    /// オーディオトラックの器を用意する (`Default` では空なので)
+    fn ensure_audio_tracks(&mut self) {
+        if self.audio_tracks.len() == graph::AUDIO_TRACKS {
+            return;
+        }
+        self.audio_tracks = (0..graph::AUDIO_TRACKS).map(AudioTrackUi::new).collect();
     }
 
     /// 繋ぎ方・音量・ミュート/ソロをまとめたもの。
@@ -716,19 +760,63 @@ impl App {
     fn mixer(&self) -> graph::Mixer {
         let mut gain = [1.0f32; graph::AUDIO_TRACKS];
         let mut pan = [0.0f32; graph::AUDIO_TRACKS];
-        for (index, value) in self.track_gain.iter().take(graph::AUDIO_TRACKS).enumerate() {
-            gain[index] = *value;
+        let mut muted = 0u16;
+        let mut soloed = 0u16;
+
+        for (index, track) in self
+            .audio_tracks
+            .iter()
+            .take(graph::AUDIO_TRACKS)
+            .enumerate()
+        {
+            gain[index] = track.gain;
+            pan[index] = track.pan;
+            if track.muted {
+                muted |= 1 << index;
+            }
+            if track.soloed {
+                soloed |= 1 << index;
+            }
         }
-        for (index, value) in self.track_pan.iter().take(graph::AUDIO_TRACKS).enumerate() {
-            pan[index] = *value;
+        graph::Mixer::build(self.routing(), &gain, &pan, muted, soloed)
+    }
+
+    /// 送り先を1本つけ外しする。**輪になるなら断って理由を返す。**
+    ///
+    /// 繋ぐ操作を断るのがいちばん安い (実行時に見つける形にすると、
+    /// オーディオスレッドで探索することになる)。
+    fn toggle_send(&mut self, from: usize, to: usize) -> Result<(), String> {
+        self.ensure_audio_tracks();
+        let Some(track) = self.audio_tracks.get_mut(from) else {
+            return Err("そのトラックはありません".into());
+        };
+        let had = track.sends.contains(&to);
+        if had {
+            track.sends.retain(|target| *target != to);
+        } else {
+            track.sends.push(to);
+            track.sends.sort_unstable();
         }
-        graph::Mixer::build(
-            self.routing(),
-            &gain,
-            &pan,
-            self.track_muted,
-            self.track_soloed,
-        )
+
+        // 組めるか試す。駄目なら元へ戻す
+        let lists: Vec<Vec<usize>> = self
+            .audio_tracks
+            .iter()
+            .map(|track| track.sends.clone())
+            .collect();
+        if let Err(problems) = graph::Routing::from_lists(&lists) {
+            let track = &mut self.audio_tracks[from];
+            if had {
+                track.sends.push(to);
+                track.sends.sort_unstable();
+            } else {
+                track.sends.retain(|target| *target != to);
+            }
+            return Err(problems.join("\n"));
+        }
+
+        self.push_routing();
+        Ok(())
     }
 
     /// 繋ぎ方と音量をオーディオスレッドへ送る。
@@ -806,29 +894,26 @@ impl App {
         };
         let switching = target_rate != stream_config.sample_rate;
 
-        let loaded: Vec<usize> = self
-            .tracks
+        // 借りるのは (オーディオトラック, 段) の組。番号はオーディオトラックのもの
+        let loaded: Vec<audio::NodeAddr> = self
+            .audio_tracks
             .iter()
             .enumerate()
-            // 借りる相手はオーディオスレッド。番号はオーディオトラックのもの
-            .filter_map(|(track, slot)| slot.as_ref().and_then(|_| graph::audio_track_for(track)))
+            .flat_map(|(track, slot)| {
+                (0..slot.nodes.len()).map(move |at| audio::NodeAddr { track, at })
+            })
             .collect();
 
         // ---- 借りる ----
-        // engine の借用はここで終える (このあと self.tracks を触るため)
+        // engine の借用はここで終える (このあと self.audio_tracks を触るため)
         let mut processors = {
             let Some(engine) = self.engine.as_mut() else {
                 return Err("音源が未ロードです。".into());
             };
             let _ = engine.producer.push(GuiMsg::Transport(TransportMsg::Stop));
-            // 画面から作れるトラックはまだ1段だけなので、先頭の段だけ借りる
-            for track in &loaded {
-                let _ = engine.producer.push(GuiMsg::RemoveNode {
-                    addr: audio::NodeAddr {
-                        track: *track,
-                        at: 0,
-                    },
-                });
+            // **後ろの段から外す。** 前から外すと後ろが繰り上がって番号がずれる
+            for addr in loaded.iter().rev() {
+                let _ = engine.producer.push(GuiMsg::RemoveNode { addr: *addr });
             }
             collect_processors(engine, loaded.len())
         };
@@ -851,8 +936,21 @@ impl App {
         // **繋ぎ方も音量も再生と同じにする。** ここを既定のままにすると、
         // 繋ぎ替えたときに鳴っている音と書き出した音が食い違う
         graph.set_mixer(self.mixer());
+        // **段の順に組み直す。** 借りるときに後ろから外したので、並びは逆になっている
+        processors.sort_by_key(|(addr, _)| (addr.track, addr.at));
+        let mut chains: Vec<Vec<audio::Node>> =
+            (0..graph::AUDIO_TRACKS).map(|_| Vec::new()).collect();
         for (addr, node) in processors {
-            graph.place_chain(addr.track, graph::midi_track_for(addr.track), vec![node]);
+            if let Some(chain) = chains.get_mut(addr.track) {
+                chain.push(node);
+            }
+        }
+        for (track, chain) in chains.into_iter().enumerate() {
+            let midi_track = self
+                .audio_tracks
+                .get(track)
+                .and_then(|slot| slot.midi_track);
+            graph.place_chain(track, midi_track, chain);
         }
         let rendered = audio::offline::render(&mut graph, setup);
         let mut processors = graph.take_nodes();
@@ -870,8 +968,8 @@ impl App {
         // 戻せなかったトラックは音源ごと外す。
         // 載っているのに鳴らない状態で放置するより、消えている方が気付ける。
         for track in &dropped {
-            if let Some(slot) = self.tracks.get_mut(*track) {
-                *slot = None;
+            if let Some(slot) = self.audio_tracks.get_mut(*track) {
+                slot.nodes.clear();
             }
         }
         Ok((rendered, dropped))
@@ -904,10 +1002,10 @@ impl App {
         }
 
         let loaded: Vec<usize> = self
-            .tracks
+            .audio_tracks
             .iter()
             .enumerate()
-            .filter_map(|(track, slot)| slot.as_ref().map(|_| track))
+            .filter_map(|(track, slot)| (!slot.nodes.is_empty()).then_some(track))
             .collect();
         if loaded.is_empty() {
             self.fail_export("音源が載っているトラックがありません。");
@@ -1016,7 +1114,7 @@ impl App {
             self.fail_opus("ノートが1つもありません。");
             return;
         }
-        if self.tracks.iter().all(Option::is_none) {
+        if self.audio_tracks.iter().all(|track| track.nodes.is_empty()) {
             self.fail_opus("音源が載っているトラックがありません。");
             return;
         }
@@ -1117,7 +1215,7 @@ impl App {
                  \n読み込み直してください。",
             );
             for track in dropped {
-                body.push_str(&format!("\n・トラック {}", track + 1));
+                body.push_str(&format!("\n・オーディオトラック {track}"));
             }
         }
 
@@ -1222,12 +1320,14 @@ impl App {
         let mut failed = Vec::new();
 
         for (addr, node) in nodes {
-            let midi_track = graph::midi_track_for(addr.track).unwrap_or(0);
-            match self.switch_one_rate(addr.track, node, config) {
+            match self.switch_one_rate(addr, node, config) {
                 Ok(node) => switched.push((addr, node)),
                 Err(e) => {
-                    eprintln!("トラック {} のレート切り替えに失敗: {e}", midi_track + 1);
-                    failed.push(midi_track);
+                    eprintln!(
+                        "オーディオトラック {} のレート切り替えに失敗: {e}",
+                        addr.track
+                    );
+                    failed.push(addr.track);
                 }
             }
         }
@@ -1241,18 +1341,16 @@ impl App {
     /// `setupProcessing` 相当をやり直す。
     fn switch_one_rate(
         &mut self,
-        track: usize,
+        addr: audio::NodeAddr,
         node: audio::Node,
         config: &StreamAudioConfig,
     ) -> Result<audio::Node, Box<dyn Error>> {
-        // `track` はオーディオトラック番号。`self.tracks` は打ち込み番号で並ぶ
-        let midi_track = graph::midi_track_for(track).ok_or("マスターには音源がありません")?;
         let Some(audio) = self
-            .tracks
-            .get_mut(midi_track)
-            .and_then(|slot| slot.as_mut())
+            .audio_tracks
+            .get_mut(addr.track)
+            .and_then(|slot| slot.nodes.get_mut(addr.at))
         else {
-            return Err("このトラックに音源がありません".into());
+            return Err("その段に音源がありません".into());
         };
 
         match (node.into_retired(), &mut audio.plugin) {
@@ -1278,18 +1376,22 @@ impl App {
             return;
         };
         while let Ok((addr, node)) = engine.retired.pop() {
-            // **返ってくるのはオーディオトラック番号。** `self.tracks` と
-            // `self.retiring` は打ち込みトラック番号で並ぶので直す
-            let track = graph::midi_track_for(addr.track).unwrap_or(0);
+            let track = addr.track;
 
-            // 差し替えで外したインスタンスが待っていればそちらへ返す。
+            // 外したインスタンスが待っていればそちらへ返す。
             // 待っていない場合 (書き出しの借り出しが時間切れになったときなど) は
-            // 今そのトラックに載っているものが当人なので、欄から降ろして始末する
+            // 今その段に載っているものが当人なので、欄から降ろして始末する
             // (止めた音源を載ったままにすると、鳴らないトラックが残る)。
+            //
+            // **同じトラック内では入れた順に返る**ので、いちばん古いものを取る
             let waiting = self.retiring.iter().position(|(index, _)| *index == track);
             let mut owner = match waiting {
                 Some(at) => self.retiring.remove(at).map(|(_, old)| old),
-                None => self.tracks.get_mut(track).and_then(|slot| slot.take()),
+                None => self
+                    .audio_tracks
+                    .get_mut(track)
+                    .filter(|slot| addr.at < slot.nodes.len())
+                    .map(|slot| slot.nodes.remove(addr.at)),
             };
 
             // 形式ごとに始末の仕方が違う。**返ってくるのは1段ぶん**
@@ -1323,16 +1425,8 @@ impl App {
             .or_else(|| self.last_directory.clone())
     }
 
-    /// トラック数をエディタに合わせる (足りなければ空きで埋める)
-    fn ensure_track_slots(&mut self, track: usize) {
-        let needed = (track + 1).max(self.editor.editor.track_count());
-        while self.tracks.len() < needed {
-            self.tracks.push(None);
-        }
-    }
-
-    /// 選んだプラグインを指定トラックに載せる (トラック欄からの操作)
-    fn instantiate(&mut self, plugin_index: usize, track: usize) {
+    /// 選んだプラグインを指定の段に載せる (詳細ウィンドウからの操作)
+    fn instantiate(&mut self, plugin_index: usize, track: audio::NodeAddr) {
         let Some(candidates) = &self.candidates else {
             return;
         };
@@ -1346,29 +1440,36 @@ impl App {
         }
     }
 
-    /// 指定トラックに音源を載せる。`state` があれば復元してから鳴らせる状態にする。
+    /// 指定の段に音源を載せる。`state` があれば復元してから鳴らせる状態にする。
     ///
-    /// 呼び出し元は2つ。トラック欄の「♪」からの選択と、プロジェクトを開いたとき。
+    /// 呼び出し元は2つ。詳細ウィンドウからの選択と、プロジェクトを開いたとき。
     /// 戻り値は「状態を戻せたか」で、`state` が無いときは常に true。
+    ///
+    /// **`track.at` が段数と同じなら末尾へ足す。** それより後ろは受け付けない。
     fn load_plugin(
         &mut self,
-        track: usize,
+        track: audio::NodeAddr,
         kind: project::PluginKind,
         path: &std::path::Path,
         id: &str,
         state: Option<&[u8]>,
     ) -> Result<bool, String> {
-        // 最初のロード時にストリームを用意する
-        // **音を出せる系統は16まで。** 打ち込みトラックには上限が無いので、
-        // 先に行き先を確かめる (0 はマスターなので1つずれる)
-        let Some(audio_index) = graph::audio_track_for(track) else {
+        self.ensure_audio_tracks();
+        if track.track >= graph::AUDIO_TRACKS {
             return Err(format!(
-                "トラック {} には音源を載せられません。音を出せるのは {} 本までです",
-                track + 1,
-                graph::AUDIO_TRACKS - 1
+                "オーディオトラック {} はありません ({} 本まで)",
+                track.track,
+                graph::AUDIO_TRACKS
             ));
-        };
+        }
+        if track.at >= graph::MAX_NODES {
+            return Err(format!(
+                "1本のトラックに刺せるのは {} 段までです",
+                graph::MAX_NODES
+            ));
+        }
 
+        // 最初のロード時にストリームを用意する
         if self.engine.is_none() {
             let engine = start_engine().map_err(|e| format!("オーディオを開始できません: {e}"))?;
             self.engine = Some(engine);
@@ -1407,16 +1508,8 @@ impl App {
             None => true,
         };
 
-        let _ = engine.producer.push(GuiMsg::SetMidiTrack {
-            track: audio_index,
-            midi_track: Some(track),
-        });
-        // 画面から作れるのはまだ1段だけなので、先頭の段に載せる
         let _ = engine.producer.push(GuiMsg::SetNode {
-            addr: audio::NodeAddr {
-                track: audio_index,
-                at: 0,
-            },
+            addr: track,
             node: Box::new(node),
         });
 
@@ -1430,135 +1523,487 @@ impl App {
             .producer
             .push(GuiMsg::Transport(TransportMsg::Seek { sample }));
 
-        self.ensure_track_slots(track);
         // 前の音源は、処理器が返ってくるまで生かしておく
-        if let Some(previous) = self.tracks[track].take() {
-            self.retiring.push_back((track, previous));
+        let nodes = &mut self.audio_tracks[track.track].nodes;
+        if track.at < nodes.len() {
+            let previous = std::mem::replace(&mut nodes[track.at], audio_track);
+            self.retiring.push_back((track.track, previous));
+        } else {
+            nodes.push(audio_track);
         }
-        self.tracks[track] = Some(audio_track);
         // 新しいプラグインにシーケンスを送り直す
         self.editor.dirty = true;
 
         Ok(restored)
     }
 
-    /// 保存用に、各オーディオトラックの中身を集める。
+    /// 段を外す
+    fn remove_node(&mut self, addr: audio::NodeAddr) {
+        let Some(slot) = self.audio_tracks.get_mut(addr.track) else {
+            return;
+        };
+        if addr.at >= slot.nodes.len() {
+            return;
+        }
+        let previous = slot.nodes.remove(addr.at);
+        self.retiring.push_back((addr.track, previous));
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.producer.push(GuiMsg::RemoveNode { addr });
+        }
+    }
+
+    /// 段を並べ替える。**パラメータの宛先は段の番号**なので向こうにも伝える
+    fn move_node(&mut self, track: usize, from: usize, to: usize) {
+        let Some(slot) = self.audio_tracks.get_mut(track) else {
+            return;
+        };
+        if from >= slot.nodes.len() || to >= slot.nodes.len() || from == to {
+            return;
+        }
+        let node = slot.nodes.remove(from);
+        slot.nodes.insert(to, node);
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.producer.push(GuiMsg::MoveNode { track, from, to });
+        }
+    }
+
+    /// 段を素通しにするか
+    fn set_bypassed(&mut self, addr: audio::NodeAddr, bypassed: bool) {
+        let Some(node) = self
+            .audio_tracks
+            .get_mut(addr.track)
+            .and_then(|slot| slot.nodes.get_mut(addr.at))
+        else {
+            return;
+        };
+        node.bypassed = bypassed;
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.producer.push(GuiMsg::SetBypassed { addr, bypassed });
+        }
+    }
+
+    /// どの打ち込みトラックから MIDI を取るかを決める
+    fn set_midi_track(&mut self, track: usize, midi_track: Option<usize>) {
+        let Some(slot) = self.audio_tracks.get_mut(track) else {
+            return;
+        };
+        slot.midi_track = midi_track;
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine
+                .producer
+                .push(GuiMsg::SetMidiTrack { track, midi_track });
+        }
+        // 割り当てが変わったらシーケンスを送り直す
+        self.editor.dirty = true;
+    }
+
+    /// オーディオトラックの窓を出す。
     ///
-    /// **`self.tracks` は打ち込みトラック番号で並んでいる。** 画面から作れるのは
-    /// まだ「打ち込み1本につき音源1つ」なので、[`graph::audio_track_for`] で
-    /// オーディオトラックへ写す (0 はマスターなので1つずれる)。
-    fn audio_track_snapshots(&mut self) -> Vec<project::AudioTrackSnapshot> {
-        let mut tracks: Vec<project::AudioTrackSnapshot> = (0..project::AUDIO_TRACKS)
-            .map(|_| project::AudioTrackSnapshot::default())
-            .collect();
+    /// 一覧は常設で**ルーティング・音量・パン・ミュート/ソロ**だけを扱い、
+    /// **プラグインの管理は詳細ウィンドウ**が受け持つ。
+    /// 戻り値は「音源を載せたい段」(押されたときだけ)。
+    fn audio_track_windows(&mut self, ctx: &egui::Context) -> Option<audio::NodeAddr> {
+        self.ensure_audio_tracks();
+        let mixer = self.mixer();
+        let midi_tracks = self.editor.editor.track_count();
 
-        for midi_track in 0..self.editor.editor.track_count() {
-            let Some(index) = graph::audio_track_for(midi_track) else {
-                continue; // 16本に収まらないぶんは、そもそも載っていない
-            };
-            let Some(audio) = self
-                .tracks
-                .get_mut(midi_track)
-                .and_then(|slot| slot.as_mut())
-            else {
-                continue;
-            };
-            tracks[index] = project::AudioTrackSnapshot {
-                nodes: vec![PluginSnapshot {
-                    kind: audio.kind(),
-                    path: audio.path.clone(),
-                    id: audio.id.clone(),
-                    state: audio.capture_state(),
-                    bypassed: false,
-                }],
-                midi_track: Some(midi_track),
-                sends: Vec::new(), // 下でまとめて入れる
-                ..Default::default()
-            };
-        }
+        let mut open_detail = None;
+        let mut toggle_send = None;
+        let mut mixer_changed = false;
 
-        // **繋ぎ方と音量は音源の有無と無関係。** 空のトラックのぶんも残す
-        // (繋ぎ替えてから音源を外しても、繋ぎ方は保たれる)
-        for (index, track) in tracks.iter_mut().enumerate() {
-            track.sends = self.routing_sends.get(index).cloned().unwrap_or_else(|| {
-                if index == project::MASTER {
-                    Vec::new()
-                } else {
-                    vec![project::MASTER]
-                }
+        egui::Window::new("オーディオトラック")
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.weak("0 はマスター。ここの出力がそのまま最終出力になる");
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for index in 0..graph::AUDIO_TRACKS {
+                        // **マスターへ辿り着けないトラックは鳴らない。**
+                        // 「繋がっていなければ鳴らない」を仕様にしたぶん、
+                        // 画面で分かるようにする必要がある
+                        let silent = !mixer.routing.reaches_master(index);
+                        let frame = if silent {
+                            egui::Frame::NONE
+                                .stroke(egui::Stroke::new(1.0_f32, theme::palette::RED))
+                                .inner_margin(2.0)
+                        } else {
+                            egui::Frame::NONE.inner_margin(2.0)
+                        };
+
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let track = &mut self.audio_tracks[index];
+                                ui.monospace(format!("{index:>2}"));
+
+                                if ui
+                                    .button(track.label())
+                                    .on_hover_text("詳細 (音源とエフェクトの管理)")
+                                    .clicked()
+                                {
+                                    open_detail = Some(index);
+                                }
+
+                                // 送り先。マスターは送り側にならないので出さない
+                                if index != graph::MASTER {
+                                    let label = if track.sends.is_empty() {
+                                        "→ なし".to_string()
+                                    } else {
+                                        let list: Vec<String> =
+                                            track.sends.iter().map(|to| to.to_string()).collect();
+                                        format!("→ {}", list.join(","))
+                                    };
+                                    ui.menu_button(label, |ui| {
+                                        for target in 0..graph::AUDIO_TRACKS {
+                                            if target == index {
+                                                continue;
+                                            }
+                                            let mut on = track.sends.contains(&target);
+                                            if ui.checkbox(&mut on, format!("{target}")).changed() {
+                                                toggle_send = Some((index, target));
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("送り先 (複数選ぶと足し合わさる)");
+                                }
+
+                                // 音量とパン
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut track.gain)
+                                            .speed(0.01)
+                                            .range(0.0..=2.0)
+                                            .prefix("×"),
+                                    )
+                                    .changed()
+                                {
+                                    mixer_changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut track.pan)
+                                            .speed(0.01)
+                                            .range(-1.0..=1.0)
+                                            .prefix("P"),
+                                    )
+                                    .on_hover_text("パン (-1 左 〜 1 右)")
+                                    .changed()
+                                {
+                                    mixer_changed = true;
+                                }
+
+                                if ui.toggle_value(&mut track.muted, "M").changed() {
+                                    mixer_changed = true;
+                                }
+                                if ui
+                                    .toggle_value(&mut track.soloed, "S")
+                                    .on_hover_text("ソロ。マスターへ至る経路は残る")
+                                    .changed()
+                                {
+                                    mixer_changed = true;
+                                }
+
+                                if silent {
+                                    ui.colored_label(theme::palette::RED, "鳴りません")
+                                        .on_hover_text("マスターへ辿り着けません");
+                                }
+                            });
+                        });
+                    }
+                });
             });
-            track.gain = self.track_gain.get(index).copied().unwrap_or(1.0);
-            track.pan = self.track_pan.get(index).copied().unwrap_or(0.0);
-            track.muted = self.track_muted & (1 << index) != 0;
-            track.soloed = self.track_soloed & (1 << index) != 0;
+
+        if let Some((from, to)) = toggle_send {
+            if let Err(problems) = self.toggle_send(from, to) {
+                self.notice = Some(Notice::error("その繋ぎ方はできません", problems));
+            }
         }
-        tracks
+        if mixer_changed {
+            self.push_routing();
+        }
+        if let Some(index) = open_detail {
+            self.detail_track = Some(index);
+        }
+
+        self.audio_track_detail(ctx, midi_tracks)
+    }
+
+    /// 選んでいる1本の詳細 (チェーンの管理)
+    fn audio_track_detail(
+        &mut self,
+        ctx: &egui::Context,
+        midi_tracks: usize,
+    ) -> Option<audio::NodeAddr> {
+        let index = self.detail_track?;
+        if index >= self.audio_tracks.len() {
+            self.detail_track = None;
+            return None;
+        }
+
+        let mut add_node = None;
+        let mut remove = None;
+        let mut moved = None;
+        let mut bypass = None;
+        let mut midi_choice = None;
+        let mut gui_error = None;
+        let mut open = true;
+
+        egui::Window::new(format!("オーディオトラック {index}"))
+            .default_width(380.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // ---- MIDI の割り当て ----
+                // マスターは音を受けるだけなので、打ち込みを割り当てても意味がない
+                if index != graph::MASTER {
+                    ui.horizontal(|ui| {
+                        ui.label("MIDI:");
+                        let current = self.audio_tracks[index].midi_track;
+                        let label = match current {
+                            Some(track) => format!("トラック {}", track + 1),
+                            None => "未割り当て".to_string(),
+                        };
+                        egui::ComboBox::from_id_salt(("midi", index))
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(current.is_none(), "未割り当て")
+                                    .clicked()
+                                {
+                                    midi_choice = Some(None);
+                                }
+                                for track in 0..midi_tracks {
+                                    let selected = current == Some(track);
+                                    if ui
+                                        .selectable_label(
+                                            selected,
+                                            format!("トラック {}", track + 1),
+                                        )
+                                        .clicked()
+                                    {
+                                        midi_choice = Some(Some(track));
+                                    }
+                                }
+                            });
+                        if self.audio_tracks[index].midi_track.is_none() {
+                            ui.weak("(音源を鳴らすには割り当てが要ります)");
+                        }
+                    });
+                    ui.separator();
+                }
+
+                // ---- チェーン ----
+                let count = self.audio_tracks[index].nodes.len();
+                if count == 0 {
+                    ui.weak("何も刺さっていません");
+                }
+                for at in 0..count {
+                    let node = &mut self.audio_tracks[index].nodes[at];
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{}.", at + 1));
+                        ui.label(node.name.clone());
+                        // **どこでステレオが潰れるかを見えるように**
+                        ui.weak(format!("({}→{}ch)", node.channels.0, node.channels.1));
+
+                        let mut bypassed = node.bypassed;
+                        if ui
+                            .toggle_value(&mut bypassed, "B")
+                            .on_hover_text("バイパス (処理を飛ばして素通し)")
+                            .changed()
+                        {
+                            bypass = Some((at, bypassed));
+                        }
+                        if ui.add_enabled(at > 0, egui::Button::new("▲")).clicked() {
+                            moved = Some((at, at - 1));
+                        }
+                        if ui
+                            .add_enabled(at + 1 < count, egui::Button::new("▼"))
+                            .clicked()
+                        {
+                            moved = Some((at, at + 1));
+                        }
+                        if ui.button("✕").on_hover_text("この段を外す").clicked() {
+                            remove = Some(at);
+                        }
+
+                        // プラグイン独自 GUI
+                        let name = node.name.clone();
+                        match &mut node.plugin {
+                            TrackPlugin::Clap(clap) => {
+                                if let Some(gui) = &mut clap.gui {
+                                    if gui.supports_gui() {
+                                        if !gui.is_open {
+                                            if ui.button("エディタ").clicked() {
+                                                if let Err(e) = gui.open(
+                                                    &mut clap.instance.plugin_handle(),
+                                                    &name,
+                                                    clap.sender.clone(),
+                                                ) {
+                                                    gui_error =
+                                                        Some(format!("GUI を開けません: {e}"));
+                                                }
+                                            }
+                                        } else if ui.button("閉じる").clicked() {
+                                            gui.close(&mut clap.instance.plugin_handle());
+                                        }
+                                    }
+                                }
+                            }
+                            TrackPlugin::Vst3(vst3) => {
+                                ui.weak("VST3");
+                                if vst3.gui.supports_gui() {
+                                    if !vst3.gui.is_open {
+                                        if ui.button("エディタ").clicked() {
+                                            let mut plugin = vst3.plugin.lock();
+                                            if let Err(e) = vst3.gui.open(
+                                                &mut plugin,
+                                                &name,
+                                                vst3.sender.clone(),
+                                            ) {
+                                                gui_error = Some(format!("GUI を開けません: {e}"));
+                                            }
+                                        }
+                                    } else if ui.button("閉じる").clicked() {
+                                        let mut plugin = vst3.plugin.lock();
+                                        vst3.gui.close(&mut plugin);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(
+                        count < graph::MAX_NODES,
+                        egui::Button::new("＋ 音源 / エフェクトを足す"),
+                    )
+                    .clicked()
+                {
+                    add_node = Some(audio::NodeAddr {
+                        track: index,
+                        at: count,
+                    });
+                }
+                ui.weak("上から順に通ります。入力を持たない段 (音源) は、そこまでの音を捨てます");
+            });
+
+        if !open {
+            self.detail_track = None;
+        }
+        if let Some(choice) = midi_choice {
+            self.set_midi_track(index, choice);
+        }
+        if let Some((at, bypassed)) = bypass {
+            self.set_bypassed(audio::NodeAddr { track: index, at }, bypassed);
+        }
+        if let Some((from, to)) = moved {
+            self.move_node(index, from, to);
+        }
+        if let Some(at) = remove {
+            self.remove_node(audio::NodeAddr { track: index, at });
+        }
+        if gui_error.is_some() {
+            self.error = gui_error;
+        }
+        add_node
+    }
+
+    /// 保存用に、各オーディオトラックの中身を集める
+    fn audio_track_snapshots(&mut self) -> Vec<project::AudioTrackSnapshot> {
+        self.ensure_audio_tracks();
+        self.audio_tracks
+            .iter_mut()
+            .map(|track| project::AudioTrackSnapshot {
+                name: String::new(),
+                nodes: track
+                    .nodes
+                    .iter_mut()
+                    .map(|node| PluginSnapshot {
+                        kind: node.kind(),
+                        path: node.path.clone(),
+                        id: node.id.clone(),
+                        state: node.capture_state(),
+                        bypassed: node.bypassed,
+                    })
+                    .collect(),
+                midi_track: track.midi_track,
+                // **繋ぎ方と音量は音源の有無と無関係。** 空のトラックのぶんも残す
+                // (繋ぎ替えてから音源を外しても、繋ぎ方は保たれる)
+                sends: track.sends.clone(),
+                gain: track.gain,
+                pan: track.pan,
+                muted: track.muted,
+                soloed: track.soloed,
+            })
+            .collect()
     }
 
     /// 今載っている音源を全部降ろす (プロジェクトを開く前の片付け)
     fn unload_all_plugins(&mut self) {
-        let Some(engine) = &mut self.engine else {
-            return;
-        };
-        for track in 0..self.tracks.len() {
-            if let Some(previous) = self.tracks[track].take() {
-                if let Some(index) = graph::audio_track_for(track) {
-                    // 画面から作れるのはまだ1段だけ
+        for track in 0..self.audio_tracks.len() {
+            // **後ろの段から外す。** 前から外すと後ろが繰り上がって番号がずれる
+            for at in (0..self.audio_tracks[track].nodes.len()).rev() {
+                let previous = self.audio_tracks[track].nodes.remove(at);
+                self.retiring.push_back((track, previous));
+                if let Some(engine) = self.engine.as_mut() {
                     let _ = engine.producer.push(GuiMsg::RemoveNode {
-                        addr: audio::NodeAddr {
-                            track: index,
-                            at: 0,
-                        },
+                        addr: audio::NodeAddr { track, at },
                     });
                 }
-                // 処理器が返ってくるまで生かしておく (解放はメインスレッド)
-                self.retiring.push_back((track, previous));
             }
         }
     }
 
-    /// プロジェクトに書かれていた音源を読み直す。
-    /// 失敗したトラックの説明を返す (そのトラックは音源なしのままになる)。
-    ///
-    /// **画面が扱えるのはまだ「打ち込み1本につき音源1つ」。** チェーンの2段目
-    /// 以降が書かれていても載せられないので、名指しで知らせる (黙って捨てない)。
+    /// プロジェクトに書かれていた音源とルーティングを読み直す。
+    /// 失敗した段の説明を返す (その段は音源なしのままになる)。
     fn restore_audio_tracks(&mut self, tracks: Vec<project::AudioTrackSnapshot>) -> Vec<String> {
+        self.ensure_audio_tracks();
         self.unload_all_plugins();
 
+        // **繋ぎ方と音量はファイルのものを使う。** 検証は読み込みで済んでいる
+        for (index, track) in tracks.iter().enumerate().take(graph::AUDIO_TRACKS) {
+            let slot = &mut self.audio_tracks[index];
+            slot.midi_track = track.midi_track;
+            slot.sends = track.sends.clone();
+            slot.gain = track.gain;
+            slot.pan = track.pan;
+            slot.muted = track.muted;
+            slot.soloed = track.soloed;
+        }
+
         let mut failures = Vec::new();
-        for (index, track) in tracks.into_iter().enumerate() {
-            let Some(plugin) = track.nodes.first().cloned() else {
-                continue;
-            };
-            // 打ち込みトラックが書かれていなければ、番号から割り出す
-            let midi_track = track
-                .midi_track
-                .or_else(|| graph::midi_track_for(index))
-                .unwrap_or(0);
-            let label = file_label(&plugin.path);
-
-            if track.nodes.len() > 1 {
-                failures.push(format!(
-                    "・オーディオトラック {index}: {} 段のうち先頭だけ載せました \
-                     (画面はまだ1段しか扱えません)",
-                    track.nodes.len()
-                ));
+        for (index, track) in tracks.into_iter().enumerate().take(graph::AUDIO_TRACKS) {
+            for (at, plugin) in track.nodes.into_iter().enumerate() {
+                let label = file_label(&plugin.path);
+                let addr = audio::NodeAddr { track: index, at };
+                match self.load_plugin(
+                    addr,
+                    plugin.kind,
+                    &plugin.path,
+                    &plugin.id,
+                    Some(&plugin.state),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => failures.push(format!(
+                        "・オーディオトラック {index} の {} 段目: {label} は読み込めましたが、\
+                         音作りの復元に失敗しました",
+                        at + 1
+                    )),
+                    Err(e) => failures.push(format!(
+                        "・オーディオトラック {index} の {} 段目: {label} — {e}",
+                        at + 1
+                    )),
+                }
+                // バイパスは載せたあとに伝える
+                if plugin.bypassed {
+                    self.set_bypassed(addr, true);
+                }
             }
-
-            match self.load_plugin(
-                midi_track,
-                plugin.kind,
-                &plugin.path,
-                &plugin.id,
-                Some(&plugin.state),
-            ) {
-                Ok(true) => {}
-                Ok(false) => failures.push(format!(
-                    "・トラック {}: {label} は読み込めましたが、音作りの復元に失敗しました",
-                    midi_track + 1
-                )),
-                Err(e) => failures.push(format!("・トラック {}: {label} — {e}", midi_track + 1)),
-            }
+            // MIDI の割り当てをオーディオスレッドへ伝える
+            let midi_track = self.audio_tracks[index].midi_track;
+            self.set_midi_track(index, midi_track);
         }
         failures
     }
@@ -1628,6 +2073,19 @@ fn instantiate_clap(
         &host_info,
     )?;
 
+    // **activate の前に数える。** 画面に「どこでステレオが潰れるか」を出すため
+    let channels = {
+        let inputs = audio::config::get_config_from_ports(&mut instance.plugin_handle(), true);
+        let outputs = audio::config::get_config_from_ports(&mut instance.plugin_handle(), false);
+        let main = |config: &audio::config::PluginAudioPortsConfig| {
+            config
+                .ports
+                .get(config.main_port_index as usize)
+                .map_or(0, |port| port.port_layout.channel_count())
+        };
+        (main(&inputs), main(&outputs))
+    };
+
     let node = audio::activate_node(&mut instance, stream_config)?;
     let params = params::read_params(&mut instance);
 
@@ -1641,6 +2099,8 @@ fn instantiate_clap(
             path: path.to_path_buf(),
             id: plugin_id.to_string(),
             pressed_keys: HashSet::new(),
+            bypassed: false,
+            channels,
             plugin: TrackPlugin::Clap(ClapTrack {
                 instance,
                 receiver,
@@ -1665,6 +2125,13 @@ fn instantiate_vst3(
 ) -> Result<(TrackAudio, audio::Node), Box<dyn Error>> {
     let (plugin, node) = audio::activate_vst3_node(path, class_id, stream_config)?;
 
+    // 入力側は `vst3-host` に問い合わせる術が無く、こちらが要求した数になる
+    // (`audio::activate_vst3_node` の説明を参照)
+    let channels = (
+        graph::BUS_CHANNELS as u16,
+        plugin.lock().output_channel_count() as u16,
+    );
+
     let gui = Vst3GuiManager::new(&plugin.lock());
     let (sender, receiver) = crossbeam_channel::unbounded();
 
@@ -1674,6 +2141,8 @@ fn instantiate_vst3(
             path: path.to_path_buf(),
             id: class_id.to_string(),
             pressed_keys: HashSet::new(),
+            bypassed: false,
+            channels,
             plugin: TrackPlugin::Vst3(Vst3Track {
                 plugin,
                 receiver,
@@ -1703,15 +2172,23 @@ impl eframe::App for App {
 
             match found {
                 Ok(plugins) => {
+                    // 検証用 CLI なので、オーディオトラック1 の先頭に載せて
+                    // 打ち込みトラック1 を鳴らす形に決め打ちする
+                    let addr = audio::NodeAddr { track: 1, at: 0 };
                     self.candidates = Some(Candidates {
                         kind,
                         path,
                         plugins,
-                        target_track: 0,
+                        target_track: addr,
                     });
-                    self.instantiate(0, 0);
+                    self.instantiate(0, addr);
+                    self.set_midi_track(1, Some(0));
                     if open_gui {
-                        if let Some(Some(track)) = self.tracks.get_mut(0) {
+                        if let Some(track) = self
+                            .audio_tracks
+                            .get_mut(1)
+                            .and_then(|slot| slot.nodes.first_mut())
+                        {
                             let name = track.name.clone();
                             let opened = match &mut track.plugin {
                                 TrackPlugin::Clap(clap) => clap.gui.as_mut().map(|gui| {
@@ -1740,7 +2217,11 @@ impl eframe::App for App {
         self.drain_retired();
 
         // プラグインからのメインスレッド要求 & GUI ウィンドウイベントを処理
-        for track in self.tracks.iter_mut().flatten() {
+        for track in self
+            .audio_tracks
+            .iter_mut()
+            .flat_map(|slot| slot.nodes.iter_mut())
+        {
             let clap = match &mut track.plugin {
                 TrackPlugin::Clap(clap) => clap,
                 TrackPlugin::Vst3(vst3) => {
@@ -1832,7 +2313,11 @@ impl eframe::App for App {
             let mut chosen_kind = None;
             if let Some(track) = self.pending_load {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("トラック {} に読み込む音源の形式:", track + 1));
+                    ui.label(format!(
+                        "オーディオトラック {} の {} 段目に読み込む音源の形式:",
+                        track.track,
+                        track.at + 1
+                    ));
                     if ui.button("CLAP (.clap ファイル)").clicked() {
                         chosen_kind = Some(LoadChoice::Clap);
                     }
@@ -1860,7 +2345,7 @@ impl eframe::App for App {
             }
 
             // プラグイン選択。1つの .clap に複数入っていて、まだ選んでいないときだけ出す
-            // (1つだけのファイルはトラック欄の「♪」でそのまま載るので出さない)。
+            // (1つだけのファイルは選ばせずにそのまま載るので出さない)。
             let mut instantiate_index = None;
             if let Some(candidates) = self
                 .candidates
@@ -1869,8 +2354,9 @@ impl eframe::App for App {
             {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
-                        "トラック {} に読み込むプラグインを選択 ({}):",
-                        candidates.target_track + 1,
+                        "オーディオトラック {} の {} 段目に読み込むプラグインを選択 ({}):",
+                        candidates.target_track.track,
+                        candidates.target_track.at + 1,
                         file_label(&candidates.path)
                     ));
                     for (i, plugin) in candidates.plugins.iter().enumerate() {
@@ -1884,75 +2370,14 @@ impl eframe::App for App {
                 });
             }
             if let Some(i) = instantiate_index {
-                let track = self.candidates.as_ref().map_or(0, |c| c.target_track);
-                self.instantiate(i, track);
+                if let Some(track) = self.candidates.as_ref().map(|c| c.target_track) {
+                    self.instantiate(i, track);
+                }
                 // 選び終わったら候補を片付ける (選択行を残さない)
                 self.candidates = None;
             }
 
-            // ロード済みプラグインの操作 UI (トラックごと)
-            let mut gui_error = None;
-            for (index, track) in self.tracks.iter_mut().enumerate() {
-                let Some(track) = track else { continue };
-                ui.horizontal(|ui| {
-                    ui.label(format!("トラック {}: {}", index + 1, track.name));
-
-                    match &mut track.plugin {
-                        // プラグイン独自 GUI の開閉ボタン
-                        TrackPlugin::Clap(clap) => {
-                            if let Some(gui) = &mut clap.gui {
-                                if gui.supports_gui() {
-                                    if !gui.is_open {
-                                        let label = if gui.is_floating() {
-                                            "エディタを開く (floating)"
-                                        } else {
-                                            "エディタを開く"
-                                        };
-                                        if ui.button(label).clicked() {
-                                            if let Err(e) = gui.open(
-                                                &mut clap.instance.plugin_handle(),
-                                                &track.name,
-                                                clap.sender.clone(),
-                                            ) {
-                                                gui_error =
-                                                    Some(format!("GUI を開けません: {e}"));
-                                            }
-                                        }
-                                    } else if ui.button("エディタを閉じる").clicked() {
-                                        gui.close(&mut clap.instance.plugin_handle());
-                                    }
-                                }
-                            }
-                        }
-                        TrackPlugin::Vst3(vst3) => {
-                            ui.weak("VST3");
-                            if vst3.gui.supports_gui() {
-                                if !vst3.gui.is_open {
-                                    if ui.button("エディタを開く").clicked() {
-                                        let mut plugin = vst3.plugin.lock();
-                                        if let Err(e) = vst3.gui.open(
-                                            &mut plugin,
-                                            &track.name,
-                                            vst3.sender.clone(),
-                                        ) {
-                                            gui_error = Some(format!("GUI を開けません: {e}"));
-                                        }
-                                    }
-                                } else if ui.button("エディタを閉じる").clicked() {
-                                    let mut plugin = vst3.plugin.lock();
-                                    vst3.gui.close(&mut plugin);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            if gui_error.is_some() {
-                self.error = gui_error;
-            }
-            if !self.tracks.iter().flatten().count() == 0 {
-                ui.add_space(8.0);
-            }
+            // 音源の操作はオーディオトラックの窓へ移した (下の `audio_track_windows`)
             {
 
                 // パラメータ汎用エディタ (一時的に無効化中)
@@ -2030,8 +2455,11 @@ impl eframe::App for App {
                 */
             }
 
-            if self.tracks.iter().flatten().count() == 0 {
-                ui.label("音色となるプラグインが未ロードです (左のトラック欄の「♪」から .clap を選択)。ロードしなくてもシーケンスの編集はできます。");
+            if self.audio_tracks.iter().all(|track| track.nodes.is_empty()) {
+                ui.label(
+                    "音源が未ロードです (「オーディオトラック」の窓から載せてください)。\
+                     ロードしなくてもシーケンスの編集はできます。",
+                );
                 ui.add_space(8.0);
             }
 
@@ -2054,13 +2482,19 @@ impl eframe::App for App {
                 None => false,
             };
 
-            // トラック欄に出す音源名を渡す
+            // 打ち込みトラック欄に出す情報。**どのオーディオトラックが
+            // その打ち込みを見ているか**を集める。誰も見ていなければ鳴らないので、
+            // 欄に赤枠を出す材料になる
             self.editor.track_plugins = (0..self.editor.editor.track_count())
-                .map(|track| {
-                    self.tracks
-                        .get(track)
-                        .and_then(|slot| slot.as_ref())
-                        .map(|audio| audio.name.clone())
+                .map(|midi_track| {
+                    let users: Vec<String> = self
+                        .audio_tracks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, slot)| slot.midi_track == Some(midi_track))
+                        .map(|(index, slot)| format!("{index}: {}", slot.label()))
+                        .collect();
+                    (!users.is_empty()).then(|| users.join(" / "))
                 })
                 .collect();
 
@@ -2077,13 +2511,10 @@ impl eframe::App for App {
                     EditorCommand::ExportMidi => file_action = Some(FileAction::ExportMidi),
                     EditorCommand::OpenProject => file_action = Some(FileAction::OpenProject),
                     EditorCommand::SaveProject => file_action = Some(FileAction::SaveProject),
-                    EditorCommand::SaveProjectAs => {
-                        file_action = Some(FileAction::SaveProjectAs)
-                    }
+                    EditorCommand::SaveProjectAs => file_action = Some(FileAction::SaveProjectAs),
                     EditorCommand::ExportWav => file_action = Some(FileAction::ExportWav),
                     EditorCommand::ExportOpus => file_action = Some(FileAction::ExportOpus),
                     EditorCommand::ExportCcs => file_action = Some(FileAction::ExportCcs),
-                    EditorCommand::LoadPlugin { track } => load_plugin_track = Some(track),
                     // エンジンが無いときは送り先がないので、再生ヘッドの移動だけ
                     // 自前で処理する。ロード時に位置とシーケンスを送り直す。
                     EditorCommand::Seek { quarters } if self.engine.is_none() => {
@@ -2096,9 +2527,9 @@ impl eframe::App for App {
                         let msg = match command {
                             EditorCommand::Commit => {
                                 // トラックごとに分けて送る (音源が別々のため)
-                                let end_sample =
-                                    (self.editor.editor.length_quarters_bar_aligned() as f64 * spq)
-                                        as u64;
+                                let end_sample = (self.editor.editor.length_quarters_bar_aligned()
+                                    as f64
+                                    * spq) as u64;
                                 for track in 0..self.editor.editor.track_count() {
                                     // ミュート/ソロで鳴らさないトラックは空にして送る
                                     // (再生中でも即座に止まる)
@@ -2138,8 +2569,7 @@ impl eframe::App for App {
                             | EditorCommand::SaveProjectAs
                             | EditorCommand::ExportWav
                             | EditorCommand::ExportOpus
-                            | EditorCommand::ExportCcs
-                            | EditorCommand::LoadPlugin { .. } => continue,
+                            | EditorCommand::ExportCcs => continue,
                         };
                         let _ = engine.producer.push(msg);
                     }
@@ -2158,7 +2588,12 @@ impl eframe::App for App {
                 None => {}
             }
 
-            // トラック欄の「♪」。まず形式を聞く行を出す
+            // オーディオトラックの窓 (一覧は常設、詳細は選んだ1本だけ)
+            if let Some(addr) = self.audio_track_windows(ui.ctx()) {
+                load_plugin_track = Some(addr);
+            }
+
+            // 詳細ウィンドウの「+」。まず形式を聞く行を出す
             if let Some(track) = load_plugin_track {
                 self.pending_load = Some(track);
                 self.candidates = None;
@@ -2167,7 +2602,9 @@ impl eframe::App for App {
             // 形式が決まったらダイアログを開く。
             // 新しく読み込めたときだけ装填する (キャンセルでは何もしない)
             if let Some(chosen) = chosen_kind {
-                let track = self.pending_load.take().unwrap_or(0);
+                let Some(track) = self.pending_load.take() else {
+                    return;
+                };
                 let opened = match chosen {
                     LoadChoice::Clap => self.open_clap_dialog(track),
                     LoadChoice::Vst3Bundle => self.open_vst3_dialog(track, true),
