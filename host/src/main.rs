@@ -161,7 +161,13 @@ struct AudioTrackUi {
     midi_track: Option<usize>,
     /// 送り先のオーディオトラック番号
     sends: Vec<usize>,
-    gain: f32,
+    /// 音量 (dB)。**画面と同じ単位で持つ。**
+    ///
+    /// エンジンとファイルは線形なので、境目で
+    /// [`db_to_linear`] / [`linear_to_db`] を通す。
+    /// dB で持つと **`Default` の 0 がそのまま「0 dB = 等倍」**になり、
+    /// 「既定値のつもりが無音」という取り違えが起きない。
+    gain_db: f32,
     /// `-1.0` (左) 〜 `1.0` (右)
     pan: f32,
     muted: bool,
@@ -177,7 +183,6 @@ impl AudioTrackUi {
             } else {
                 vec![graph::MASTER]
             },
-            gain: 1.0,
             ..Default::default()
         }
     }
@@ -384,6 +389,29 @@ const TRACK_SENDS_W: f32 = 74.0;
 /// 詳細ウィンドウで、段の名前とチャンネル表記に取る幅 (理由は上と同じ)
 const NODE_NAME_W: f32 = 150.0;
 const NODE_CHANNELS_W: f32 = 56.0;
+
+/// 音量つまみの下限 (dB)。**ここまで下げたら無音として扱う。**
+///
+/// 対数なので本当の無音は -∞ になる。下限を決めて、そこを無音に割り当てる。
+const MIN_GAIN_DB: f32 = -60.0;
+/// 音量つまみの上限 (dB)
+const MAX_GAIN_DB: f32 = 12.0;
+
+/// dB を線形の係数へ。**下限まで下げたら 0 (無音)**
+fn db_to_linear(db: f32) -> f32 {
+    if !db.is_finite() || db <= MIN_GAIN_DB {
+        return 0.0;
+    }
+    10f32.powf(db / 20.0)
+}
+
+/// 線形の係数を dB へ ([`db_to_linear`] の逆)
+fn linear_to_db(linear: f32) -> f32 {
+    if !linear.is_finite() || linear <= 0.0 {
+        return MIN_GAIN_DB;
+    }
+    (20.0 * linear.log10()).clamp(MIN_GAIN_DB, MAX_GAIN_DB)
+}
 
 /// 「♪」で聞く音源の選び方。
 ///
@@ -790,7 +818,8 @@ impl App {
             .take(graph::AUDIO_TRACKS)
             .enumerate()
         {
-            gain[index] = track.gain;
+            // エンジンは線形で受け取る
+            gain[index] = db_to_linear(track.gain_db);
             pan[index] = track.pan;
             if track.muted {
                 muted |= 1 << index;
@@ -1841,11 +1870,19 @@ impl App {
                                     open_detail = Some(index);
                                 }
 
-                                // 送り先。マスターは送り側にならないので出さないが、
-                                // **場所は空けておく** (列がずれないように)
-                                if index == graph::MASTER {
-                                    ui.add_space(TRACK_SENDS_W + ui.spacing().item_spacing.x);
-                                } else {
+                                // 送り先。マスターは送り側にならないので中身は出さない。
+                                //
+                                // **どちらの枝も同じ大きさを確保する。** `allocate_ui`
+                                // は中身に合わせて縮むので、ボタンの幅 (「→ 0」と
+                                // 「→ 0,3」で違う) に引きずられて後ろの列がずれる。
+                                // `set_min_width` で下限を揃える
+                                let sends_size = egui::vec2(TRACK_SENDS_W, 20.0);
+                                let layout = egui::Layout::left_to_right(egui::Align::Center);
+                                ui.allocate_ui_with_layout(sends_size, layout, |ui| {
+                                    ui.set_min_width(TRACK_SENDS_W);
+                                    if index == graph::MASTER {
+                                        return;
+                                    }
                                     let label = if track.sends.is_empty() {
                                         "→ なし".to_string()
                                     } else {
@@ -1854,34 +1891,38 @@ impl App {
                                         format!("→ {}", list.join(","))
                                     };
                                     let sends = &track.sends;
-                                    ui.allocate_ui(egui::vec2(TRACK_SENDS_W, 20.0), |ui| {
-                                        ui.menu_button(label, |ui| {
-                                            for target in 0..graph::AUDIO_TRACKS {
-                                                if target == index {
-                                                    continue;
-                                                }
-                                                let mut on = sends.contains(&target);
-                                                if ui
-                                                    .checkbox(&mut on, format!("{target}"))
-                                                    .changed()
-                                                {
-                                                    toggle_send = Some((index, target));
-                                                }
+                                    ui.menu_button(label, |ui| {
+                                        for target in 0..graph::AUDIO_TRACKS {
+                                            if target == index {
+                                                continue;
                                             }
-                                        })
-                                        .response
-                                        .on_hover_text("送り先 (複数選ぶと足し合わさる)");
-                                    });
-                                }
+                                            let mut on = sends.contains(&target);
+                                            if ui.checkbox(&mut on, format!("{target}")).changed() {
+                                                toggle_send = Some((index, target));
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("送り先 (複数選ぶと足し合わさる)");
+                                });
 
-                                // 音量とパン
+                                // 音量 (dB)。下限まで下げると無音
                                 if ui
                                     .add(
-                                        egui::DragValue::new(&mut track.gain)
-                                            .speed(0.01)
-                                            .range(0.0..=2.0)
-                                            .prefix("×"),
+                                        egui::DragValue::new(&mut track.gain_db)
+                                            .speed(0.1)
+                                            .range(MIN_GAIN_DB..=MAX_GAIN_DB)
+                                            .fixed_decimals(1)
+                                            .suffix(" dB")
+                                            .custom_formatter(|value, _| {
+                                                if value as f32 <= MIN_GAIN_DB {
+                                                    "-∞".to_string()
+                                                } else {
+                                                    format!("{value:+.1}")
+                                                }
+                                            }),
                                     )
+                                    .on_hover_text("音量 (0 dB が等倍。下限まで下げると無音)")
                                     .changed()
                                 {
                                     mixer_changed = true;
@@ -2166,7 +2207,8 @@ impl App {
                 // **繋ぎ方と音量は音源の有無と無関係。** 空のトラックのぶんも残す
                 // (繋ぎ替えてから音源を外しても、繋ぎ方は保たれる)
                 sends: track.sends.clone(),
-                gain: track.gain,
+                // ファイルは線形で持つ (画面と単位を分ける)
+                gain: db_to_linear(track.gain_db),
                 pan: track.pan,
                 muted: track.muted,
                 soloed: track.soloed,
@@ -2201,7 +2243,7 @@ impl App {
             let slot = &mut self.audio_tracks[index];
             slot.midi_track = track.midi_track;
             slot.sends = track.sends.clone();
-            slot.gain = track.gain;
+            slot.gain_db = linear_to_db(track.gain);
             slot.pan = track.pan;
             slot.muted = track.muted;
             slot.soloed = track.soloed;
@@ -2823,5 +2865,60 @@ impl eframe::App for App {
         // エディタを開いていないときは誰も割を食わないので、そのまま滑らかに保つ。
         let interval = if self.any_editor_open() { 33 } else { 16 };
         ctx.request_repaint_after(Duration::from_millis(interval));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **既定 (0 dB) が等倍であること。**
+    ///
+    /// ここがずれると、何も触っていないトラックの音量が変わる。
+    /// 以前パンの既定で -3dB 落ちる不具合を入れているので、必ず縛っておく。
+    #[test]
+    fn zero_db_is_unity() {
+        assert!((db_to_linear(0.0) - 1.0).abs() < 1e-6);
+        assert!(linear_to_db(1.0).abs() < 1e-4);
+    }
+
+    /// `AudioTrackUi` の既定がそのまま 0 dB になること。
+    /// (線形で持っていた頃は `Default` の 0.0 が無音を意味していた)
+    #[test]
+    fn default_track_is_unity() {
+        let track = AudioTrackUi::new(1);
+        assert_eq!(track.gain_db, 0.0);
+        assert!((db_to_linear(track.gain_db) - 1.0).abs() < 1e-6);
+    }
+
+    /// dB と線形が往復すること (画面・エンジン・ファイルで単位が違うため)
+    #[test]
+    fn db_and_linear_round_trip() {
+        for db in [-48.0, -24.0, -6.0, 0.0, 6.0, 12.0] {
+            let back = linear_to_db(db_to_linear(db));
+            assert!((back - db).abs() < 1e-3, "{db} dB が {back} dB に化けた");
+        }
+    }
+
+    /// -6 dB がおよそ半分、+6 dB がおよそ倍になること
+    #[test]
+    fn six_db_halves_and_doubles() {
+        assert!((db_to_linear(-6.0) - 0.501).abs() < 0.01);
+        assert!((db_to_linear(6.0) - 1.995).abs() < 0.01);
+    }
+
+    /// 下限まで下げたら無音になること (対数なので本当の 0 は表せない)
+    #[test]
+    fn the_bottom_of_the_range_is_silence() {
+        assert_eq!(db_to_linear(MIN_GAIN_DB), 0.0);
+        assert_eq!(db_to_linear(MIN_GAIN_DB - 10.0), 0.0);
+        assert_eq!(linear_to_db(0.0), MIN_GAIN_DB);
+    }
+
+    /// NaN を通さないこと (以降の計算すべてに波及する)
+    #[test]
+    fn broken_values_fall_back_to_silence() {
+        assert_eq!(db_to_linear(f32::NAN), 0.0);
+        assert_eq!(linear_to_db(f32::NAN), MIN_GAIN_DB);
     }
 }
