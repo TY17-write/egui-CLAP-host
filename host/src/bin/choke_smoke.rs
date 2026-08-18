@@ -7,15 +7,15 @@
 //! プラグインがそれを処理するかの両方で決まる。ここは後者を落とさないための検証。
 //! (プラグインが NoteChoke を無視すると、ホストが正しくても鳴りっぱなしになる)
 //!
-//! 使い方: cargo run -p clap-host-test --bin choke_smoke -- <path\to\plugin.clap>
+//! 使い方: cargo run -p egui-clap-host --bin choke_smoke -- <path\to\plugin.clap>
 
 use clack_host::prelude::*;
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::transport::{self, Transport, TransportMsg, TransportShared};
-use clap_host_test::audio::{self, TrackProcessor};
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::sequencer::{MidiEditor, Note};
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::transport::{self, Transport, TransportMsg, TransportShared};
+use egui_clap_host::audio::{self, TrackProcessor};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::sequencer::{MidiEditor, Note};
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let host_info = HostInfo::new(
         "Choke Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

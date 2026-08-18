@@ -6,17 +6,17 @@
 //! 「鳴るべき区間で鳴り、休符区間は無音」「末尾の無音が落ちている」
 //! 「WAV のヘッダが中身と一致する」をサンプル位置で検証する。
 //!
-//! 使い方: cargo run -p clap-host-test --bin wav_smoke -- <path\to\plugin.clap> [out.wav]
+//! 使い方: cargo run -p egui-clap-host --bin wav_smoke -- <path\to\plugin.clap> [out.wav]
 
 use clack_host::prelude::*;
-use clap_host_test::audio::activate_node;
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::graph::{self, Graph};
-use clap_host_test::audio::offline::{self, RenderSetup};
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::sequencer::{MidiEditor, Note};
-use clap_host_test::wav;
+use egui_clap_host::audio::activate_node;
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::graph::{self, Graph};
+use egui_clap_host::audio::offline::{self, RenderSetup};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::sequencer::{MidiEditor, Note};
+use egui_clap_host::wav;
 use std::error::Error;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 使い終わった処理器はメインスレッドで停止・解放する
     for ((_, node), mut instance) in graph.take_nodes().into_iter().zip(instances) {
-        let clap_host_test::audio::RetiredProcessor::Clap(stopped) = node.into_retired() else {
+        let egui_clap_host::audio::RetiredProcessor::Clap(stopped) = node.into_retired() else {
             return Err("CLAP を載せたのに別形式が返ってきた".into());
         };
         instance.deactivate(stopped);
@@ -201,7 +201,7 @@ fn instantiate(
 ) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
     let host_info = HostInfo::new(
         "WAV Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

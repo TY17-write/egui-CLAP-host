@@ -25,7 +25,7 @@
 //! cargo run --release --bin opus_smoke
 //! ```
 
-use clap_host_test::opus;
+use egui_clap_host::opus;
 
 /// 本体のメインスレッドと同じ細さ (Windows の既定)
 const DEFAULT_STACK: usize = 1024 * 1024;

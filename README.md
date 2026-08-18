@@ -1,8 +1,8 @@
-# clap-host-test
+# egui-CLAP-host
 
-Rust + egui で CLAP (CLever Audio Plug-in) と VST3 をロードして鳴らす、マルチトラックのミニホスト。
-トラックごとに別々の音源を読み込み、1つの再生ヘッドで同期して再生できる。
-CLAP と VST3 はトラック単位で混在でき、どちらも音源独自のエディタを開ける。
+Rust + egui で CLAP (CLever Audio Plug-in) と VST3 をロードして鳴らす、マルチトラックのホスト。
+オーディオトラックごとに音源とエフェクトを重ね、トラック同士を自由に繋いで鳴らせる。
+CLAP と VST3 は同じチェーンの中で混在でき、どちらも音源独自のエディタを開ける。
 
 > **このリポジトリのコードは Claude Opus 5 (Anthropic) が作成しました。**
 > 設計方針の決定・仕様の判断・動作確認は人間が行い、実装とドキュメントは対話しながら生成しています。
@@ -59,7 +59,7 @@ MIT のまま VST3 対応にできています (`vst3-host` → `vst3` → SDK �
 
 | クレート | 内容 |
 |---|---|
-| `host` | ミニホスト本体 (egui GUI + cpal オーディオ出力 + clack-host + vst3-host) |
+| `host` | ホスト本体 (egui GUI + cpal オーディオ出力 + clack-host + vst3-host)。パッケージ名は `egui-clap-host` |
 | `test-plugin` | テスト用のサイン波シンセ CLAP プラグイン (16ボイス、Volume パラメータ、ベロシティ対応) |
 | `spike/vst3` | VST3 に進めるかを確かめた実験用クレート (親のワークスペースからは切り離してある) |
 | `spike/opus` | Ogg/Opus の書き出しを確かめた実験用クレート (同上)。`opus-rs` の不具合を測って上流へ報告した検証コードも置いてある |
@@ -80,10 +80,10 @@ Remove-Item target\debug\test_plugin.clap -ErrorAction SilentlyContinue
 Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap
 
 # GUI ホストを起動 (--bin の指定が必要。検証用バイナリも同居しているため)
-cargo run -p clap-host-test --bin clap-host-test -- target\debug\test_plugin.clap
+cargo run -p egui-clap-host --bin egui-clap-host -- target\debug\test_plugin.clap
 
 # ユニットテスト
-cargo test -p clap-host-test --lib
+cargo test -p egui-clap-host --lib
 ```
 
 引数なしでも起動でき、あとから画面上で音源を読み込めます。

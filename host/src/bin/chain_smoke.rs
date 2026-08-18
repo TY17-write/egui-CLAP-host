@@ -23,20 +23,20 @@
 //! チャンネルごとの `Vec`) ので、片方が通っても他方は分からない。
 //!
 //! ```text
-//! cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap
+//! cargo run -p egui-clap-host --bin chain_smoke -- target\debug\test_plugin.clap
 //!
 //! # VST3 も見る (clap-wrapper で作った test_plugin.vst3。作り方は guide.md)
 //! $env:CLAP_PATH = "$PWD\target\debug"
-//! cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
+//! cargo run -p egui-clap-host --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
 //! ```
 
 use clack_host::prelude::*;
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::events::BlockEvent;
-use clap_host_test::audio::{self, TrackProcessor};
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::params;
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::events::BlockEvent;
+use egui_clap_host::audio::{self, TrackProcessor};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::params;
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -309,7 +309,7 @@ fn run_chain(
 fn instantiate(entry: &PluginEntry, id: &str) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
     let host_info = HostInfo::new(
         "Chain Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

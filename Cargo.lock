@@ -781,29 +781,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clap-host-test"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clack-extensions",
- "clack-host",
- "cpal",
- "crossbeam-channel",
- "eframe",
- "midly",
- "ogg",
- "opus-rs",
- "quick-xml 0.37.5",
- "rfd",
- "ron",
- "rtrb",
- "serde",
- "uuid",
- "vst3-host",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "clap-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1145,6 +1122,29 @@ dependencies = [
  "log",
  "nohash-hasher",
  "profiling",
+]
+
+[[package]]
+name = "egui-clap-host"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clack-extensions",
+ "clack-host",
+ "cpal",
+ "crossbeam-channel",
+ "eframe",
+ "midly",
+ "ogg",
+ "opus-rs",
+ "quick-xml 0.37.5",
+ "rfd",
+ "ron",
+ "rtrb",
+ "serde",
+ "uuid",
+ "vst3-host",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

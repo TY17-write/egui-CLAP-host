@@ -6,15 +6,15 @@
 //! `TrackProcessor`) を通す。手組みの並行実装を持つと、抽象化を変えたときに
 //! ここだけ古い形のまま通ってしまう。
 //!
-//! 使い方: cargo run -p clap-host-test --bin seq_smoke -- <path\to\plugin.clap>
+//! 使い方: cargo run -p egui-clap-host --bin seq_smoke -- <path\to\plugin.clap>
 
 use clack_host::prelude::*;
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::transport::{Transport, TransportMsg, TransportShared};
-use clap_host_test::audio::{self, TrackProcessor};
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::sequencer::{MidiEditor, Note};
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::transport::{Transport, TransportMsg, TransportShared};
+use egui_clap_host::audio::{self, TrackProcessor};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::sequencer::{MidiEditor, Note};
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let host_info = HostInfo::new(
         "Seq Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

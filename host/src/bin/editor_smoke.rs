@@ -11,16 +11,16 @@
 //! 出力の最後の行は必ず `RESULT <状態> <詳細>` の形にしてあり、
 //! 総なめの結果を機械的に集計できる。
 //!
-//! 使い方: cargo run -p clap-host-test --bin editor_smoke -- <path\to\plugin.vst3>
+//! 使い方: cargo run -p egui-clap-host --bin editor_smoke -- <path\to\plugin.vst3>
 
 #![allow(unsafe_code)]
 
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::vst3::SharedPlugin;
-use clap_host_test::audio::{self};
-use clap_host_test::discovery;
-use clap_host_test::gui::Vst3GuiManager;
-use clap_host_test::host::MainThreadMessage;
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::vst3::SharedPlugin;
+use egui_clap_host::audio::{self};
+use egui_clap_host::discovery;
+use egui_clap_host::gui::Vst3GuiManager;
+use egui_clap_host::host::MainThreadMessage;
 use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};

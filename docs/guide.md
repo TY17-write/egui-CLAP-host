@@ -24,10 +24,10 @@ Remove-Item target\debug\test_plugin.clap -ErrorAction SilentlyContinue
 Copy-Item target\debug\test_plugin.dll target\debug\test_plugin.clap
 
 # GUI ホストを起動 (--bin の指定が必要。smoke 系のバイナリも同居しているため)
-cargo run -p clap-host-test --bin clap-host-test -- target\debug\test_plugin.clap
+cargo run -p egui-clap-host --bin egui-clap-host -- target\debug\test_plugin.clap
 
 # 実プラグインで起動する
-cargo run -p clap-host-test --bin clap-host-test -- "<音源へのパス>.clap"
+cargo run -p egui-clap-host --bin egui-clap-host -- "<音源へのパス>.clap"
 ```
 
 引数なしでも起動でき、あとから画面上で音源を読み込める。
@@ -37,35 +37,35 @@ cargo run -p clap-host-test --bin clap-host-test -- "<音源へのパス>.clap"
 `host/src/bin/` に**オーディオデバイス不要**の検証バイナリが並ぶ。
 
 ```powershell
-cargo run -p clap-host-test --bin smoke -- target\debug\test_plugin.clap       # ロード→発音→波形確認
-cargo run -p clap-host-test --bin seq_smoke -- target\debug\test_plugin.clap   # 再生エンジンの検証
-cargo run -p clap-host-test --bin wav_smoke -- target\debug\test_plugin.clap   # WAV 書き出しの検証
-cargo run -p clap-host-test --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
-cargo run -p clap-host-test --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
-cargo run -p clap-host-test --bin gain_smoke -- target\debug\test_plugin.clap  # 検証用エフェクトの挙動確認
-cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap # 音源→エフェクトのチェーンの検証
-cargo run -p clap-host-test --bin route_smoke -- target\debug\test_plugin.clap # トラック間のルーティングの検証
+cargo run -p egui-clap-host --bin smoke -- target\debug\test_plugin.clap       # ロード→発音→波形確認
+cargo run -p egui-clap-host --bin seq_smoke -- target\debug\test_plugin.clap   # 再生エンジンの検証
+cargo run -p egui-clap-host --bin wav_smoke -- target\debug\test_plugin.clap   # WAV 書き出しの検証
+cargo run -p egui-clap-host --bin choke_smoke -- target\debug\test_plugin.clap # 停止・シークで音が止まるかの検証
+cargo run -p egui-clap-host --bin state_smoke -- target\debug\test_plugin.clap # 音作りの保存・復元の検証
+cargo run -p egui-clap-host --bin gain_smoke -- target\debug\test_plugin.clap  # 検証用エフェクトの挙動確認
+cargo run -p egui-clap-host --bin chain_smoke -- target\debug\test_plugin.clap # 音源→エフェクトのチェーンの検証
+cargo run -p egui-clap-host --bin route_smoke -- target\debug\test_plugin.clap # トラック間のルーティングの検証
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
-cargo run -p clap-host-test --bin opus_smoke
-cargo run -p clap-host-test --bin opus_smoke -- 262144   # 256KiB のスレッドから呼ぶ
+cargo run -p egui-clap-host --bin opus_smoke
+cargo run -p egui-clap-host --bin opus_smoke -- 262144   # 256KiB のスレッドから呼ぶ
 
 # VST3 バックエンドの検証 (実物の .vst3 が要る。test-plugin は CLAP 専用のため)
-cargo run -p clap-host-test --bin vst3_smoke -- "<音源へのパス>.vst3"
+cargo run -p egui-clap-host --bin vst3_smoke -- "<音源へのパス>.vst3"
 
 # CLAP と VST3 を別トラックに載せた同時再生の検証
-cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap "<音源へのパス>.vst3"
+cargo run -p egui-clap-host --bin mixed_smoke -- target\debug\test_plugin.clap "<音源へのパス>.vst3"
 
 # VST3 のエディタを開けるかだけの検証 (音は鳴らさない。GUI ウィンドウが一瞬出る)
-cargo run -p clap-host-test --bin editor_smoke -- "<音源へのパス>.vst3"
+cargo run -p egui-clap-host --bin editor_smoke -- "<音源へのパス>.vst3"
 
 # エディタを開いたまま保持して手で触る (--busy でオーディオスレッド相当を並走、
 # --egui で本体と同じ eframe の窓を並べる。再描画まわりを触ったらこれで確認する)
-cargo run -p clap-host-test --bin editor_smoke -- "<音源へのパス>.vst3" --hold
-cargo run -p clap-host-test --bin editor_smoke -- "<音源へのパス>.vst3" --egui --repaint-ms 33
+cargo run -p egui-clap-host --bin editor_smoke -- "<音源へのパス>.vst3" --hold
+cargo run -p egui-clap-host --bin editor_smoke -- "<音源へのパス>.vst3" --egui --repaint-ms 33
 
 # ユニットテスト
-cargo test -p clap-host-test --lib
+cargo test -p egui-clap-host --lib
 ```
 
 ### test_plugin.clap には2つ入っている
@@ -106,7 +106,7 @@ VST3 版は**同名の .clap を CLAP の探索パスから探して読み込む
 
 ```powershell
 $env:CLAP_PATH = "$PWD\target\debug"
-cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3 --same-plugin
+cargo run -p egui-clap-host --bin mixed_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3 --same-plugin
 ```
 
 `--same-plugin` を付けると、片方だけ鳴る区間の音量が両形式で一致することまで
@@ -117,7 +117,7 @@ cargo run -p clap-host-test --bin mixed_smoke -- target\debug\test_plugin.clap t
 突き合わせられるので、チェーンの検証はこちらも通しておくとよい。
 
 ```powershell
-cargo run -p clap-host-test --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
+cargo run -p egui-clap-host --bin chain_smoke -- target\debug\test_plugin.clap target\test_plugin.vst3
 ```
 
 依存は VST3 SDK 3.8.0 の `base` / `public.sdk` / `pluginterfaces` / `cmake` だけを

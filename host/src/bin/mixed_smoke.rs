@@ -11,7 +11,7 @@
 //!   `TrackProcessor` しか見ないが、返し方 (`RetiredProcessor`) は形式ごとに違う
 //!
 //! 使い方:
-//!   cargo run -p clap-host-test --bin mixed_smoke -- <path\to\plugin.clap> <path\to\plugin.vst3> [--same-plugin]
+//!   cargo run -p egui-clap-host --bin mixed_smoke -- <path\to\plugin.clap> <path\to\plugin.vst3> [--same-plugin]
 //!
 //! `--same-plugin` は、2つが**同じ DSP の別形式**であるときに付ける
 //! (clap-wrapper で `test-plugin` を VST3 化したものなど。作り方は README を参照)。
@@ -23,14 +23,14 @@
 //! 渡しても通ってしまう** (実測: Surge XT と test-plugin は 1.1% しか違わなかった)。
 
 use clack_host::prelude::*;
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::graph::Graph;
-use clap_host_test::audio::offline::{self, RenderSetup};
-use clap_host_test::audio::transport::{Transport, TransportMsg, TransportShared};
-use clap_host_test::audio::{self};
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::sequencer::{MidiEditor, Note};
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::graph::Graph;
+use egui_clap_host::audio::offline::{self, RenderSetup};
+use egui_clap_host::audio::transport::{Transport, TransportMsg, TransportShared};
+use egui_clap_host::audio::{self};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::sequencer::{MidiEditor, Note};
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -313,7 +313,7 @@ fn instantiate_clap(
 ) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
     let host_info = HostInfo::new(
         "Mixed Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

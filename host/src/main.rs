@@ -1,4 +1,4 @@
-//! CLAP ミニホスト: .clap ファイルをロードして egui から鳴らすテスト用ホスト。
+//! egui-CLAP-host: CLAP / VST3 をロードして egui から鳴らすマルチトラックのホスト。
 
 // GUI アプリなので、起動時に黒いコンソールを出さない (Windows のみ効く)。
 // 引き換えに標準出力・標準エラーの行き先が無くなるため、cargo run で
@@ -6,7 +6,7 @@
 // smoke 系のバイナリはコンソールで使うものなので、こちらには付けない。
 //#![windows_subsystem = "windows"]
 
-use clap_host_test::{
+use egui_clap_host::{
     audio, ccs, discovery, editor_ui, gui, host, midi, opus, params, project, sequencer, theme, wav,
 };
 
@@ -51,7 +51,7 @@ const KEYS: [(u16, &str, bool); 13] = [
 ];
 
 fn main() -> eframe::Result {
-    // 検証用 CLI: clap-host-test.exe [plugin.clap] [--open-gui]
+    // 検証用 CLI: egui-clap-host.exe [plugin.clap] [--open-gui]
     let args: Vec<String> = std::env::args().skip(1).collect();
     let auto_open_gui = args.iter().any(|a| a == "--open-gui");
     let autoload_path = args
@@ -64,7 +64,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "CLAP ミニホスト",
+        "egui-CLAP-host",
         options,
         Box::new(move |cc| {
             setup_japanese_fonts(&cc.egui_ctx);
@@ -2333,8 +2333,8 @@ fn instantiate_clap(
     let (entry, _) = discovery::load_clap_file(path)?;
 
     let host_info = HostInfo::new(
-        "CLAP Mini Host",
-        "clap-host-test",
+        "egui-CLAP-host",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

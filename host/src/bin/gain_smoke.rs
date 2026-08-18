@@ -13,14 +13,14 @@
 //!    掛け算だけだと順序が結果に出ず、チェーンの順が守られているか分からない
 //!
 //! ```text
-//! cargo run -p clap-host-test --bin gain_smoke -- target\debug\test_plugin.clap
+//! cargo run -p egui-clap-host --bin gain_smoke -- target\debug\test_plugin.clap
 //! ```
 
 use clack_host::events::event_types::ParamValueEvent;
 use clack_host::prelude::*;
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::params;
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::params;
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let host_info = HostInfo::new(
         "Gain Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

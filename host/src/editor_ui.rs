@@ -465,7 +465,7 @@ fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
 ///
 /// 中身に意味は無く、**Ctrl+V を発火させるためだけ**のもの。他所へ貼られても
 /// 何が起きたか分かる文言にしてある。
-const CLIPBOARD_MARKER: &str = "clap-host-test: ノートをコピーしました";
+const CLIPBOARD_MARKER: &str = "egui-clap-host: ノートをコピーしました";
 
 /// クリップボードにテキストが入っているか。
 ///

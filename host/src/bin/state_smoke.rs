@@ -6,16 +6,16 @@
 //!
 //! 併せて .ron への往復も通す (base64 を挟んでバイト列が壊れないことの確認)。
 //!
-//! 使い方: cargo run -p clap-host-test --bin state_smoke -- <path\to\plugin.clap>
+//! 使い方: cargo run -p egui-clap-host --bin state_smoke -- <path\to\plugin.clap>
 
 use clack_extensions::params::PluginParams;
 use clack_extensions::state::PluginState;
 use clack_host::events::event_types::ParamValueEvent;
 use clack_host::events::Pckn;
 use clack_host::prelude::*;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
-use clap_host_test::sequencer::MidiEditor;
-use clap_host_test::{discovery, project};
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::sequencer::MidiEditor;
+use egui_clap_host::{discovery, project};
 use std::error::Error;
 use std::ffi::CString;
 use std::io::Cursor;
@@ -143,7 +143,7 @@ fn instantiate(path: &Path, id: &str) -> Result<PluginInstance<MiniHost>, Box<dy
     let (entry, _) = discovery::load_clap_file(path)?;
     let host_info = HostInfo::new(
         "State Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

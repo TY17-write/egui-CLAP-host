@@ -16,16 +16,16 @@
 //! 5. **輪を拒否すること** — `1 → 2 → 3 → 1` は繋ぎ方の組み立てで落ちる
 //!
 //! ```text
-//! cargo run -p clap-host-test --bin route_smoke -- target\debug\test_plugin.clap
+//! cargo run -p egui-clap-host --bin route_smoke -- target\debug\test_plugin.clap
 //! ```
 
 use clack_host::prelude::*;
-use clap_host_test::audio;
-use clap_host_test::audio::config::StreamAudioConfig;
-use clap_host_test::audio::events::BlockEvent;
-use clap_host_test::audio::graph::{self, Graph, Mixer, Routing};
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::audio;
+use egui_clap_host::audio::config::StreamAudioConfig;
+use egui_clap_host::audio::events::BlockEvent;
+use egui_clap_host::audio::graph::{self, Graph, Mixer, Routing};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -259,7 +259,7 @@ fn run(
 fn instantiate(entry: &PluginEntry, id: &str) -> Result<PluginInstance<MiniHost>, Box<dyn Error>> {
     let host_info = HostInfo::new(
         "Route Smoke",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;

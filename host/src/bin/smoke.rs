@@ -2,13 +2,13 @@
 //! オーディオデバイスなしで .clap をロード → アクティベート → ノートオン →
 //! process() を回して、実際に波形が出力されることを確認する。
 //!
-//! 使い方: cargo run -p clap-host-test --bin smoke -- <path\to\plugin.clap>
+//! 使い方: cargo run -p egui-clap-host --bin smoke -- <path\to\plugin.clap>
 
 use clack_host::events::event_types::NoteOnEvent;
 use clack_host::events::{EventFlags, Match};
 use clack_host::prelude::*;
-use clap_host_test::discovery;
-use clap_host_test::host::{MiniHost, MiniHostMainThread, MiniHostShared};
+use egui_clap_host::discovery;
+use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use std::error::Error;
 use std::ffi::CString;
 use std::path::Path;
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let host_info = HostInfo::new(
         "Smoke Test",
-        "clap-host-test",
+        "egui-clap-host",
         "https://example.com",
         "0.1.0",
     )?;
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("インスタンス化: OK");
 
     // パラメータ列挙の確認
-    let params = clap_host_test::params::read_params(&mut instance);
+    let params = egui_clap_host::params::read_params(&mut instance);
     for p in &params {
         println!(
             "  パラメータ: {} (id={:?}, {}..{}, 現在値={})",

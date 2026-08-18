@@ -1,4 +1,4 @@
-//! CLAP ミニホストのライブラリ部分。
+//! egui-CLAP-host のライブラリ部分。
 //! main.rs (GUI) と bin/smoke.rs (オフライン検証) の両方から使う。
 
 pub mod audio;

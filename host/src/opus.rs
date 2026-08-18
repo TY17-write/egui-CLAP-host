@@ -211,7 +211,7 @@ fn opus_head(channels: u8) -> Vec<u8> {
 
 /// `OpusTags` パケット (RFC 7845)。コメントは付けない
 fn opus_tags() -> Vec<u8> {
-    const VENDOR: &[u8] = b"clap-host-test";
+    const VENDOR: &[u8] = b"egui-clap-host";
     let mut tags = Vec::with_capacity(8 + 4 + VENDOR.len() + 4);
     tags.extend_from_slice(b"OpusTags");
     tags.extend_from_slice(&(VENDOR.len() as u32).to_le_bytes());
