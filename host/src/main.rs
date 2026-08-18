@@ -25,7 +25,9 @@ fn main() -> eframe::Result {
         .map(PathBuf::from);
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 580.0]),
+        // 幅は上部のメーター (スペクトル + ラウドネス) が入る大きさにしてある。
+        // これより狭いと、オーディオトラックのボタンとメーターが折り返す
+        viewport: egui::ViewportBuilder::default().with_inner_size([1320.0, 620.0]),
         ..Default::default()
     };
     eframe::run_native(

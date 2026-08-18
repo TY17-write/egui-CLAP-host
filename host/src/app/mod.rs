@@ -8,6 +8,7 @@
 //! それらのファイルへ分かれている。
 
 mod mixer_ui;
+mod monitor_ui;
 mod notice;
 mod plugins;
 mod project_io;
@@ -24,6 +25,7 @@ use crate::audio::transport::TransportMsg;
 use crate::audio::GuiMsg;
 use crate::editor_ui::{EditorCommand, EditorState};
 use crate::host::MainThreadMessage;
+use crate::meter::Meters;
 use crate::{audio, discovery, editor_ui, project};
 use eframe::egui;
 use std::path::PathBuf;
@@ -72,6 +74,9 @@ pub struct App {
     /// **結果の知らせはここに一本化してある。** 以前は上部に status 行を出して
     /// いたが、同じ内容を通知にも出していたうえ、上部パネルごと畳んだため。
     notice: Option<Notice>,
+    /// マスターのスペクトルとラウドネス。
+    /// 中身はオーディオスレッドから流れてくるサンプルで毎フレーム更新する
+    meters: Meters,
 }
 
 impl App {
@@ -228,9 +233,22 @@ impl eframe::App for App {
         let chosen_kind = self.load_choice_popup(ctx);
         self.plugin_choice_popup(ctx);
 
-        // **オーディオトラックの窓を呼び戻すためだけの帯。**
+        // マスターの出力を取り込む。**描く前に済ませる**
+        // (同じフレームの中で、取り込んだ値をそのまま出すため)。
+        // エンジンが無い間は溜めたものを捨てて、止まった絵が残らないようにする。
+        let dt = ctx.input(|i| i.stable_dt);
+        match self.engine.as_mut() {
+            Some(engine) => {
+                let rate = engine.config.sample_rate;
+                self.meters.drain(&mut engine.monitor, rate, dt);
+            }
+            None => self.meters.reset(),
+        }
+
+        // **オーディオトラックの窓を呼び戻す口と、マスターのメーターの帯。**
         // 窓は閉じられるので、閉じたあとに開き直す口が要る
         // (音源を載せる唯一の入口なので、行き止まりにできない)。
+        // メーターは閉じられない — 常に見えているほうがよいという判断。
         self.ensure_audio_tracks();
         egui::TopBottomPanel::top("audio_track_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -246,6 +264,9 @@ impl eframe::App for App {
                 } else {
                     ui.weak(format!("{loaded} 本に音源が載っています"));
                 }
+
+                ui.separator();
+                self.master_meters(ui);
             });
         });
 

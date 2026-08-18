@@ -368,6 +368,7 @@ pub fn start_engine(
     gui_events: Consumer<GuiMsg>,
     retired: rtrb::Producer<(NodeAddr, Node)>,
     transport_shared: TransportShared,
+    monitor: rtrb::Producer<f32>,
 ) -> Result<(Stream, StreamAudioConfig), Box<dyn Error>> {
     let cpal_host = cpal::default_host();
 
@@ -384,6 +385,7 @@ pub fn start_engine(
         gui_events,
         retired,
         transport_shared,
+        monitor,
         stream_config.output_channel_count,
         stream_config.max_likely_buffer_size as usize,
     );
@@ -397,6 +399,24 @@ pub fn start_engine(
     stream.play()?;
 
     Ok((stream, stream_config))
+}
+
+/// マスターの出力を計測側へ写す。**入らなければ捨てる。**
+///
+/// 溢れるのは画面が長く止まっているとき (ファイルダイアログを開いている間など) で、
+/// そのぶんは見せる相手がいない。**待たない・確保しない**ので、オーディオ
+/// スレッドの規約から外れない。
+///
+/// フレームの途中で切ると、次の塊で L と R が入れ替わったまま届く。
+/// **必ず偶数個**にしてから渡すこと。
+fn feed_monitor(monitor: &mut rtrb::Producer<f32>, master: &[f32]) {
+    let want = master.len().min(monitor.slots()) & !1;
+    if want == 0 {
+        return;
+    }
+    if let Ok(chunk) = monitor.write_chunk_uninit(want) {
+        chunk.fill_from_iter(master[..want].iter().copied());
+    }
 }
 
 /// CLAP プラグインを指定のストリーム構成でアクティベートし、チェーンの1段にする。
@@ -599,6 +619,11 @@ struct StreamAudioProcessor {
     output_channel_count: usize,
     transport: Transport,
     steady_counter: u64,
+    /// マスターの出力をメインスレッドの計測へ渡す口 (スペクトルとラウドネス)。
+    ///
+    /// **ここでは何も測らない。** 値を写すだけにしてあり、詰まっていれば
+    /// そのブロックは捨てる。メーターが欠けても音には影響しない。
+    monitor: rtrb::Producer<f32>,
 }
 
 impl StreamAudioProcessor {
@@ -606,6 +631,7 @@ impl StreamAudioProcessor {
         gui_events: Consumer<GuiMsg>,
         retired: rtrb::Producer<(NodeAddr, Node)>,
         transport_shared: TransportShared,
+        monitor: rtrb::Producer<f32>,
         output_channel_count: usize,
         max_frames: usize,
     ) -> Self {
@@ -620,6 +646,7 @@ impl StreamAudioProcessor {
             output_channel_count,
             transport: Transport::new(transport_shared),
             steady_counter: 0,
+            monitor,
         }
     }
 
@@ -735,6 +762,11 @@ impl StreamAudioProcessor {
         // グラフは 2ch。ここで初めてデバイスに合わせる
         let master = self.graph.master(frames);
         graph::write_to_device(master, data, self.output_channel_count);
+
+        // **デバイスへ落とす前の 2ch を計測へ回す。** デバイスがモノラルでも
+        // 3ch 以上でも、メーターに見えるものが変わらないようにするため。
+        // `graph` と `monitor` は別のフィールドなので、同時に借りられる
+        feed_monitor(&mut self.monitor, master);
 
         self.steady_counter += frames as u64;
     }

@@ -18,6 +18,10 @@ use std::ffi::CString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// メーターへ渡すリングバッファの大きさ (サンプル数)。
+/// 96kHz のステレオでも 0.34秒ぶんあり、画面の1フレームには十分な余裕がある
+const MONITOR_RING_SAMPLES: usize = 1 << 16;
+
 /// 中身を数え上げた音源ファイル (プラグイン選択待ち)。
 /// .clap でも .vst3 でも同じ形になる。
 pub(super) struct Candidates {
@@ -38,6 +42,8 @@ pub(super) struct Engine {
     pub(super) retired: rtrb::Consumer<(audio::NodeAddr, audio::Node)>,
     /// 再生位置・再生中フラグの共有
     pub(super) transport_shared: TransportShared,
+    /// マスターの出力 (L/R 交互)。上部のメーターが読む
+    pub(super) monitor: rtrb::Consumer<f32>,
     /// 全プラグイン共通のストリーム構成
     pub(super) config: StreamAudioConfig,
 }
@@ -235,16 +241,24 @@ pub(super) fn start_engine() -> Result<Engine, Box<dyn Error>> {
     let (producer, consumer) = rtrb::RingBuffer::new(256);
     // 外した音源をメインスレッドへ返す口 (オーディオスレッドで解放しないため)
     let (retired_producer, retired) = rtrb::RingBuffer::new(8);
+    // マスターの出力をメーターへ渡す口。**0.5秒ぶん**あれば、画面が少し
+    // 止まっても取りこぼさない。溢れたぶんはオーディオ側が捨てる
+    let (monitor_producer, monitor) = rtrb::RingBuffer::new(MONITOR_RING_SAMPLES);
     let transport_shared = TransportShared::new();
 
-    let (stream, config) =
-        audio::start_engine(consumer, retired_producer, transport_shared.clone())?;
+    let (stream, config) = audio::start_engine(
+        consumer,
+        retired_producer,
+        transport_shared.clone(),
+        monitor_producer,
+    )?;
 
     Ok(Engine {
         _stream: stream,
         producer,
         retired,
         transport_shared,
+        monitor,
         config,
     })
 }

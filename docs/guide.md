@@ -48,6 +48,7 @@ cargo run -p egui-clap-host --bin state_smoke -- target\test_plugin.clap # 音�
 cargo run -p egui-clap-host --bin gain_smoke -- target\test_plugin.clap  # 検証用エフェクトの挙動確認
 cargo run -p egui-clap-host --bin chain_smoke -- target\test_plugin.clap # 音源→エフェクトのチェーンの検証
 cargo run -p egui-clap-host --bin route_smoke -- target\test_plugin.clap # トラック間のルーティングの検証
+cargo run -p egui-clap-host --bin meter_smoke -- target\test_plugin.clap # ラウドネス・スペクトルの検証
 
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
 cargo run -p egui-clap-host --bin opus_smoke
@@ -307,6 +308,35 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 
 テーマは [vim-hybrid](https://github.com/w0ng/vim-hybrid) 風のダークテーマ (`theme.rs`)。
 
+### マスターメーター (画面上部)
+
+上部の帯に**マスター (オーディオトラック0) の出力**を出す。閉じられない
+(常に見えているほうがよいという判断)。
+
+| | 中身 |
+|---|---|
+| スペクトル | 30Hz〜18kHz を対数で56帯に分けたもの。左が低域、縦線が 1kHz |
+| **M** | Momentary — 直近 400ms のラウドネス |
+| **S** | Short-term — 直近3秒のラウドネス |
+| 横棒 | Short-term の位置。**白い縦線が基準の −14 LUFS** |
+
+読み値は基準との差で色が変わる。**±1 LU 以内なら緑**、大きければ赤 (配信側で
+下げられる)、小さければ水色。横棒が Short-term なのは、Momentary は揺れが速くて
+目盛りとして読めないため。
+
+測定は ITU-R BS.1770-4 に従う。**K特性の係数はそのときのサンプリングレートから
+引き直している** — 規格が表で載せているのは 48kHz のものだけで、44.1kHz の
+デバイスにそのまま当てると読みがずれる。EBU Tech 3341 の試験信号1
+(1kHz 正弦波 −23.0 dBFS) が −23.0 LUFS を示すことを、テストと `meter_smoke` の
+両方で毎回確かめている。
+
+**Integrated (曲全体の積算) は出していない。** ゲート処理と「いつからの積算か」の
+決めごとが要るため。
+
+計測そのものは**メインスレッドで行う**。オーディオスレッドはマスターの
+サンプルをリングバッファへ写すだけで、詰まっていればそのブロックを捨てる
+(メーターが欠けても音には影響しない)。
+
 ### 音階モード
 
 ホストが変えるのは MIDI ノート番号だけで、実際の音高はプラグイン側の音律設定
@@ -558,6 +588,7 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 | `app/` | アプリの状態と毎フレームの処理。`mod.rs` が `App` と `update`、以下 `routing` (繋ぎ方と音量) / `plugins` (音源の読み込み) / `project_io` (保存と MIDI) / `render` (書き出し) / `mixer_ui` (オーディオトラックの窓) / `track` / `notice` |
 | `editor_ui/` | ピアノロール。`grid` (描画と操作) / `geometry` (座標と当たり判定・テストの大半) / `state` (選択と編集) / `history` / `gutter` / `toolbar` / `color` / `help` / `metrics` |
 | `audio/` | オーディオスレッド側。`graph` (ルーティングとミキサ) / `transport` / `buffers` / `clap` / `vst3` / `offline` (書き出し) |
+| `meter/` | マスターの計測。`loudness` (BS.1770 の K特性) / `spectrum` (FFT) |
 | その他 | `sequencer` (ノートとトラックの型) / `project` (.ron) / `midi` / `wav` / `opus` / `ccs` / `discovery` / `gui` / `host` / `theme` |
 
 ## プラグイン独自 GUI
