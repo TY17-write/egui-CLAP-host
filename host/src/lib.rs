@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod editor_ui;
 pub mod gui;
 pub mod host;
+pub mod library;
 pub mod meter;
 pub mod midi;
 pub mod opus;
