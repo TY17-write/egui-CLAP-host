@@ -440,6 +440,26 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 **走査中に落ちても分かる。** 開く直前のパスを `config\scanning.txt` に書いて
 おり、次の起動でそれが残っていればそのファイルを走査から外して知らせる。
 
+#### 検証用の `test_plugin.vst3` は走査で読めない
+
+`target` を走査フォルダに登録すると、`test_plugin.vst3` だけ
+`GetPluginFactory returned null` で落ちる。**不具合ではない。**
+
+これは clap-wrapper で作った VST3 で、「テスト治具: test-plugin の VST3 版」に
+書いたとおり**同名の `.clap` を CLAP の探索パスから探す**。GUI ホストを
+`cargo run` で起動すると `CLAP_PATH` が無いので見つけられない。
+
+走査の結果には**この事情を添えて出す**ようにしてある (隣に同名の `.clap` が
+あるかどうかで見分けている)。読ませたいときは、起動前に環境変数を入れる。
+
+```powershell
+$env:CLAP_PATH = "$PWD\target"
+cargo run -p egui-clap-host --bin egui-clap-host
+```
+
+なお `target` は普段から走査フォルダに入れておく場所ではない
+(ビルドの出力先で、`cargo clean` で中身ごと消える)。
+
 ### 音源の保存 (オーディオトラック)
 
 音源は**オーディオトラック**に載る。打ち込み側の「トラック」とは別の系統で、

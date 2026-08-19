@@ -81,6 +81,30 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// 開けなかった `.vst3` に添える手がかり。
+///
+/// **clap-wrapper で作った VST3 は、同名の `.clap` を CLAP の探索パスから
+/// 探して読み込む。** 見つからないとファクトリを返せず、
+/// `GetPluginFactory returned null` とだけ言って終わる。
+///
+/// 隣に同名の `.clap` があるなら、まずこれを疑う。そのままでは
+/// 「読めない理由が分からないプラグイン」として一覧から消えてしまう。
+fn clap_wrapper_hint(path: &Path) -> Option<String> {
+    let beside = path.with_extension("clap");
+    if !beside.exists() {
+        return None;
+    }
+    Some(format!(
+        "隣に {} があります。clap-wrapper で作った VST3 は同名の .clap を \
+         CLAP の探索パスから探すので、環境変数 CLAP_PATH にこのフォルダを足すか、\
+         .clap を CLAP の標準の置き場へ入れてください",
+        beside
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ))
+}
+
 /// 1ファイルを開いて中のプラグインを数え上げる (形式は拡張子で決まる)。
 ///
 /// # Safety
@@ -90,7 +114,10 @@ pub fn scan_file(path: &Path) -> Result<Vec<FoundPlugin>, Box<dyn Error>> {
         // CLAP は列挙のために開いた `PluginEntry` をここで捨てる
         // (載せるときに開き直す。走査中は抱えておく理由が無い)
         Some(PluginKind::Clap) => load_clap_file(path).map(|(_entry, plugins)| plugins),
-        Some(PluginKind::Vst3) => load_vst3_file(path),
+        Some(PluginKind::Vst3) => load_vst3_file(path).map_err(|e| match clap_wrapper_hint(path) {
+            Some(hint) => format!("{e}\n  → {hint}").into(),
+            None => e,
+        }),
         None => Err("拡張子が .clap でも .vst3 でもありません".into()),
     }
 }
@@ -397,6 +424,29 @@ mod tests {
         assert_eq!(file_wide_role(5, "Fx"), Role::Unknown);
         // クラスが1つでもカテゴリが空なら分からない
         assert_eq!(file_wide_role(1, ""), Role::Unknown);
+    }
+
+    /// **隣に同名の .clap があるときだけ手がかりを添えること。**
+    ///
+    /// clap-wrapper で作った VST3 は `GetPluginFactory returned null` としか
+    /// 言わないので、そのままでは理由が分からない。
+    #[test]
+    fn a_clap_wrapper_vst3_gets_a_hint() {
+        let root = temp_dir("wrapper");
+        touch(&root.join("Wrapped.clap"));
+        touch(&root.join("Wrapped.vst3"));
+        touch(&root.join("Plain.vst3"));
+
+        let hint = clap_wrapper_hint(&root.join("Wrapped.vst3")).expect("手がかりが付くこと");
+        assert!(hint.contains("Wrapped.clap"), "{hint}");
+        assert!(hint.contains("CLAP_PATH"), "直し方まで言うこと: {hint}");
+
+        assert!(
+            clap_wrapper_hint(&root.join("Plain.vst3")).is_none(),
+            "隣に .clap が無ければ添えないこと"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 拡張子が違うファイルは開かずに断ること
