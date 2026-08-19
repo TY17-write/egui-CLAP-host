@@ -165,10 +165,135 @@ fn main() -> Result<(), Box<dyn Error>> {
         failures.push("シークして再生し直しても音が出ない".to_string());
     }
 
+    failures.extend(bypass_pass(&entry, &target.id)?);
+
     if failures.is_empty() {
         println!("✅ 消音イベントのテスト成功");
         Ok(())
     } else {
         Err(format!("❌ 失敗: {}", failures.join(", ")).into())
     }
+}
+
+/// バイパス中に鳴っている最中の停止を挟んで、**戻したときに鳴り出さないこと**。
+///
+/// バイパス中のノードに `process` を渡さないと、消音イベントもノートオフも
+/// 届かない。プラグインの中ではノートが鳴ったままなので、バイパスを戻した
+/// 瞬間に音が出てくる。
+fn bypass_pass(entry: &PluginEntry, plugin_id: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    /// 鳴っている最中にバイパスへ入れる / 停止する / バイパスを戻す
+    const BYPASS_AT: usize = 5;
+    const STOP_AT: usize = 10;
+    const UNBYPASS_AT: usize = 15;
+    const TOTAL: usize = 25;
+
+    let host_info = HostInfo::new(
+        "Choke Smoke",
+        "egui-clap-host",
+        "https://example.com",
+        "0.1.0",
+    )?;
+    let id = CString::new(plugin_id)?;
+    let (sender, _receiver) = crossbeam_channel::unbounded();
+    let mut instance = PluginInstance::<MiniHost>::new(
+        |_| MiniHostShared::new(sender.clone()),
+        |shared| MiniHostMainThread::new(shared),
+        entry,
+        &id,
+        &host_info,
+    )?;
+
+    let stream_config = StreamAudioConfig {
+        output_channel_count: CHANNELS,
+        min_buffer_size: 1,
+        max_likely_buffer_size: BLOCK_SIZE as u32,
+        sample_rate: SAMPLE_RATE as u32,
+        sample_format: cpal::SampleFormat::F32,
+    };
+    let mut processor: Box<TrackProcessor> = audio::activate_track(&mut instance, &stream_config)?;
+
+    let mut editor = MidiEditor::default();
+    editor.notes = vec![Note {
+        start_tick: 0.0,
+        duration: 4.0,
+        semitone: 0,
+        octave: 4,
+        velocity: 127,
+        track: 0,
+        lane: 0,
+    }];
+    let spq = editor.samples_per_quarter(SAMPLE_RATE);
+    let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
+
+    let mut transport = Transport::new(TransportShared::new());
+    let _ = transport.handle_msg(TransportMsg::SetSequence {
+        track: 0,
+        events: editor.to_events(SAMPLE_RATE).into_boxed_slice(),
+        end_sample,
+    });
+    let _ = transport.handle_msg(TransportMsg::Play);
+
+    let mut mix = vec![0.0f32; BLOCK_SIZE * CHANNELS];
+    // [バイパス前, バイパス中, 戻したあと]
+    let mut peaks = [0.0f32; 3];
+    let mut pos = 0u64;
+
+    for block in 0..TOTAL {
+        processor.events_mut().clear();
+
+        match block {
+            BYPASS_AT => processor.set_bypassed(0, true),
+            UNBYPASS_AT => processor.set_bypassed(0, false),
+            STOP_AT => {
+                if transport.handle_msg(TransportMsg::Stop) {
+                    transport::push_choke(processor.events_mut(), 0);
+                }
+            }
+            _ => {}
+        }
+
+        let plan = transport.plan_block(BLOCK_SIZE as u64);
+        transport.emit_track(0, &plan, processor.events_mut());
+
+        mix.fill(0.0);
+        processor.process(pos, &mut mix)?;
+
+        let peak = mix.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+        match block {
+            b if b < BYPASS_AT => peaks[0] = peaks[0].max(peak),
+            b if b > BYPASS_AT && b < UNBYPASS_AT => peaks[1] = peaks[1].max(peak),
+            b if b > UNBYPASS_AT => peaks[2] = peaks[2].max(peak),
+            _ => {}
+        }
+        pos += BLOCK_SIZE as u64;
+    }
+
+    let Some(audio::RetiredProcessor::Clap(stopped)) = processor.into_single_retired() else {
+        return Err("CLAP 1段を載せたのに別のものが返ってきた".into());
+    };
+    instance.deactivate(stopped);
+
+    println!(
+        "バイパス: 前={:.4} 中={:.4} 戻したあと={:.4}",
+        peaks[0], peaks[1], peaks[2]
+    );
+
+    let mut failures = Vec::new();
+    if peaks[0] < AUDIBLE {
+        failures.push("バイパス前に音が出ていない (検証になっていない)".to_string());
+    }
+    if peaks[1] > SILENT {
+        failures.push(format!(
+            "バイパス中に音が漏れている (ピーク {:.4})",
+            peaks[1]
+        ));
+    }
+    if peaks[2] > SILENT {
+        failures.push(format!(
+            "停止済みなのにバイパスを戻すと鳴り出す (ピーク {:.4})。\
+             バイパス中のノードに消音イベントが届いていない",
+            peaks[2]
+        ));
+    }
+    Ok(failures)
 }

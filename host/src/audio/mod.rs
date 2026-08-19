@@ -152,13 +152,17 @@ pub enum Backend {
 /// チェーンの途中に置けばそこまでの音が消える。
 pub struct Node {
     backend: Backend,
-    /// 処理を飛ばして音を素通しする。
+    /// 音を素通しする。
     ///
     /// **無音にはしない。** 入力ポートを持たないノード (音源) をバイパスすると、
     /// そこまでの音がそのまま通る (チェーンの先頭なら無音)。
     ///
-    /// 処理そのものを飛ばすので、**戻した瞬間は内部状態が古い**
-    /// (ディレイやリバーブは溜まりが無い状態から始まる)。
+    /// **処理そのものは飛ばさず、出した音を捨てる。** 飛ばすとイベントが
+    /// 届かなくなり、ノートオフや消音を取りこぼす。実際に
+    /// 「鳴っている最中にバイパス → 停止 → 戻す」で音が出てしまった
+    /// (プラグインの中ではノートが鳴ったままだった)。
+    /// 引き換えにバイパス中も CPU は使う。**バイパスは A/B 比較のためのもので、
+    /// 負荷を下げる口ではない。**
     bypassed: bool,
 }
 
@@ -197,7 +201,9 @@ impl Node {
     /// 1ブロック処理して `buf` を置き換える。
     /// `index` はチェーンの何段目か (自分宛てのパラメータを拾うために使う)。
     ///
-    /// **バイパス中は何もしない。** `buf` に入っている音がそのまま次段へ渡る。
+    /// **バイパスはここでは見ない。** 出した音を捨てるのは呼び出し側
+    /// ([`TrackProcessor::process`]) の仕事で、ここは常に通す
+    /// (イベントを届けるため。理由は [`Node::bypassed`] を参照)。
     fn process(
         &mut self,
         events: &BlockEvents,
@@ -205,9 +211,6 @@ impl Node {
         steady: u64,
         buf: &mut [f32],
     ) -> Result<(), ProcessError> {
-        if self.bypassed {
-            return Ok(());
-        }
         match &mut self.backend {
             Backend::Clap(processor) => processor.process(events, index, steady, buf),
             Backend::Vst3(processor) => processor.process(events, index, buf),
@@ -227,6 +230,12 @@ pub struct TrackProcessor {
     /// ([`BlockEvent::Param`](events::BlockEvent::Param))。
     events: BlockEvents,
     nodes: Vec<Node>,
+    /// バイパス中の段に入ってきた音の控え。
+    ///
+    /// 段を通したあとにこれで書き戻すことで、**出した音だけを捨てる**。
+    /// 大きさは [`reserve`](Self::reserve) で先に取っておく
+    /// (オーディオスレッドで伸ばさないため)。
+    bypass_scratch: Vec<f32>,
 }
 
 /// オーディオスレッドから外した処理器。メインスレッドで始末するために形式を保つ。
@@ -258,6 +267,17 @@ impl TrackProcessor {
         Self {
             events: BlockEvents::with_capacity(128),
             nodes: Vec::with_capacity(capacity),
+            bypass_scratch: Vec::new(),
+        }
+    }
+
+    /// バイパス用の控えを、1ブロックの上限ぶん確保しておく。
+    /// **オーディオスレッドへ渡す前に呼ぶこと** ([`Graph::reserve`] が面倒を見る)。
+    ///
+    /// [`Graph::reserve`]: graph::Graph::reserve
+    pub fn reserve(&mut self, samples: usize) {
+        if self.bypass_scratch.len() < samples {
+            self.bypass_scratch.resize(samples, 0.0);
         }
     }
 
@@ -348,10 +368,34 @@ impl TrackProcessor {
     /// 処理した音を出すと、加工されていない原音が混ざって出てしまう
     /// (呼び出し側は「失敗したトラックは無音のまま混ざる」前提で記録している)。
     pub fn process(&mut self, steady: u64, buf: &mut [f32]) -> Result<(), ProcessError> {
-        for (index, node) in self.nodes.iter_mut().enumerate() {
-            if let Err(e) = node.process(&self.events, index, steady, buf) {
+        let Self {
+            events,
+            nodes,
+            bypass_scratch,
+        } = self;
+
+        for (index, node) in nodes.iter_mut().enumerate() {
+            // **バイパス中も通す。** 飛ばすとイベントが届かず、ノートオフや
+            // 消音を取りこぼして「戻した瞬間に鳴り出す」ことになる
+            // (理由は [`Node::bypassed`])。入ってきた音を控えておき、
+            // 段を通したあとに書き戻して**出した音だけを捨てる**。
+            let bypassed = node.is_bypassed();
+            if bypassed {
+                // 器は `reserve` で取ってある。ここで伸びるのは、それを通らない
+                // 検証バイナリのような経路だけ
+                if bypass_scratch.len() < buf.len() {
+                    bypass_scratch.resize(buf.len(), 0.0);
+                }
+                bypass_scratch[..buf.len()].copy_from_slice(buf);
+            }
+
+            if let Err(e) = node.process(events, index, steady, buf) {
                 buf.fill(0.0);
                 return Err(e);
+            }
+
+            if bypassed {
+                buf.copy_from_slice(&bypass_scratch[..buf.len()]);
             }
         }
         Ok(())

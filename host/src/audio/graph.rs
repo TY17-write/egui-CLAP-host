@@ -608,6 +608,11 @@ impl Graph {
         self.capacity_frames = frames;
         self.buffers
             .resize(AUDIO_TRACKS * frames * BUS_CHANNELS, 0.0);
+        // バイパス中の段が使う控えも、ここで取っておく
+        // (オーディオスレッドで伸ばさないため)
+        for track in &mut self.tracks {
+            track.processor.reserve(frames * BUS_CHANNELS);
+        }
     }
 
     /// 1ブロック処理する。結果は [`master`](Self::master) に入る。

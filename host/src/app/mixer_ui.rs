@@ -435,7 +435,10 @@ impl App {
                         let mut bypassed = node.bypassed;
                         if ui
                             .toggle_value(&mut bypassed, "B")
-                            .on_hover_text("バイパス (処理を飛ばして素通し)")
+                            .on_hover_text(
+                                "バイパス (この段の音を捨てて素通し)。\
+                                 処理自体は続けるので、戻したときに続きから鳴ります",
+                            )
                             .changed()
                         {
                             bypass = Some((at, bypassed));
