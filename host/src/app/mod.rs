@@ -7,6 +7,7 @@
 //! (`routing` / `plugins` / …) からだけ触れる。`impl App` は責務ごとに
 //! それらのファイルへ分かれている。
 
+mod library_ui;
 mod mixer_ui;
 mod monitor_ui;
 mod notice;
@@ -25,9 +26,11 @@ use crate::audio::transport::TransportMsg;
 use crate::audio::GuiMsg;
 use crate::editor_ui::{EditorCommand, EditorState};
 use crate::host::MainThreadMessage;
+use crate::library::{Library, Scan};
 use crate::meter::Meters;
 use crate::{audio, discovery, editor_ui, project};
 use eframe::egui;
+use library_ui::Tab;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -81,15 +84,30 @@ pub struct App {
     /// ([`TransportShared::pass`](crate::audio::transport::TransportShared::pass))。
     /// **増えていたら Integrated を測り直す**
     meter_pass: u64,
+    /// 走査したプラグインの一覧 (`config\plugins.ron`)
+    library: Library,
+    /// 走査の進行。**`Some` の間は毎フレーム1ファイルずつ進む**
+    scan: Option<Scan>,
+    /// 今開いているファイル (進捗の表示用)
+    scanning_now: Option<PathBuf>,
+    /// プラグインの窓を出しているか
+    show_library: bool,
+    /// 一覧のどのタブを見ているか
+    library_tab: Tab,
+    /// 一覧の絞り込み (名前・ベンダー)
+    library_filter: String,
 }
 
 impl App {
     /// 起動時に自動ロードする音源を指定して作る (検証用 CLI)
     pub fn with_autoload(autoload: Option<(PathBuf, bool)>) -> Self {
-        Self {
+        let mut app = Self {
             autoload,
             ..Default::default()
-        }
+        };
+        // 走査したプラグインの記録は起動時に1回だけ読む
+        app.load_library();
+        app
     }
 }
 
@@ -271,6 +289,8 @@ impl eframe::App for App {
                     .count();
                 ui.toggle_value(&mut self.show_audio_tracks, "オーディオトラック")
                     .on_hover_text("音源とエフェクトの管理・ルーティング");
+                ui.toggle_value(&mut self.show_library, "プラグイン")
+                    .on_hover_text("フォルダを走査してプラグインを一覧する");
                 if loaded == 0 {
                     ui.weak("音源が1つも載っていません");
                 } else {
@@ -486,6 +506,11 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // プラグインの一覧。**走査は1フレームに1ファイルずつ進める**
+        // (別スレッドにできないので、描く前に1つ進めて進捗へ反映する)
+        self.step_scan();
+        self.library_window(ctx);
 
         // 結果通知は最前面に出したいので、パネルを描いたあとに重ねる
         notice_window(ctx, &mut self.notice);

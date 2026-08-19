@@ -28,6 +28,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("フォルダを1つ以上渡してください".into());
     }
 
+    // **フォルダを渡すもの。** プラグインそのものを渡されたときは、
+    // 「0件」と出して終わるより先に理由を言う
+    if let Some(not_a_folder) = folders.iter().find(|path| !path.is_dir()) {
+        return Err(format!(
+            "{} はフォルダではありません。\
+             プラグインの入っているフォルダを渡してください",
+            not_a_folder.display()
+        )
+        .into());
+    }
+
     // 候補を数えるところまでは開かない
     for folder in &folders {
         let files = discovery::plugin_files(folder);
