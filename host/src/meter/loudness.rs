@@ -5,8 +5,10 @@
 //! ここでは規格が元にしているアナログ原型から双一次変換で組み立てるので、
 //! どのレートでも同じ特性になる (48kHz では規格の表と一致する。テスト参照)。
 //!
-//! **Integrated (全体の積算) は持たない。** ゲート処理と「いつからの積算か」の
-//! 決めごとが要るので、必要になったときに足す。
+//! **Integrated (積算) は「頭から今まで」を測る。** 起点は呼び出し側が
+//! [`LoudnessMeter::restart_integrated`] で決める (本体は再生開始とループの
+//! 折り返し)。M と S は**巻き戻さない** — 直近を見るためのものなので、
+//! 折り返しのたびに -∞ へ戻ると読めなくなる。
 
 /// 積算の単位 (100ms)。Momentary も Short-term もこの倍数で切る
 const BLOCK_MS: f64 = 100.0;
@@ -14,6 +16,18 @@ const BLOCK_MS: f64 = 100.0;
 const MOMENTARY_BLOCKS: usize = 4;
 /// Short-term の窓 (3秒)
 const SHORT_TERM_BLOCKS: usize = 30;
+
+/// Integrated の絶対ゲート。これ未満の区間は積算に入れない
+const ABSOLUTE_GATE_LUFS: f64 = -70.0;
+/// Integrated の相対ゲート。ゲート後の平均からこれだけ下を切る
+const RELATIVE_GATE_LU: f64 = 10.0;
+
+/// 積算に溜める区間の上限 (100ms 刻みなので1時間ぶん)。
+///
+/// 起点は再生開始かループの折り返しなので、普通はここに届かない。
+/// **届いたらそこで積算を止める** (古いものを捨てると「頭からの積算」で
+/// なくなり、意味の違う数字が出てしまう)。
+const MAX_GATING_BLOCKS: usize = 36_000;
 
 /// これより下は無音として扱う。対数なので本当の無音は -∞ になる
 pub const SILENCE_LUFS: f32 = -70.0;
@@ -124,6 +138,15 @@ pub struct LoudnessMeter {
     at: usize,
     /// 積んだ区間の数 (窓が埋まるまでの判定に使う)
     filled_blocks: usize,
+    /// Integrated 用に溜めた 400ms 窓の平均二乗。
+    /// **[`restart_integrated`](Self::restart_integrated) で捨てる**
+    gating: Vec<f64>,
+    /// 積算の起点から閉じた区間の数。
+    /// 400ms 窓は4区間ぶんなので、**起点直後の窓に前の周のぶんが混じらない**
+    /// よう、これが 4 に届くまでは積まない
+    blocks_since_restart: usize,
+    /// 計算済みの Integrated (区間が増えたときだけ求め直す)
+    integrated: f32,
 }
 
 impl LoudnessMeter {
@@ -139,6 +162,9 @@ impl LoudnessMeter {
             history: [0.0; SHORT_TERM_BLOCKS],
             at: 0,
             filled_blocks: 0,
+            gating: Vec::new(),
+            blocks_since_restart: 0,
+            integrated: SILENCE_LUFS,
         }
     }
 
@@ -146,7 +172,7 @@ impl LoudnessMeter {
         self.sample_rate
     }
 
-    /// 溜めたものを捨てる (レートが変わったとき・再生を止めたとき)
+    /// 溜めたものを全部捨てる (レートが変わったとき・エンジンを止めたとき)
     pub fn reset(&mut self) {
         for filter in self.shelving.iter_mut().chain(self.highpass.iter_mut()) {
             filter.reset();
@@ -156,6 +182,17 @@ impl LoudnessMeter {
         self.history = [0.0; SHORT_TERM_BLOCKS];
         self.at = 0;
         self.filled_blocks = 0;
+        self.restart_integrated();
+    }
+
+    /// **Integrated だけ**を測り直す (再生開始・ループの折り返し)。
+    ///
+    /// M と S には触れない。直近を見るためのものなので、折り返しのたびに
+    /// -∞ へ戻ると読めなくなる。
+    pub fn restart_integrated(&mut self) {
+        self.gating.clear();
+        self.blocks_since_restart = 0;
+        self.integrated = SILENCE_LUFS;
     }
 
     /// L/R 交互のサンプルを流し込む。**長さは2の倍数**であること
@@ -183,6 +220,24 @@ impl LoudnessMeter {
         self.filled_blocks = (self.filled_blocks + 1).min(SHORT_TERM_BLOCKS);
         self.filled = 0;
         self.sum = 0.0;
+
+        // Integrated のゲート判定は 400ms 窓を 100ms ずつずらして行う。
+        // **起点から4区間そろうまで積まない** (前の周のぶんが混じるため)
+        self.blocks_since_restart += 1;
+        if self.blocks_since_restart >= MOMENTARY_BLOCKS && self.gating.len() < MAX_GATING_BLOCKS {
+            self.gating.push(self.mean_of_last(MOMENTARY_BLOCKS));
+            self.integrated = self.compute_integrated();
+        }
+    }
+
+    /// 直近 `blocks` 区間の平均二乗 (L+R)
+    fn mean_of_last(&self, blocks: usize) -> f64 {
+        let mut total = 0.0;
+        for step in 1..=blocks {
+            let index = (self.at + SHORT_TERM_BLOCKS - step) % SHORT_TERM_BLOCKS;
+            total += self.history[index];
+        }
+        total / blocks as f64
     }
 
     /// Momentary (直近 400ms)。まだ埋まっていなければ [`SILENCE_LUFS`]
@@ -203,18 +258,74 @@ impl LoudnessMeter {
         if self.filled_blocks < blocks {
             return SILENCE_LUFS;
         }
-        let mut total = 0.0;
-        for step in 1..=blocks {
-            let index = (self.at + SHORT_TERM_BLOCKS - step) % SHORT_TERM_BLOCKS;
-            total += self.history[index];
+        to_lufs(self.mean_of_last(blocks))
+    }
+
+    /// Integrated (積算の起点から今まで)。
+    ///
+    /// 起点は [`restart_integrated`](Self::restart_integrated) を呼んだところ。
+    /// 400ms 窓が4つ揃うまでは [`SILENCE_LUFS`]。
+    pub fn integrated(&self) -> f32 {
+        self.integrated
+    }
+
+    /// 積算に入っている 400ms 窓の数 (画面で「まだ測り始めたばかり」を出すのに使う)
+    pub fn integrated_blocks(&self) -> usize {
+        self.gating.len()
+    }
+
+    /// BS.1770 の2段ゲートを掛けて積算する。
+    ///
+    /// 1. **絶対ゲート** — [`ABSOLUTE_GATE_LUFS`] 未満の区間を捨てる (無音の除外)
+    /// 2. **相対ゲート** — 残りの平均から [`RELATIVE_GATE_LU`] 下を切る
+    ///    (静かな部分に引きずられて全体が低く出るのを防ぐ)
+    ///
+    /// 中間の一覧を作らずに2周する。毎回の区間追加で呼ぶので、確保を挟みたくない。
+    fn compute_integrated(&self) -> f32 {
+        let absolute = power_at(ABSOLUTE_GATE_LUFS);
+
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for power in &self.gating {
+            if *power > absolute {
+                sum += *power;
+                count += 1;
+            }
         }
-        let mean = total / blocks as f64;
-        if mean <= 0.0 {
+        if count == 0 {
             return SILENCE_LUFS;
         }
-        let lufs = OFFSET_LU + 10.0 * mean.log10();
-        (lufs as f32).max(SILENCE_LUFS)
+
+        // 相対ゲートの敷居は、絶対ゲートを通ったものの平均から決める
+        let relative = power_at(to_lufs(sum / count as f64) as f64 - RELATIVE_GATE_LU);
+        let gate = absolute.max(relative);
+
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for power in &self.gating {
+            if *power > gate {
+                sum += *power;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return SILENCE_LUFS;
+        }
+        to_lufs(sum / count as f64)
     }
+}
+
+/// 平均二乗 (L+R) をラウドネスへ
+fn to_lufs(power: f64) -> f32 {
+    if power <= 0.0 {
+        return SILENCE_LUFS;
+    }
+    ((OFFSET_LU + 10.0 * power.log10()) as f32).max(SILENCE_LUFS)
+}
+
+/// ラウドネスを平均二乗へ ([`to_lufs`] の逆。ゲートの敷居を作るのに使う)
+fn power_at(lufs: f64) -> f64 {
+    10f64.powf((lufs - OFFSET_LU) / 10.0)
 }
 
 #[cfg(test)]
@@ -365,6 +476,121 @@ mod tests {
             (both - left_only - 3.01).abs() < 0.05,
             "両側 {both} / 片側 {left_only} (3.01 LU 差)"
         );
+    }
+
+    /// **Integrated も試験信号1に乗ること。**
+    /// 一定の水準なら M・S・I が揃うはず (ゲートで何も落ちない)
+    #[test]
+    fn a_steady_tone_reads_the_same_on_every_window() {
+        let mut meter = LoudnessMeter::new(48_000);
+        meter.push(&stereo_sine(48_000, 4.0, 1000.0, -23.0));
+
+        for (name, value) in [
+            ("Momentary", meter.momentary()),
+            ("Short-term", meter.short_term()),
+            ("Integrated", meter.integrated()),
+        ] {
+            assert!(
+                (value - (-23.0)).abs() < 0.1,
+                "{name} が {value} LUFS (期待 -23.0)"
+            );
+        }
+    }
+
+    /// **EBU Tech 3341 の試験信号3 (相対ゲート)。**
+    ///
+    /// 静か → 大きい → 静か と並べると、**静かな部分は落とされて
+    /// 大きい部分の値になる**。規格は 10秒/60秒/10秒 で -36/-23/-36 dBFS。
+    ///
+    /// **相対ゲートを外すと通らない。** -36 は平均より 10 LU 以上下なので、
+    /// 入れたままだと全体が -24.4 あたりまで下がる。
+    ///
+    /// 大きい部分を 20秒と長く取っているのは、**境目をまたぐ 400ms 窓**が
+    /// あるため。半分だけ静かな窓はゲートを通り抜けて平均を少し下げるので、
+    /// 短くすると (6秒だと 0.2 LU) 規格の許容 ±0.1 に収まらない。
+    #[test]
+    fn the_quiet_parts_are_gated_out() {
+        let mut meter = LoudnessMeter::new(48_000);
+        meter.push(&stereo_sine(48_000, 3.0, 1000.0, -36.0));
+        meter.push(&stereo_sine(48_000, 20.0, 1000.0, -23.0));
+        meter.push(&stereo_sine(48_000, 3.0, 1000.0, -36.0));
+
+        assert!(
+            (meter.integrated() - (-23.0)).abs() < 0.1,
+            "Integrated が {} LUFS (期待 -23.0)",
+            meter.integrated()
+        );
+    }
+
+    /// **無音は絶対ゲートで落ちること。**
+    /// 前後に無音を足しても、鳴っている部分の値が変わらない
+    /// (長さの理由は [`the_quiet_parts_are_gated_out`] と同じ)
+    #[test]
+    fn silence_does_not_drag_the_integrated_down() {
+        let mut meter = LoudnessMeter::new(48_000);
+        meter.push(&vec![0.0; 48_000 * 2 * 2]);
+        meter.push(&stereo_sine(48_000, 20.0, 1000.0, -23.0));
+        meter.push(&vec![0.0; 48_000 * 2 * 2]);
+
+        assert!(
+            (meter.integrated() - (-23.0)).abs() < 0.1,
+            "{} LUFS (期待 -23.0)",
+            meter.integrated()
+        );
+    }
+
+    /// **測り直しは Integrated だけに効くこと。**
+    ///
+    /// ループの折り返しで M と S まで戻すと、そのたびに -∞ になって読めなくなる。
+    #[test]
+    fn restarting_leaves_the_rolling_windows_alone() {
+        let mut meter = LoudnessMeter::new(48_000);
+        meter.push(&stereo_sine(48_000, 4.0, 1000.0, -23.0));
+        assert!(meter.integrated() > -30.0);
+
+        meter.restart_integrated();
+        assert_eq!(meter.integrated(), SILENCE_LUFS, "Integrated は戻ること");
+        assert!(
+            (meter.short_term() - (-23.0)).abs() < 0.1,
+            "Short-term は戻らないこと ({})",
+            meter.short_term()
+        );
+        assert!(
+            (meter.momentary() - (-23.0)).abs() < 0.1,
+            "Momentary は戻らないこと ({})",
+            meter.momentary()
+        );
+    }
+
+    /// **測り直した後に、前の分が混じらないこと。**
+    ///
+    /// 400ms 窓は4区間ぶんあるので、起点直後の窓には前の音が残っている。
+    /// 大きい音のあとで測り直し、静かな音だけを入れて、静かなほうの値が出ること。
+    #[test]
+    fn the_previous_pass_does_not_leak_in() {
+        let mut meter = LoudnessMeter::new(48_000);
+        meter.push(&stereo_sine(48_000, 4.0, 1000.0, -14.0));
+        meter.restart_integrated();
+        meter.push(&stereo_sine(48_000, 4.0, 1000.0, -30.0));
+
+        assert!(
+            (meter.integrated() - (-30.0)).abs() < 0.1,
+            "Integrated が {} LUFS (期待 -30.0。前の -14 が混じっていないか)",
+            meter.integrated()
+        );
+    }
+
+    /// 起点から 400ms 経つまでは測らないこと (窓が1つも埋まっていない)
+    #[test]
+    fn the_integrated_needs_one_full_window() {
+        let mut meter = LoudnessMeter::new(48_000);
+        meter.push(&stereo_sine(48_000, 0.3, 1000.0, -23.0));
+        assert_eq!(meter.integrated(), SILENCE_LUFS);
+        assert_eq!(meter.integrated_blocks(), 0);
+
+        meter.push(&stereo_sine(48_000, 0.2, 1000.0, -23.0));
+        assert!(meter.integrated_blocks() > 0, "窓が埋まれば測り始めること");
+        assert!(meter.integrated() > -30.0);
     }
 
     /// レートを変えたら作り直せること (係数と溜めたものが両方入れ替わる)

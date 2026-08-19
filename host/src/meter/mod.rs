@@ -80,6 +80,14 @@ impl Meters {
         self.spectrum.reset();
     }
 
+    /// **Integrated だけ**を測り直す (再生開始・ループの折り返し)。
+    ///
+    /// M と S には触れない。直近を見るためのものなので、折り返しのたびに
+    /// -∞ へ戻ると読めなくなる。
+    pub fn restart_integrated(&mut self) {
+        self.loudness.restart_integrated();
+    }
+
     /// Momentary (400ms) のラウドネス
     pub fn momentary_lufs(&self) -> f32 {
         self.loudness.momentary()
@@ -88,6 +96,11 @@ impl Meters {
     /// Short-term (3秒) のラウドネス
     pub fn short_term_lufs(&self) -> f32 {
         self.loudness.short_term()
+    }
+
+    /// Integrated (測り直してから今まで) のラウドネス
+    pub fn integrated_lufs(&self) -> f32 {
+        self.loudness.integrated()
     }
 
     /// 帯ごとのレベル (dB)。左が低域

@@ -52,12 +52,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     ] {
         println!("-- {label} --");
 
-        let looped = render(&plugin_path, &[(start, duration)], LOOP_QUARTERS, true)?;
+        let Pass {
+            samples: looped,
+            passes,
+        } = render(&plugin_path, &[(start, duration)], LOOP_QUARTERS, true)?;
+        // 頭から通し直した回数 (再生開始で1 + 折り返しごとに1)。
+        // **Integrated ラウドネスの測り直しがこれで走る**ので、
+        // 折り返しが数えられていないと積算が周をまたいでしまう
+        println!(
+            "  頭から通した回数: {passes} (再生開始1 + 折り返し{})",
+            passes - 1
+        );
+        if passes < LOOPS as u64 {
+            failed = true;
+            println!("  ❌ 折り返しが数えられていない ({passes} 回。{LOOPS} 回以上のはず)");
+        }
         // 同じノートを LOOPS 個並べた、ループしないシーケンス
         let laid_out: Vec<(f32, f32)> = (0..LOOPS)
             .map(|turn| (start + LOOP_QUARTERS * turn as f32, duration))
             .collect();
-        let straight = render(&plugin_path, &laid_out, LOOP_QUARTERS * LOOPS as f32, false)?;
+        let straight =
+            render(&plugin_path, &laid_out, LOOP_QUARTERS * LOOPS as f32, false)?.samples;
 
         let frames = (looped.len() / CHANNELS).min(straight.len() / CHANNELS);
         let mut worst = 0.0f32;
@@ -100,6 +115,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 鳴らした結果
+struct Pass {
+    samples: Vec<f32>,
+    /// 頭から通した回数 (再生開始で1 + 折り返しごとに1)
+    passes: u64,
+}
+
 /// ノートを置いて `total_quarters` 拍ぶんのシーケンスを鳴らす。
 /// `looping` が true なら1周ぶんを [`LOOPS`] 周回す。
 fn render(
@@ -107,7 +129,7 @@ fn render(
     notes: &[(f32, f32)],
     total_quarters: f32,
     looping: bool,
-) -> Result<Vec<f32>, Box<dyn Error>> {
+) -> Result<Pass, Box<dyn Error>> {
     let (entry, plugins) = discovery::load_clap_file(Path::new(plugin_path))?;
     let target = &plugins[0];
 
@@ -146,7 +168,8 @@ fn render(
     // ループ側と展開側で1周の長さが揃わなくなる
     let end_sample = (total_quarters as f64 * spq) as u64;
 
-    let mut transport = Transport::new(TransportShared::new());
+    let shared = TransportShared::new();
+    let mut transport = Transport::new(shared.clone());
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
         events: editor.to_events_for_track(0, rate).into_boxed_slice(),
@@ -184,7 +207,10 @@ fn render(
         instance.deactivate(stopped);
     }
 
-    Ok(samples)
+    Ok(Pass {
+        samples,
+        passes: shared.pass.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// 隣り合うサンプルの差の最大 (段差 = クリック音の元)

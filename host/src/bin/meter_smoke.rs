@@ -43,23 +43,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ---- 1. 規格の試験信号 ----
     println!("-- EBU Tech 3341 試験信号1 (1kHz {TEST_TONE_DBFS} dBFS) --");
     for rate in [44_100u32, 48_000, 96_000] {
-        let lufs = measure_tone(rate);
-        let off = (lufs - TEST_TONE_DBFS as f32).abs();
-        let verdict = if off <= TOLERANCE_LU {
-            "OK"
-        } else {
-            failed = true;
-            "**ずれている**"
-        };
-        println!("  {rate:>6} Hz → {lufs:+7.2} LUFS (期待 {TEST_TONE_DBFS:+.1}) {verdict}");
+        let (short_term, integrated) = measure_tone(rate);
+        // 一定の水準なので S と I は揃うはず (ゲートで何も落ちない)
+        for (name, lufs) in [("S", short_term), ("I", integrated)] {
+            let off = (lufs - TEST_TONE_DBFS as f32).abs();
+            let verdict = if off <= TOLERANCE_LU {
+                "OK"
+            } else {
+                failed = true;
+                "**ずれている**"
+            };
+            println!(
+                "  {rate:>6} Hz {name} → {lufs:+7.2} LUFS (期待 {TEST_TONE_DBFS:+.1}) {verdict}"
+            );
+        }
     }
     println!();
 
     // ---- 2. 実際の音源 ----
     println!("-- 検証用プラグインの出力 --");
-    let (momentary, short_term, peak_band) = measure_plugin(&plugin_path)?;
+    let Plugin {
+        momentary,
+        short_term,
+        integrated,
+        peak_band,
+    } = measure_plugin(&plugin_path)?;
     println!("  Momentary : {momentary:+7.2} LUFS");
     println!("  Short-term: {short_term:+7.2} LUFS");
+    println!("  Integrated: {integrated:+7.2} LUFS");
     println!(
         "  いちばん強い帯: {:.0} Hz",
         spectrum::Spectrum::center_hz(peak_band)
@@ -84,9 +95,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// 試験信号をリングバッファ越しに流して Short-term を測る。
+/// 試験信号をリングバッファ越しに流して (Short-term, Integrated) を測る。
 /// **本体と同じく、オーディオ側は塊で押し込み、画面側は毎フレーム取り込む。**
-fn measure_tone(sample_rate: u32) -> f32 {
+fn measure_tone(sample_rate: u32) -> (f32, f32) {
     let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(1 << 16);
     let mut meters = Meters::new(sample_rate);
 
@@ -108,12 +119,20 @@ fn measure_tone(sample_rate: u32) -> f32 {
         meters.drain(&mut consumer, sample_rate, 1.0 / 60.0);
     }
     meters.drain(&mut consumer, sample_rate, 1.0 / 60.0);
-    meters.short_term_lufs()
+    (meters.short_term_lufs(), meters.integrated_lufs())
 }
 
-/// 検証用プラグインを鳴らし、その出力を測る。
-/// 戻り値は (Momentary, Short-term, いちばん強い帯)
-fn measure_plugin(plugin_path: &str) -> Result<(f32, f32, usize), Box<dyn Error>> {
+/// 検証用プラグインの出力の読み
+struct Plugin {
+    momentary: f32,
+    short_term: f32,
+    integrated: f32,
+    /// いちばん強い帯
+    peak_band: usize,
+}
+
+/// 検証用プラグインを鳴らし、その出力を測る
+fn measure_plugin(plugin_path: &str) -> Result<Plugin, Box<dyn Error>> {
     const SAMPLE_RATE: u32 = 44_100;
 
     let (entry, plugins) = discovery::load_clap_file(Path::new(plugin_path))?;
@@ -186,7 +205,12 @@ fn measure_plugin(plugin_path: &str) -> Result<(f32, f32, usize), Box<dyn Error>
             best
         }
     });
-    Ok((meters.momentary_lufs(), meters.short_term_lufs(), peak_band))
+    Ok(Plugin {
+        momentary: meters.momentary_lufs(),
+        short_term: meters.short_term_lufs(),
+        integrated: meters.integrated_lufs(),
+        peak_band,
+    })
 }
 
 fn instantiate(

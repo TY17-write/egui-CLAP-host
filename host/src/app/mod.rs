@@ -77,6 +77,10 @@ pub struct App {
     /// マスターのスペクトルとラウドネス。
     /// 中身はオーディオスレッドから流れてくるサンプルで毎フレーム更新する
     meters: Meters,
+    /// 最後に見た「頭から通した回数」
+    /// ([`TransportShared::pass`](crate::audio::transport::TransportShared::pass))。
+    /// **増えていたら Integrated を測り直す**
+    meter_pass: u64,
 }
 
 impl App {
@@ -240,6 +244,14 @@ impl eframe::App for App {
         match self.engine.as_mut() {
             Some(engine) => {
                 let rate = engine.config.sample_rate;
+                // **頭から通し直していたら Integrated を測り直す** (再生開始・ループ)。
+                // 取り込む前に戻すので、前の周の音がリングに数ブロック残っていれば
+                // 新しい周に混じる。積算の窓は 400ms なので、この 20ms 程度は響かない。
+                let pass = engine.transport_shared.pass.load(Ordering::Relaxed);
+                if pass != self.meter_pass {
+                    self.meter_pass = pass;
+                    self.meters.restart_integrated();
+                }
                 self.meters.drain(&mut engine.monitor, rate, dt);
             }
             None => self.meters.reset(),

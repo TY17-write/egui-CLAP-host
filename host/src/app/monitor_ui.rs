@@ -36,6 +36,7 @@ impl App {
 
         let momentary = self.meters.momentary_lufs();
         let short_term = self.meters.short_term_lufs();
+        let integrated = self.meters.integrated_lufs();
 
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -46,6 +47,13 @@ impl App {
                 ui.label(egui::RichText::new("S").size(10.0).color(palette::FG_DIM))
                     .on_hover_text("Short-term (直近3秒)");
                 ui.label(reading(short_term, running));
+                // **Integrated が最後に読む値。** 少し強めに出す
+                ui.label(egui::RichText::new("I").size(10.0).color(palette::FG))
+                    .on_hover_text(
+                        "Integrated (頭からの積算)。\
+                         再生を始めたときとループの折り返しで測り直します",
+                    );
+                ui.label(reading(integrated, running).strong());
                 ui.label(
                     egui::RichText::new(format!("基準 {REFERENCE_LUFS:.0}"))
                         .size(10.0)
@@ -53,8 +61,9 @@ impl App {
                 )
                 .on_hover_text("配信で事実上の基準になっている値");
             });
-            // 目盛りは Short-term で振る (Momentary は揺れが速すぎて読めない)
-            lufs_bar(ui, short_term, running);
+            // 棒は Short-term で振り、Integrated は印で重ねる。
+            // Momentary は揺れが速すぎて目盛りとしては読めない
+            lufs_bar(ui, short_term, integrated, running);
         });
     }
 }
@@ -78,8 +87,11 @@ fn reading(lufs: f32, running: bool) -> egui::RichText {
     }
 }
 
-/// ラウドネスの横棒。基準の位置に線を立てる
-fn lufs_bar(ui: &mut egui::Ui, lufs: f32, running: bool) {
+/// ラウドネスの横棒。
+///
+/// 塗りが `lufs` (Short-term)、白い線が基準、上下に出た三角が `integrated`。
+/// **積算だけ形を変える** — 揺れる塗りの上に重なるので、色だけだと見失う。
+fn lufs_bar(ui: &mut egui::Ui, lufs: f32, integrated: f32, running: bool) {
     let (rect, _) = ui.allocate_exact_size(vec2(LUFS_BAR_W, LUFS_BAR_H), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same(2), palette::BG_DARK);
@@ -107,6 +119,20 @@ fn lufs_bar(ui: &mut egui::Ui, lufs: f32, running: bool) {
         [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
         Stroke::new(1.5_f32, palette::FG),
     );
+
+    // Integrated の印 (太い縦棒)。塗りの色と重なっても分かるよう、
+    // 基準の線とは違う色にする
+    if running && integrated > SILENCE_LUFS {
+        let x = to_x(integrated);
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - 1.5, rect.top() - 2.0),
+                Pos2::new(x + 1.5, rect.bottom() + 2.0),
+            ),
+            CornerRadius::same(1),
+            palette::YELLOW,
+        );
+    }
 }
 
 /// スペクトル。左が低域で、縦は dB

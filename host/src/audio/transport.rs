@@ -33,6 +33,13 @@ pub struct TransportShared {
     pub pos: Arc<AtomicU64>,
     /// 再生中か
     pub playing: Arc<AtomicBool>,
+    /// **頭から通した回数。** 再生を始めたときとループの折り返しで1つ増える。
+    ///
+    /// 位置 (`pos`) の巻き戻りで見分けようとすると、短いループを1フレームの間に
+    /// 2周した場合に取りこぼす。数える側を1つに決めておけば、増えた分だけ
+    /// 「何回頭に戻ったか」が確実に分かる。
+    /// 今のところ Integrated ラウドネスの測り直しに使っている。
+    pub pass: Arc<AtomicU64>,
 }
 
 impl TransportShared {
@@ -40,6 +47,7 @@ impl TransportShared {
         Self {
             pos: Arc::new(AtomicU64::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
+            pass: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -116,6 +124,11 @@ impl Transport {
         self.shared.playing.store(self.playing, Ordering::Relaxed);
     }
 
+    /// 頭から通し直したことを知らせる (再生開始・ループの折り返し)
+    fn begin_pass(&self) {
+        self.shared.pass.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// GUI からの操作を処理する。
     /// 戻り値が true なら、鳴りっぱなし防止のため全トラックを消音する必要がある
     /// (どのトラックへ消音イベントを積むかは呼び出し側が決める)。
@@ -141,6 +154,8 @@ impl Transport {
                 }
                 self.recompute_next_event();
                 self.playing = true;
+                // 頭から通し直す合図 (ループの折り返しと同じ扱い)
+                self.begin_pass();
             }
             TransportMsg::Stop => {
                 needs_choke = self.playing;
@@ -201,6 +216,7 @@ impl Transport {
                 if self.looping {
                     span.rewind = true;
                     self.pos = 0;
+                    self.begin_pass();
                 } else {
                     self.playing = false;
                     self.pos = self.end_sample;
