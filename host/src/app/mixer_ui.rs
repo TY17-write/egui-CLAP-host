@@ -10,6 +10,7 @@ use super::routing::{MAX_GAIN_DB, MIN_GAIN_DB};
 use super::track::TrackPlugin;
 use super::App;
 use crate::audio::graph;
+use crate::theme::palette;
 use crate::{audio, theme};
 use eframe::egui;
 
@@ -24,6 +25,17 @@ const TRACK_SENDS_W: f32 = 74.0;
 /// 詳細ウィンドウで、段の名前とチャンネル表記に取る幅 (理由は上と同じ)
 const NODE_NAME_W: f32 = 150.0;
 const NODE_CHANNELS_W: f32 = 56.0;
+
+/// M / S / B のような1文字の切り替えの文字。
+///
+/// **入っているときだけ色を付ける。** 打ち込みトラック欄 (`editor_ui::gutter`)
+/// と同じ流儀で、切り替えの状態を枠だけでなく色でも出す。
+/// 消えているときは目立たせない ([`palette::FG_DIM`])。
+fn toggle_text(label: &str, on: bool, color: egui::Color32) -> egui::RichText {
+    egui::RichText::new(label)
+        .size(10.0)
+        .color(if on { color } else { palette::FG_DIM })
+}
 
 impl App {
     /// 音源の形式を選ばせるポップアップ。
@@ -297,11 +309,21 @@ impl App {
                                     mixer_changed = true;
                                 }
 
-                                if ui.toggle_value(&mut track.muted, "M").changed() {
+                                // **色は打ち込みトラック欄と揃える。**
+                                // 同じ意味の切り替えが窓ごとに違う見た目だと、
+                                // どちらが入っているのか読み取れない
+                                // 文字は先に作る (切り替えへ渡す借用と重ならないように)
+                                let mute_text = toggle_text("M", track.muted, palette::RED);
+                                if ui
+                                    .toggle_value(&mut track.muted, mute_text)
+                                    .on_hover_text("ミュート (このトラックを鳴らさない)")
+                                    .changed()
+                                {
                                     mixer_changed = true;
                                 }
+                                let solo_text = toggle_text("S", track.soloed, palette::YELLOW);
                                 if ui
-                                    .toggle_value(&mut track.soloed, "S")
+                                    .toggle_value(&mut track.soloed, solo_text)
                                     .on_hover_text("ソロ。マスターへ至る経路は残る")
                                     .changed()
                                 {
@@ -438,8 +460,12 @@ impl App {
                         );
 
                         let mut bypassed = node.bypassed;
+                        // **赤にはしない。** 赤は「鳴らない」に取ってあり、
+                        // バイパスは音が通る (素通しになるだけ)。
+                        // 打ち込み欄の W / V と同じ「この切り替えが入っている」の水色
+                        let bypass_text = toggle_text("B", bypassed, palette::CYAN);
                         if ui
-                            .toggle_value(&mut bypassed, "B")
+                            .toggle_value(&mut bypassed, bypass_text)
                             .on_hover_text(
                                 "バイパス (この段の音を捨てて素通し)。\
                                  処理自体は続けるので、戻したときに続きから鳴ります",
