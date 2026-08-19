@@ -51,6 +51,10 @@ cargo run -p egui-clap-host --bin route_smoke -- target\test_plugin.clap # ト�
 cargo run -p egui-clap-host --bin loop_smoke -- target\test_plugin.clap  # ループの折り返しの検証
 cargo run -p egui-clap-host --bin meter_smoke -- target\test_plugin.clap # ラウドネス・スペクトルの検証
 
+# フォルダ走査の検証 (渡したフォルダの中身を実際に開く)。
+# 引数なしで実行すると、この環境の標準の置き場を一覧するだけで終わる
+cargo run -p egui-clap-host --bin scan_smoke -- target
+
 # Opus 書き出しの検証 (音源不要。呼び出し側のスタックを細くしても通るかを見る)
 cargo run -p egui-clap-host --bin opus_smoke
 cargo run -p egui-clap-host --bin opus_smoke -- 262144   # 256KiB のスレッドから呼ぶ

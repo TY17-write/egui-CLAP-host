@@ -359,6 +359,110 @@ pub fn existing_standard_folders() -> Vec<PathBuf> {
         .collect()
 }
 
+/// 走査の進行。
+///
+/// **1ファイルずつ進める。** 別スレッドにしないのは、CLAP も VST3 も
+/// モジュールの読み込みがメインスレッドの規約に縛られているため。
+/// 画面から毎フレーム [`step`](Self::step) を呼べば、進捗を出しながら
+/// 反応を保てるし、途中でやめられる。
+pub struct Scan {
+    /// まだ開いていない候補 (**後ろから取る**ので逆順に積んである)
+    queue: Vec<PathBuf>,
+    /// 最初に見つけた候補の数
+    total: usize,
+    /// 開けなかったものの説明
+    problems: Vec<String>,
+    /// 走査前に星が付いていたもの。**走査し直しても消さない**
+    favorites: Vec<(PathBuf, String)>,
+}
+
+impl Scan {
+    /// 登録されたフォルダから候補を集める。**まだ1つも開かない。**
+    ///
+    /// 対象フォルダの記録はここで捨てる (消えたプラグインを残さないため)。
+    /// 星だけは控えて、見つかり直したら付け直す。
+    pub fn start(library: &mut Library) -> Self {
+        let mut favorites = Vec::new();
+        let mut queue = Vec::new();
+
+        for folder in library.folders.clone() {
+            favorites.extend(library.forget_under(&folder));
+            for path in crate::discovery::plugin_files(&folder) {
+                // 前に落ちたファイルは開きに行かない
+                if library.blocked.contains(&path) {
+                    continue;
+                }
+                queue.push(path);
+            }
+        }
+
+        queue.sort();
+        queue.dedup();
+        let total = queue.len();
+        // pop() で前から取れるように積み直す
+        queue.reverse();
+
+        Self {
+            queue,
+            total,
+            problems: Vec::new(),
+            favorites,
+        }
+    }
+
+    /// 1ファイルだけ開いて一覧へ入れる。終わっていれば `None`。
+    ///
+    /// **開く直前に目印を書き、開き終えたら消す。** 途中で落ちても、次の起動で
+    /// どのファイルだったか分かる ([`take_crashed`])。
+    pub fn step(&mut self, library: &mut Library) -> Option<PathBuf> {
+        let path = self.queue.pop()?;
+        let Some(kind) = crate::discovery::kind_of(&path) else {
+            return Some(path); // 候補の集め方が変わらない限り起きない
+        };
+
+        mark_scanning(&path);
+        match crate::discovery::scan_file(&path) {
+            Ok(found) => {
+                for plugin in found {
+                    let favorite = self
+                        .favorites
+                        .iter()
+                        .any(|(kept, id)| *kept == path && *id == plugin.id);
+                    library.insert(Entry {
+                        kind,
+                        path: path.clone(),
+                        id: plugin.id,
+                        name: plugin.name,
+                        vendor: plugin.vendor,
+                        version: plugin.version,
+                        role: plugin.role,
+                        favorite,
+                    });
+                }
+            }
+            Err(e) => self.problems.push(format!("{}: {e}", path.display())),
+        }
+        clear_scanning();
+
+        Some(path)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// (開いた数, 全体)
+    pub fn progress(&self) -> (usize, usize) {
+        (self.total - self.queue.len(), self.total)
+    }
+
+    /// 開けなかったものの説明。**空でも成功とは限らない**
+    /// (中にプラグインが1つも無いファイルもここに来る)
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
