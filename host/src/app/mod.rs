@@ -37,9 +37,16 @@ use std::time::Duration;
 
 #[derive(Default)]
 pub struct App {
-    /// 「+」を押したあと、音源の形式を選んでもらっている最中の段。
-    /// 形式ごとにダイアログの出し方が違うので、先に [`LoadChoice`] を決める必要がある。
+    /// 「+」を押したあと、**どの段へ載せようとしているか**。
+    ///
+    /// `Some` の間はプラグインの窓が「選んで載せる」状態になり、
+    /// 一覧の行を押すとそこへ載る。
     pending_load: Option<audio::NodeAddr>,
+    /// 一覧に無いものをファイルから直接読む流れに入っているか。
+    ///
+    /// 形式ごとにダイアログの出し方が違うので、先に [`LoadChoice`] を決める
+    /// 必要がある。**一覧から選ぶのが普通の道**で、こちらは逃げ道。
+    direct_dialog: bool,
     candidates: Option<Candidates>,
     // 宣言順にドロップされるため、ストリームをインスタンスより先に止める
     engine: Option<Engine>,
@@ -475,33 +482,45 @@ impl eframe::App for App {
                 load_plugin_track = Some(addr);
             }
 
-            // 詳細ウィンドウの「+」。まず形式を聞く行を出す
+            // 詳細ウィンドウの「+」。**走査した一覧から選んでもらう。**
+            // ファイルから直接読む道も残してあるが、そちらは一覧の中のボタンから
             if let Some(track) = load_plugin_track {
                 self.pending_load = Some(track);
                 self.candidates = None;
+                self.show_library = true;
+                // 先頭の段は音源、それ以降はエフェクトを見たいことが多い
+                self.library_tab = if track.at == 0 {
+                    Tab::Instrument
+                } else {
+                    Tab::Effect
+                };
             }
 
             // 形式が決まったらダイアログを開く。
             // 新しく読み込めたときだけ装填する (キャンセルでは何もしない)
             if let Some(chosen) = chosen_kind {
-                let Some(track) = self.pending_load.take() else {
-                    return;
-                };
-                let opened = match chosen {
-                    LoadChoice::Clap => self.open_clap_dialog(track),
-                    LoadChoice::Vst3Bundle => self.open_vst3_dialog(track, true),
-                    LoadChoice::Vst3File => self.open_vst3_dialog(track, false),
-                    LoadChoice::Cancel => false,
-                };
-                if opened {
-                    // 候補が1つだけならそのまま載せる (選択の手間を省く)
-                    let single = self
-                        .candidates
-                        .as_ref()
-                        .is_some_and(|candidates| candidates.plugins.len() == 1);
-                    if single {
-                        self.instantiate(0, track);
-                        self.candidates = None;
+                self.direct_dialog = false;
+                // **やめたときは段の指定を残す。** 一覧へ戻るだけにする
+                if chosen != LoadChoice::Cancel {
+                    let Some(track) = self.pending_load.take() else {
+                        return;
+                    };
+                    let opened = match chosen {
+                        LoadChoice::Clap => self.open_clap_dialog(track),
+                        LoadChoice::Vst3Bundle => self.open_vst3_dialog(track, true),
+                        LoadChoice::Vst3File => self.open_vst3_dialog(track, false),
+                        LoadChoice::Cancel => false,
+                    };
+                    if opened {
+                        // 候補が1つだけならそのまま載せる (選択の手間を省く)
+                        let single = self
+                            .candidates
+                            .as_ref()
+                            .is_some_and(|candidates| candidates.plugins.len() == 1);
+                        if single {
+                            self.instantiate(0, track);
+                            self.candidates = None;
+                        }
                     }
                 }
             }

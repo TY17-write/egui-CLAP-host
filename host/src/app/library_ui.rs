@@ -137,6 +137,7 @@ impl App {
             .default_pos(egui::pos2(24.0, 60.0))
             .open(&mut open)
             .show(ctx, |ui| {
+                self.library_picking(ui);
                 self.library_folders(ui);
                 ui.separator();
                 self.library_progress(ui);
@@ -144,7 +145,45 @@ impl App {
                 ui.separator();
                 self.library_list(ui);
             });
+
+        // **閉じたら段の指定も解く。** 載せる先を握ったまま窓だけ消えると、
+        // 次に開いたときに身に覚えのない「載せます」が出る
+        if !open {
+            self.pending_load = None;
+        }
         self.show_library = open;
+    }
+
+    /// 「この段に載せる」状態のときの見出し。
+    ///
+    /// **一覧に無いものはファイルから直接読める。** 走査で落ちるプラグインや、
+    /// 登録していないフォルダのものを試したいことがあるので、この道は残す。
+    fn library_picking(&mut self, ui: &mut egui::Ui) {
+        let Some(addr) = self.pending_load else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "オーディオトラック {} の {} 段目に載せます",
+                    addr.track,
+                    addr.at + 1
+                ))
+                .color(palette::GREEN),
+            );
+            if ui
+                .button("ファイルから直接…")
+                .on_hover_text("一覧に無いプラグインを、ファイルを選んで読み込みます")
+                .clicked()
+            {
+                self.direct_dialog = true;
+            }
+            if ui.button("やめる").clicked() {
+                self.pending_load = None;
+            }
+        });
+        ui.weak("下の一覧から選ぶと、その段に載ります");
+        ui.separator();
     }
 
     /// 走査するフォルダの管理
@@ -348,7 +387,9 @@ impl App {
             return;
         }
 
+        let picking = self.pending_load.is_some();
         let mut toggle = None;
+        let mut load = None;
         egui::ScrollArea::vertical()
             .max_height(320.0)
             .show(ui, |ui| {
@@ -373,17 +414,29 @@ impl App {
                             toggle = Some((path.clone(), id.clone()));
                         }
 
-                        ui.add_sized(
-                            [NAME_W, 20.0],
-                            egui::Label::new(entry.label())
-                                .truncate()
-                                .halign(egui::Align::LEFT),
-                        )
-                        .on_hover_text(format!(
-                            "{}\n{}",
-                            entry.path.display(),
-                            entry.id
-                        ));
+                        // **段を選んでいる間だけ押せる。** そうでないときに
+                        // ボタンに見えると、押しても何も起きなくて戸惑う
+                        let where_it_is = format!("{}\n{}", entry.path.display(), entry.id);
+                        if picking {
+                            if ui
+                                .add_sized(
+                                    [NAME_W, 20.0],
+                                    egui::Button::new(entry.label()).truncate(),
+                                )
+                                .on_hover_text(format!("この段に載せる\n\n{where_it_is}"))
+                                .clicked()
+                            {
+                                load = Some((path.clone(), id.clone()));
+                            }
+                        } else {
+                            ui.add_sized(
+                                [NAME_W, 20.0],
+                                egui::Label::new(entry.label())
+                                    .truncate()
+                                    .halign(egui::Align::LEFT),
+                            )
+                            .on_hover_text(where_it_is);
+                        }
 
                         ui.add_sized(
                             [VENDOR_W, 20.0],
@@ -411,6 +464,38 @@ impl App {
         if let Some((path, id)) = toggle {
             self.library.toggle_favorite(&path, &id);
             let _ = library::save(&self.library);
+        }
+        if let Some((path, id)) = load {
+            self.load_from_library(&path, &id);
+        }
+    }
+
+    /// 一覧の1件を、待っている段へ載せる。
+    ///
+    /// 一覧が持っているのは (形式, パス, ID) の3つで、これは
+    /// [`load_plugin`](App::load_plugin) がそのまま受け取れる形。
+    /// **載せる経路自体は今までと同じ**で、選び方だけが変わっている。
+    fn load_from_library(&mut self, path: &std::path::Path, id: &str) {
+        let Some(addr) = self.pending_load else {
+            return;
+        };
+        let Some(entry) = self.library.plugins.iter().find(|entry| entry.is(path, id)) else {
+            return;
+        };
+        let (kind, path, name) = (entry.kind, entry.path.clone(), entry.label().to_string());
+
+        match self.load_plugin(addr, kind, &path, id, None) {
+            Ok(_) => {
+                self.pending_load = None;
+                self.error = None;
+            }
+            // **窓は開けたままにする。** 別のものを選び直せるように
+            Err(e) => {
+                self.notice = Some(Notice::error(
+                    "音源を読み込めません",
+                    format!("{name}\n{}\n\n{e}", path.display()),
+                ))
+            }
         }
     }
 }

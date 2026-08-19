@@ -34,6 +34,11 @@ impl App {
     /// **画面中央に出す。** 上部に行として出していたときは、押す場所が
     /// 画面の隅にあって遠かった。
     pub(super) fn load_choice_popup(&mut self, ctx: &egui::Context) -> Option<LoadChoice> {
+        // **普通は一覧から選ぶ。** ここへ来るのは「ファイルから直接…」を
+        // 押したときだけ
+        if !self.direct_dialog {
+            return None;
+        }
         let track = self.pending_load?;
         let mut chosen = None;
 
