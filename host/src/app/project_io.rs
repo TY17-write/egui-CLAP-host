@@ -82,6 +82,9 @@ impl App {
 
     /// MIDI ファイルへ書き出す。スウィングが乗るので、編集の保存には使わない
     /// (それはプロジェクト形式の役目)。
+    ///
+    /// **画面上は「出力」の仲間**だが、コードは MIDI の読み込みと隣に置いてある
+    /// (同じ形式の入り口と出口を離すほうが探しにくい)。
     pub(super) fn export_midi(&mut self) {
         let Some(path) = self.ask_save_path("MIDI ファイル", "mid", "sequence.mid") else {
             return;
@@ -94,11 +97,36 @@ impl App {
                 return;
             }
         };
+        let size = bytes.len();
 
         match std::fs::write(&path, bytes) {
             Ok(()) => {
                 self.last_directory = path.parent().map(PathBuf::from);
                 self.error = None;
+
+                let editor = &self.editor.editor;
+                let mut body = format!(
+                    "{}\n\n{} トラック / {} ノート ({size} バイト)",
+                    path.display(),
+                    editor.track_count(),
+                    editor.notes.len(),
+                );
+                // **揺らぎが乗ったことは伏せない。** 書いた位置と鳴る位置が
+                // 違うファイルになるので、編集の保存に使うと記譜が崩れる
+                let swinging = (0..editor.track_count()).any(|track| editor.track_swings(track));
+                let waltzing = (0..editor.track_count()).any(|track| editor.track_waltzes(track));
+                if swinging || waltzing {
+                    let what = match (swinging, waltzing) {
+                        (true, true) => "スウィングと拍の偏り",
+                        (true, false) => "スウィング",
+                        _ => "拍の偏り",
+                    };
+                    body.push_str(&format!(
+                        "\n\n※ {what}が乗っています。\
+                         記譜どおりに残したいときはプロジェクト (.ron) で保存してください。"
+                    ));
+                }
+                self.notice = Some(Notice::ok("MIDI を書き出しました", body).with_path(&path));
             }
             Err(e) => {
                 self.notice = Some(Notice::error(

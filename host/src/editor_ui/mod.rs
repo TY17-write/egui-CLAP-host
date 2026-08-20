@@ -161,22 +161,13 @@ pub fn editor_panel(
 
             ui.separator();
 
+            // **書き出しは「出力」へ移した。** 読み込みだけがここに残る
             if ui
                 .button("MIDI インポート")
                 .on_hover_text("MIDI ファイルを読み込む (今のノートは置き換わります)")
                 .clicked()
             {
                 commands.push(EditorCommand::ImportMidi);
-                ui.close_menu();
-            }
-            if ui
-                .button("MIDI エクスポート")
-                .on_hover_text(
-                    "MIDI ファイルに書き出す (スウィングが乗ります。編集の保存には使わないこと)",
-                )
-                .clicked()
-            {
-                commands.push(EditorCommand::ExportMidi);
                 ui.close_menu();
             }
         });
@@ -211,6 +202,21 @@ pub fn editor_panel(
                     }
                 }
             });
+
+            // **ここから下は音ではなく譜面の書き出し。** 上の2つ (音声) とは
+            // 用途が違うので区切る
+            ui.separator();
+
+            if ui
+                .button("MIDI ファイルとして出力")
+                .on_hover_text(
+                    "MIDI ファイルに書き出す (スウィングが乗ります。編集の保存には使わないこと)",
+                )
+                .clicked()
+            {
+                commands.push(EditorCommand::ExportMidi);
+                ui.close_menu();
+            }
             if ui
                 .button("CCS ファイルとして出力")
                 .on_hover_text("CeVIO のプロジェクトファイルに書き出す (1トラック目のみ)")
