@@ -169,6 +169,8 @@ impl App {
         if let Some(index) = chosen {
             self.instantiate(index, target);
             self.candidates = None;
+            // 一覧から選んだときと同じく、載せたら閉じる
+            self.show_library = false;
         } else if cancel {
             self.candidates = None;
         }

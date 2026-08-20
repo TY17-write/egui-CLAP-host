@@ -520,6 +520,8 @@ impl eframe::App for App {
                         if single {
                             self.instantiate(0, track);
                             self.candidates = None;
+                            // 一覧から選んだときと同じく、載せたら閉じる
+                            self.show_library = false;
                         }
                     }
                 }

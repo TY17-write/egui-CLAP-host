@@ -182,7 +182,7 @@ impl App {
                 self.pending_load = None;
             }
         });
-        ui.weak("下の一覧から選ぶと、その段に載ります");
+        ui.weak("下の一覧から選ぶと、その段に載ってこの窓は閉じます");
         ui.separator();
     }
 
@@ -488,6 +488,9 @@ impl App {
             Ok(_) => {
                 self.pending_load = None;
                 self.error = None;
+                // **載せたら閉じる。** 開いたままだと、載ったのかどうかが
+                // 画面から読み取れない。次の段は「＋」から入り直す
+                self.show_library = false;
             }
             // **窓は開けたままにする。** 別のものを選び直せるように
             Err(e) => {

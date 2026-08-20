@@ -233,7 +233,7 @@ impl App {
                 // 音源の処理に失敗したトラックは無音のまま混ざっている。
                 // ファイルは残すが、成功として見せると欠けたまま気付けない。
                 if rendered.failures.is_empty() {
-                    self.notice = Some(Notice::ok("WAV を書き出しました", body));
+                    self.notice = Some(Notice::ok("WAV を書き出しました", body).with_path(&path));
                 } else {
                     body.push_str(
                         "\n\n次のトラックは音源の処理に失敗したため、無音になっています。",
@@ -246,7 +246,11 @@ impl App {
                             failure.blocks
                         ));
                     }
-                    self.notice = Some(Notice::error("WAV の一部を書き出せませんでした", body));
+                    // **失敗した側にも付ける。** ファイル自体はできているので、
+                    // 中身を聞いて確かめたくなる
+                    self.notice = Some(
+                        Notice::error("WAV の一部を書き出せませんでした", body).with_path(&path),
+                    );
                 }
             }
             Err(e) => self.fail_export(format!("保存できません:\n{e}")),
@@ -381,10 +385,11 @@ impl App {
             }
         }
 
+        // 一部に問題があってもファイル自体はできているので、どちらにも付ける
         if failed {
-            Notice::error("Opus を書き出しました (一部に問題あり)", body)
+            Notice::error("Opus を書き出しました (一部に問題あり)", body).with_path(path)
         } else {
-            Notice::ok("Opus を書き出しました", body)
+            Notice::ok("Opus を書き出しました", body).with_path(path)
         }
     }
 
@@ -426,7 +431,7 @@ impl App {
                         exported.skipped
                     ));
                 }
-                self.notice = Some(Notice::ok("CCS を書き出しました", body));
+                self.notice = Some(Notice::ok("CCS を書き出しました", body).with_path(&path));
             }
             Err(e) => {
                 self.notice = Some(Notice::error(
