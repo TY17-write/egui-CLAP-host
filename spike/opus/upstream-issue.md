@@ -13,7 +13,7 @@
 
 再現コードは同じディレクトリの `main.rs` / `pvq_check.rs` / `cwrs_bound.rs` /
 `cwrs_check.rs` / `spectral_match.rs`。測定の経緯と、こちらの対処
-(48 / 96kbps に絞った理由) は `docs/export_rate_plan.md` の
+(48 / 96kbps に絞った理由) は `docs/archive/export_rate_plan.md` の
 「高ビットレートは出さない」を参照。
 
 ## 0.1.28 で直った (2026-08-17 に確認)
@@ -62,7 +62,7 @@ PVQ 側も変わった。
 
 `host/src/opus.rs` の `BITRATES_KBPS` を **48 / 96 → 48 / 96 / 128 / 192** に
 広げ、**実際の曲を 192kbps で書き出して聴いて確かめた** (ノイズにならない)。
-経緯は `docs/export_rate_plan.md` の「0.1.28 で直った」。
+経緯は `docs/archive/export_rate_plan.md` の「0.1.28 で直った」。
 
 **版を上げるとスタックが足りなくなる。** これは別件なので
 `upstream-issue-stack.md` に分けた (原因は 0.1.27 の設計変更)。

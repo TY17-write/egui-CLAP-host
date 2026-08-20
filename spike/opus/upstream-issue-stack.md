@@ -13,7 +13,7 @@
 **「遅くていいのでヒープに置く経路も欲しい」程度のお願い**として出す。
 
 再現コードは `src/bin/stack_probe.rs`。本体側の対処は `host/src/opus.rs` の
-`ENCODE_STACK`、経緯は `docs/export_rate_plan.md`。
+`ENCODE_STACK`、経緯は `docs/archive/export_rate_plan.md`。
 
 ## 0.1.29 で入った (2026-08-17)
 

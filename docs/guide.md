@@ -85,7 +85,7 @@ cargo test -p egui-clap-host --lib
 | 1 | `com.example.test-gain` | `out = in * gain + offset` のエフェクト |
 
 エフェクトのほうは**音声ルーティングの検証治具**で、音として使うものではない
-(経緯は [routing_plan.md](routing_plan.md))。**索引0 が音源のまま**なので、
+(経緯は [archive/routing_plan.md](archive/routing_plan.md))。**索引0 が音源のまま**なので、
 最初の1つを取る検証バイナリは今まで通り音源を掴む。
 
 画面から読み込むと**候補が2つ出る**ので、どちらかを選ぶことになる。
@@ -290,7 +290,7 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 (時間軸ごと写すので写像が単調)。
 
 強さの既定値はスウィングと違って**典拠が無く、耳で決めた出発点**
-(`docs/waltz-plan.md`)。
+(`docs/archive/waltz-plan.md`)。
 
 書き出した MIDI にも跳ねが乗る。読み戻すと跳ねが二重に掛かるので、
 編集を保存する用途には使わないこと。
@@ -607,7 +607,7 @@ cargo run -p egui-clap-host --bin egui-clap-host
 `opus-rs` と `ogg` はどちらも純 Rust で、**C のビルド環境 (CMake) は要らない**。
 
 選べるビットレートを広げた経緯、版ごとのスタック実測、上流へ出した2件の報告は
-[export_rate_plan.md](export_rate_plan.md) にまとめてある。
+[archive/export_rate_plan.md](archive/export_rate_plan.md) にまとめてある。
 
 ### CeVIO (.ccs) への書き出し
 
@@ -683,7 +683,7 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 | CC | 生 MIDI (`0xB0`)。**MIDI を受けないポートには送れない** | `IMidiMapping` 経由でパラメータへ |
 | 音源の持ち方 | 処理器だけを切り離してオーディオスレッドへ | `Arc<Mutex<Plugin>>` を共有し、オーディオ側は `try_lock` |
 
-設計の経緯と実測は [vst3_host_plan.md](vst3_host_plan.md) に残してある。
+設計の経緯と実測は [archive/vst3_host_plan.md](archive/vst3_host_plan.md) に残してある。
 
 ### ソースの置き場
 
@@ -720,7 +720,7 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 約 16.7ms なので、16ms を要求すると毎回すでに期限切れになり、ループが待機状態に
 入らず**メッセージキューが常に捌き残る**。割を食うのは同じスレッドに貼り付いた
 プラグインのエディタで、単発のクリックは通るのにホバーやドラッグが効かなくなる
-(一部の音源で発覚。経緯は [vst3_host_plan.md](vst3_host_plan.md) のフェーズ7)。
+(一部の音源で発覚。経緯は [archive/vst3_host_plan.md](archive/vst3_host_plan.md) のフェーズ7)。
 
 ## 制限事項・既知の注意点
 

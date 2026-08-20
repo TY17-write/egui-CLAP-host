@@ -549,7 +549,7 @@ impl eframe::App for App {
         // (`interrupt_msg_dispatch`)、待機に入らない限りキューが常に捌き残る。
         // 割を食うのは**同じスレッドに貼り付いたプラグインのエディタ**で、
         // 単発のクリックは通るのにホバーやドラッグが効かなくなる
-        // (Native Instruments の音源で発覚。経緯は docs/vst3_host_plan.md のフェーズ7)。
+        // (Native Instruments の音源で発覚。経緯は docs/archive/vst3_host_plan.md のフェーズ7)。
         //
         // エディタを開いていないときは誰も割を食わないので、そのまま滑らかに保つ。
         let interval = if self.any_editor_open() { 33 } else { 16 };
