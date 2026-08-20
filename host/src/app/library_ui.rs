@@ -151,7 +151,12 @@ impl App {
         if !open {
             self.pending_load = None;
         }
-        self.show_library = open;
+
+        // **中で閉じると決めたぶんも汲む。** 音源を載せた [`load_from_library`] は
+        // `show_library` を false にするが、ここで `open` (窓の × の状態) を
+        // そのまま代入すると、その指示を消してしまう。
+        // どちらかが「閉じる」と言っていれば閉じる。
+        self.show_library = open && self.show_library;
     }
 
     /// 「この段に載せる」状態のときの見出し。
