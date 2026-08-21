@@ -19,6 +19,7 @@ pub mod params;
 pub mod plugin_window;
 pub mod project;
 pub mod sequencer;
+pub mod subscan;
 pub mod swing;
 pub mod theme;
 pub mod timers;

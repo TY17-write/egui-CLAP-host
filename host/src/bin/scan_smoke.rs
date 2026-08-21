@@ -7,19 +7,25 @@
 //! 本物のプラグインフォルダを渡せば、そこで何が読めて何が読めないかが分かる。
 //! **読めなかったものも必ず出す** (黙って一覧から消えるのがいちばん困る)。
 //!
-//! **走査は2回まわす。**
+//! **走査は3回まわす。**
 //!
-//! 1. 記録が無い状態から全部開く → ファイルごとの所要時間が出る
+//! 1. 別プロセスで全部開く → ファイルごとの所要時間が出る
 //! 2. そのまま走査し直す → **1件も開かないはず** (差分走査)
+//! 3. 同じプロセスで全部開き直す → **1と同じ結果になるはず**
 //!
 //! 2回目で開いたものが出たら、印の取り方がそのファイルに効いていない
-//! (ディレクトリを見てしまう等)。時間のかかるプラグインが分かるので、
-//! 遅い環境ではまずこれを流すとよい。
+//! (ディレクトリを見てしまう等)。3回目で結果が変われば、別プロセスとの
+//! やり取りのどこかが欠けている。1と3の時間差が**プロセスを起てる代償**。
+//!
+//! 時間のかかるプラグインが分かるので、遅い環境ではまずこれを流すとよい。
+//!
+//! **別プロセス走査には `egui-clap-host` の実行ファイルが要る。**
+//! 隣に無ければ同じプロセスで開くので、先に `cargo build` しておくこと。
 //!
 //! 使い方: cargo run -p egui-clap-host --bin scan_smoke -- <フォルダ> [フォルダ...]
 
 use egui_clap_host::discovery;
-use egui_clap_host::library::{self, Library, Role, Scan};
+use egui_clap_host::library::{self, Entry, Library, Role, Scan};
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -96,14 +102,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // **本体と同じく1ファイルずつ進める** (画面から毎フレーム呼ぶのと同じ経路)
+    library.isolate = true;
     let (elapsed, timings, scan) = run(&mut library, false);
 
     let (done, total) = scan.progress();
     println!(
-        "1回目: {done}/{total} ファイルを開いて {} 個のプラグインを見つけた ({:.1} 秒)",
+        "1回目 (別プロセス): {done}/{total} ファイルを開いて {} 個のプラグインを見つけた ({:.1} 秒)",
         library.plugins.len(),
         elapsed.as_secs_f64()
     );
+    if scan.crashed() > 0 {
+        println!("  {} 件が落ちたので飛ばすことにした", scan.crashed());
+    }
     for (took, path) in timings.iter().take(SLOWEST) {
         println!("  {took:>6} ms  {}", path.display());
     }
@@ -173,6 +183,50 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("使い回した記録が1回目と食い違う".into());
     }
 
-    println!("✅ 走査できた (差分走査も効いている)");
+    // **3回目。** 同じプロセスで開き直し、別プロセスと同じ結果になるか見る
+    library.isolate = false;
+    let (direct, _, third) = run(&mut library, true);
+    println!();
+    println!(
+        "3回目 (同じプロセス): {} 件を開いた ({:.1} 秒)",
+        third.progress().0,
+        direct.as_secs_f64()
+    );
+    println!(
+        "  プロセスを起てる代償: {:.1} 秒 ({} 件ぶん)",
+        elapsed.as_secs_f64() - direct.as_secs_f64(),
+        done
+    );
+
+    // 落ちたファイルは1回目で blocked に入り、3回目では候補から外れる。
+    // 中身の比較はそれを差し引いてから
+    if scan.crashed() == 0 && !same_plugins(&library, &before) {
+        return Err("別プロセスで開いた結果と、同じプロセスで開いた結果が違う".into());
+    }
+
+    println!("✅ 走査できた (差分走査・別プロセスとも効いている)");
     Ok(())
+}
+
+/// 見つけたプラグインが同じか。**印は見ない** (開いた時刻で変わらないが、
+/// 走査のたびに取り直すので、比べるのは中身だけにする)
+fn same_plugins(left: &Library, right: &Library) -> bool {
+    let key = |entry: &Entry| {
+        (
+            entry.path.clone(),
+            entry.id.clone(),
+            entry.name.clone(),
+            entry.role.label(),
+            entry.vendor.clone(),
+            entry.version.clone(),
+        )
+    };
+    let mut a: Vec<_> = left.plugins.iter().map(key).collect();
+    let mut b: Vec<_> = right.plugins.iter().map(key).collect();
+    a.sort();
+    b.sort();
+    if a != b {
+        eprintln!("  別プロセス {} 件 / 同じプロセス {} 件", b.len(), a.len());
+    }
+    a == b
 }

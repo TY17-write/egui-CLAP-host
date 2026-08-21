@@ -18,6 +18,14 @@ use std::path::PathBuf;
 fn main() -> eframe::Result {
     // 検証用 CLI: egui-clap-host.exe [plugin.clap] [--open-gui]
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // **走査の子プロセスとして起てられた場合は、ここで終わる。**
+    // 窓を出さず、1ファイル開いて結果を書くだけ (egui_clap_host::subscan)。
+    // 落ちてよい相手として親から呼ばれるので、GUI の初期化より先に見る
+    if let Some(code) = egui_clap_host::subscan::child_main(&args) {
+        std::process::exit(code);
+    }
+
     let auto_open_gui = args.iter().any(|a| a == "--open-gui");
     let autoload_path = args
         .iter()

@@ -24,6 +24,7 @@ use crate::library::{Role, Stamp};
 use crate::project::PluginKind;
 use clack_host::plugin::PluginDescriptor;
 use clack_host::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -31,8 +32,11 @@ use std::path::{Path, PathBuf};
 /// ベンダーが1〜2階層掘る程度なので十分で、リンクの輪に落ちる保険も兼ねる
 const MAX_DEPTH: usize = 8;
 
-/// ファイル内で見つかったプラグインの情報
-#[derive(Debug)]
+/// ファイル内で見つかったプラグインの情報。
+///
+/// **別プロセスから受け取ることがある**ので `.ron` にできる
+/// ([`crate::subscan`])。
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FoundPlugin {
     /// CLAP のプラグイン ID、または VST3 のクラス UID (32桁の16進)
     pub id: String,

@@ -16,6 +16,19 @@ use std::path::{Path, PathBuf};
 /// (項目を足すだけなら `#[serde(default)]` で読めるので上げない)。
 const VERSION: u32 = 1;
 
+/// 走査器のバージョン。**読み取りの中身を変えたら上げる。**
+///
+/// 差分走査はファイルの印しか見ないので、**こちらの読み取りを直しても
+/// 記録は古いまま居座る**。ここが記録と食い違っていれば印を信用せず、
+/// 次の走査で全部開き直す (Ardour の `ARDOUR_VST3_CACHE_FILE_VERSION` と
+/// 同じ役目)。
+///
+/// | 版 | 何が変わったか |
+/// |---|---|
+/// | 1 | 最初 (印を持たない記録もここに入る) |
+/// | 2 | VST3 は `moduleinfo.json` があればそれを読む (種別がクラス単位になった) |
+pub const SCANNER_VERSION: u32 = 2;
+
 /// 設定を置くディレクトリの名前 (実行ファイルの隣に作る)
 const CONFIG_DIR: &str = "config";
 /// 一覧の記録
@@ -144,7 +157,7 @@ impl Entry {
 }
 
 /// 走査した結果ぜんぶ
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
     /// 走査するフォルダ
@@ -153,6 +166,26 @@ pub struct Library {
     pub plugins: Vec<Entry>,
     /// 走査中に落ちたファイル。**次からは飛ばす** (画面から外せる)
     pub blocked: Vec<PathBuf>,
+    /// この記録を作った走査器の版 ([`SCANNER_VERSION`])。
+    /// **食い違っていれば印を信用しない**
+    pub scanner: u32,
+    /// **プラグインを別プロセスで開くか。** 既定は開く
+    /// ([`crate::subscan`])。切ると速いが、落ちたら道連れになる
+    pub isolate: bool,
+}
+
+impl Default for Library {
+    fn default() -> Self {
+        Self {
+            folders: Vec::new(),
+            plugins: Vec::new(),
+            blocked: Vec::new(),
+            // **記録が無い状態は「版が古い」ではない。** 開くものが無いので
+            // どちらでも同じだが、走査前に書き出したときに嘘が残らないほう
+            scanner: SCANNER_VERSION,
+            isolate: true,
+        }
+    }
 }
 
 /// ファイルに書く形。`Library` に版を添えたもの
@@ -165,6 +198,19 @@ struct Stored {
     plugins: Vec<Entry>,
     #[serde(default)]
     blocked: Vec<PathBuf>,
+    /// **既定は 1。** この項目を持たない記録は、印を入れる前のもの
+    #[serde(default = "first_scanner_version")]
+    scanner: u32,
+    #[serde(default = "isolate_by_default")]
+    isolate: bool,
+}
+
+fn first_scanner_version() -> u32 {
+    1
+}
+
+fn isolate_by_default() -> bool {
+    true
 }
 
 /// 版だけ先に見るための形 (project.rs と同じ手順)
@@ -247,6 +293,8 @@ pub fn to_string(library: &Library) -> Result<String, String> {
         folders: library.folders.clone(),
         plugins: library.plugins.clone(),
         blocked: library.blocked.clone(),
+        scanner: library.scanner,
+        isolate: library.isolate,
     };
 
     // 1件を1行に収める (数百件になると読めない)
@@ -281,6 +329,8 @@ pub fn from_str(text: &str) -> Result<Library, String> {
             .filter(|entry| !entry.path.as_os_str().is_empty() && !entry.id.is_empty())
             .collect(),
         blocked: stored.blocked,
+        scanner: stored.scanner,
+        isolate: stored.isolate,
     })
 }
 
@@ -418,8 +468,12 @@ pub struct Scan {
     reused: usize,
     /// 開けなかったものの説明
     problems: Vec<String>,
+    /// 落ちたので次から飛ばすことにしたファイルの数
+    crashed: usize,
     /// 走査前に星が付いていたもの。**走査し直しても消さない**
     favorites: Vec<(PathBuf, String)>,
+    /// 別プロセスで開くか (走査の途中で切り替わらないよう控えておく)
+    isolate: bool,
 }
 
 /// 前の記録をそのまま使えるか決める。**開き直すなら `None`。**
@@ -451,19 +505,27 @@ impl Scan {
     /// **変わっていないファイルは開き直さない** ([`reusable`])。プラグインを
     /// 開くのは1本で数秒かかることがあるので、2回目以降はここでほとんどが
     /// 落ちる。何件を使い回したかは [`reused`](Self::reused) で分かる。
+    ///
+    /// **走査器の版が変わっていれば印は信用しない** ([`SCANNER_VERSION`])。
+    /// ファイルは同じでも、こちらが読み取る中身が変わっているため。
     pub fn start(library: &mut Library) -> Self {
-        Self::begin(library, true)
+        let current = library.scanner == SCANNER_VERSION;
+        Self::begin(library, current)
     }
 
     /// 印を見ずに**全部開き直す**。
     ///
-    /// 分類がおかしいときや、こちらの読み取りを直したあとに使う
-    /// (記録の中身はビルドによって変わるが、ファイルの印は変わらないため)。
+    /// 分類がおかしいときに使う。版を上げ忘れたときの逃げ道でもある。
     pub fn start_full(library: &mut Library) -> Self {
         Self::begin(library, false)
     }
 
     fn begin(library: &mut Library, reuse: bool) -> Self {
+        let isolate = library.isolate;
+        // **走査し終えたときではなく、始めるときに書く。** 途中でやめても
+        // 「この版で開いたものが入っている」ことに変わりはない
+        library.scanner = SCANNER_VERSION;
+
         let mut previous = Vec::new();
         let mut queue = Vec::new();
 
@@ -516,14 +578,20 @@ impl Scan {
             total,
             reused,
             problems: Vec::new(),
+            crashed: 0,
             favorites,
+            isolate,
         }
     }
 
     /// 1ファイルだけ開いて一覧へ入れる。終わっていれば `None`。
     ///
-    /// **開く直前に目印を書き、開き終えたら消す。** 途中で落ちても、次の起動で
-    /// どのファイルだったか分かる ([`take_crashed`])。
+    /// **別プロセスで開くのが既定** ([`crate::subscan`])。落ちたファイルは
+    /// その場で `blocked` へ入るので、次の走査では開きに行かない。
+    ///
+    /// 同じプロセスで開く設定のときは、**開く直前に目印を書いて開き終えたら
+    /// 消す**。途中で落ちても次の起動でどのファイルだったか分かる
+    /// ([`take_crashed`])。別プロセスなら落ちても親が生きているので要らない。
     pub fn step(&mut self, library: &mut Library) -> Option<PathBuf> {
         let path = self.queue.pop()?;
         let Some(kind) = crate::discovery::kind_of(&path) else {
@@ -534,32 +602,75 @@ impl Scan {
         // 実際に読んだものと揃う (次の走査でずれに気付ける)
         let stamp = crate::discovery::stamp(&path);
 
-        mark_scanning(&path);
-        match crate::discovery::scan_file(&path) {
-            Ok(found) => {
-                for plugin in found {
-                    let favorite = self
-                        .favorites
-                        .iter()
-                        .any(|(kept, id)| *kept == path && *id == plugin.id);
-                    library.insert(Entry {
-                        kind,
-                        path: path.clone(),
-                        id: plugin.id,
-                        name: plugin.name,
-                        vendor: plugin.vendor,
-                        version: plugin.version,
-                        role: plugin.role,
-                        favorite,
-                        stamp,
-                    });
-                }
+        let found = if self.isolate {
+            self.open_isolated(library, &path)
+        } else {
+            mark_scanning(&path);
+            let opened =
+                crate::discovery::scan_file(&path).map_err(|e| format!("{}: {e}", path.display()));
+            clear_scanning();
+            opened.map_err(|problem| {
+                self.problems.push(problem);
+            })
+        };
+
+        if let Ok(found) = found {
+            for plugin in found {
+                let favorite = self
+                    .favorites
+                    .iter()
+                    .any(|(kept, id)| *kept == path && *id == plugin.id);
+                library.insert(Entry {
+                    kind,
+                    path: path.clone(),
+                    id: plugin.id,
+                    name: plugin.name,
+                    vendor: plugin.vendor,
+                    version: plugin.version,
+                    role: plugin.role,
+                    favorite,
+                    stamp,
+                });
             }
-            Err(e) => self.problems.push(format!("{}: {e}", path.display())),
         }
-        clear_scanning();
 
         Some(path)
+    }
+
+    /// 別プロセスで1ファイル開く。**落ちたらここで飛ばすことにする。**
+    ///
+    /// 子を起てられなかったときだけ、この場で自分で開く。プラグインのせいでは
+    /// ないので、飛ばしてしまうと直しても戻ってこない。
+    fn open_isolated(
+        &mut self,
+        library: &mut Library,
+        path: &Path,
+    ) -> Result<Vec<crate::discovery::FoundPlugin>, ()> {
+        match crate::subscan::scan_file(path) {
+            Ok(found) => Ok(found),
+            Err(crate::subscan::Failure::CannotSpawn(detail)) => {
+                // 一度だけ知らせる。**毎回出すと問題の一覧が埋まる**
+                if self.crashed == 0 && self.problems.is_empty() {
+                    self.problems.push(format!(
+                        "別プロセスで開けないため同じプロセスで開きます: {detail}"
+                    ));
+                }
+                mark_scanning(path);
+                let opened = crate::discovery::scan_file(path);
+                clear_scanning();
+                opened.map_err(|e| {
+                    self.problems.push(format!("{}: {e}", path.display()));
+                })
+            }
+            Err(failure) => {
+                self.problems.push(format!("{}: {failure}", path.display()));
+                if failure.should_block() && !library.blocked.contains(&path.to_path_buf()) {
+                    library.blocked.push(path.to_path_buf());
+                    self.crashed += 1;
+                }
+                Err(())
+            }
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -574,6 +685,11 @@ impl Scan {
     /// 開かずに前の記録を戻したファイルの数
     pub fn reused(&self) -> usize {
         self.reused
+    }
+
+    /// 落ちたので次から飛ばすことにしたファイルの数
+    pub fn crashed(&self) -> usize {
+        self.crashed
     }
 
     /// 開けなかったものの説明。**空でも成功とは限らない**
@@ -618,6 +734,7 @@ mod tests {
                 entry("Mystery", "com.example.mystery", Role::Unknown),
             ],
             blocked: vec![PathBuf::from("C:\\plugins\\Bad.clap")],
+            ..Default::default()
         }
     }
 
@@ -857,6 +974,110 @@ mod tests {
         let previous = vec![make("com.pack.one", 100), make("com.pack.two", 101)];
 
         assert_eq!(reusable(&previous, &path, Some(stamp(100))), None);
+    }
+
+    // ---- 走査器の版 ----
+
+    /// 版を持たない記録は 1 として読むこと (印を入れる前のファイル)
+    #[test]
+    fn a_record_without_a_scanner_version_reads_as_one() {
+        let text = r#"(
+            version: 1,
+            plugins: [
+                (kind: Clap, path: "C:\\a.clap", id: "com.a"),
+            ],
+        )"#;
+        let library = from_str(text).expect("読めること");
+        assert_eq!(library.scanner, 1);
+        assert!(library.isolate, "別プロセスが既定であること");
+    }
+
+    /// 版と設定が往復すること
+    #[test]
+    fn the_scanner_version_survives_a_round_trip() {
+        let mut before = sample();
+        before.scanner = 7;
+        before.isolate = false;
+
+        let after = from_str(&to_string(&before).unwrap()).unwrap();
+        assert_eq!(after.scanner, 7);
+        assert!(!after.isolate);
+    }
+
+    /// 走査するフォルダを1つ作り、その中に空のファイルを置く
+    fn folder_with_one_file(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("egui-clap-host-lib-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("A.clap");
+        std::fs::write(&file, b"not really a plugin").unwrap();
+        (dir, file)
+    }
+
+    /// 印が合っていれば、開く候補が残らないこと (**前提の確認**)
+    #[test]
+    fn a_matching_stamp_leaves_nothing_to_open() {
+        let (dir, file) = folder_with_one_file("stamp-current");
+        let mut library = Library {
+            folders: vec![dir.clone()],
+            ..Default::default()
+        };
+        let mut kept = entry("A", "com.a", Role::Instrument);
+        kept.path = file.clone();
+        kept.stamp = crate::discovery::stamp(&file);
+        library.insert(kept);
+
+        let scan = Scan::start(&mut library);
+        assert_eq!(scan.progress().1, 0, "開くものが無いこと");
+        assert_eq!(scan.reused(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **走査器の版が古ければ、印が合っていても開き直すこと。**
+    ///
+    /// ファイルは同じでも、こちらが読み取る中身が変わっている。
+    /// ここが効かないと、読み取りを直しても古い記録が居座る
+    #[test]
+    fn an_old_scanner_version_ignores_the_stamps() {
+        let (dir, file) = folder_with_one_file("stamp-old-scanner");
+        let mut library = Library {
+            folders: vec![dir.clone()],
+            ..Default::default()
+        };
+        let mut kept = entry("A", "com.a", Role::Instrument);
+        kept.path = file.clone();
+        kept.stamp = crate::discovery::stamp(&file);
+        library.insert(kept);
+        library.scanner = SCANNER_VERSION - 1;
+
+        let scan = Scan::start(&mut library);
+        assert_eq!(scan.progress().1, 1, "開き直すこと");
+        assert_eq!(scan.reused(), 0);
+        // **版はここで揃う。** 走査を始めた時点で新しい読み取りに入っている
+        assert_eq!(library.scanner, SCANNER_VERSION);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「すべて開き直す」は版が合っていても開き直すこと
+    #[test]
+    fn a_full_scan_ignores_the_stamps_too() {
+        let (dir, file) = folder_with_one_file("stamp-full");
+        let mut library = Library {
+            folders: vec![dir.clone()],
+            ..Default::default()
+        };
+        let mut kept = entry("A", "com.a", Role::Instrument);
+        kept.path = file.clone();
+        kept.stamp = crate::discovery::stamp(&file);
+        library.insert(kept);
+
+        let scan = Scan::start_full(&mut library);
+        assert_eq!(scan.progress().1, 1);
+        assert_eq!(scan.reused(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 別のファイルの記録を巻き込まないこと

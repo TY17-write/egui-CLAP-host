@@ -106,6 +106,7 @@ impl App {
         let problems = scan.problems().to_vec();
         let (opened, _) = scan.progress();
         let reused = scan.reused();
+        let crashed = scan.crashed();
         self.scan = None;
         self.scanning_now = None;
         self.library.sort();
@@ -118,6 +119,13 @@ impl App {
         if reused > 0 {
             body.push_str(&format!(
                 "\n\n{opened} 件を開き、{reused} 件は変わっていないので前の記録を使いました。"
+            ));
+        }
+        // **落ちたものは数を先に出す。** 理由は下の一覧に並ぶ
+        if crashed > 0 {
+            body.push_str(&format!(
+                "\n\n{crashed} 件は走査中に落ちたので、次からは飛ばします \
+                 (この窓の「走査で飛ばすファイル」から戻せます)。"
             ));
         }
         if let Err(e) = library::save(&self.library) {
@@ -243,6 +251,23 @@ impl App {
                 .clicked()
             {
                 self.scan = Some(Scan::start_full(&mut self.library));
+            }
+
+            // **落ちるプラグインからホストを守るしくみ。** 切れる形にして
+            // あるのは、プロセスを起てるぶんの重さを測れるようにするため
+            let mut isolate = self.library.isolate;
+            if ui
+                .add_enabled(!scanning, egui::Checkbox::new(&mut isolate, "別プロセス"))
+                .on_hover_text(
+                    "プラグインを別のプロセスで開きます。\n\
+                     落ちるプラグインがあってもホストは巻き込まれず、\
+                     そのファイルは次から飛ばします。\n\
+                     切ると少し速くなりますが、落ちたときは道連れになります",
+                )
+                .changed()
+            {
+                self.library.isolate = isolate;
+                let _ = library::save(&self.library);
             }
         });
 
