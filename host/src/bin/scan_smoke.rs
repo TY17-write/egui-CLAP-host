@@ -7,13 +7,47 @@
 //! 本物のプラグインフォルダを渡せば、そこで何が読めて何が読めないかが分かる。
 //! **読めなかったものも必ず出す** (黙って一覧から消えるのがいちばん困る)。
 //!
+//! **走査は2回まわす。**
+//!
+//! 1. 記録が無い状態から全部開く → ファイルごとの所要時間が出る
+//! 2. そのまま走査し直す → **1件も開かないはず** (差分走査)
+//!
+//! 2回目で開いたものが出たら、印の取り方がそのファイルに効いていない
+//! (ディレクトリを見てしまう等)。時間のかかるプラグインが分かるので、
+//! 遅い環境ではまずこれを流すとよい。
+//!
 //! 使い方: cargo run -p egui-clap-host --bin scan_smoke -- <フォルダ> [フォルダ...]
 
 use egui_clap_host::discovery;
 use egui_clap_host::library::{self, Library, Role, Scan};
 use std::error::Error;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// いちばん遅かったファイルを何件出すか
+const SLOWEST: usize = 5;
+
+/// 走査を1回まわす。戻り値は (かかった時間, ファイルごとの ms, 走査の結果)
+fn run(library: &mut Library, full: bool) -> (Duration, Vec<(u128, PathBuf)>, Scan) {
+    let started = Instant::now();
+    let mut scan = if full {
+        Scan::start_full(library)
+    } else {
+        Scan::start(library)
+    };
+    let mut timings = Vec::new();
+    while !scan.is_done() {
+        let at = Instant::now();
+        if let Some(path) = scan.step(library) {
+            timings.push((at.elapsed().as_millis(), path));
+        }
+    }
+    let elapsed = started.elapsed();
+    library.sort();
+    // 遅かったものから並べる
+    timings.sort_by_key(|(took, _)| std::cmp::Reverse(*took));
+    (elapsed, timings, scan)
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let folders: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
@@ -62,33 +96,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // **本体と同じく1ファイルずつ進める** (画面から毎フレーム呼ぶのと同じ経路)
-    let started = Instant::now();
-    let mut scan = Scan::start(&mut library);
-    let mut slowest = (0u128, PathBuf::new());
-    while !scan.is_done() {
-        let at = Instant::now();
-        if let Some(path) = scan.step(&mut library) {
-            let took = at.elapsed().as_millis();
-            if took > slowest.0 {
-                slowest = (took, path);
-            }
-        }
-    }
-    let elapsed = started.elapsed();
-    library.sort();
+    let (elapsed, timings, scan) = run(&mut library, false);
 
     let (done, total) = scan.progress();
     println!(
-        "{done}/{total} ファイルを開いて {} 個のプラグインを見つけた ({:.1} 秒)",
+        "1回目: {done}/{total} ファイルを開いて {} 個のプラグインを見つけた ({:.1} 秒)",
         library.plugins.len(),
         elapsed.as_secs_f64()
     );
-    if slowest.0 > 0 {
-        println!(
-            "  いちばん遅かったファイル: {} ({} ms)",
-            slowest.1.display(),
-            slowest.0
-        );
+    for (took, path) in timings.iter().take(SLOWEST) {
+        println!("  {took:>6} ms  {}", path.display());
     }
     println!();
 
@@ -131,6 +148,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     if library.plugins.is_empty() {
         return Err("プラグインが1つも見つからなかった".into());
     }
-    println!("✅ 走査できた");
+
+    // **2回目。** 何も変えていないので、1件も開かないはず
+    let before = library.clone();
+    let (again, reopened, second) = run(&mut library, false);
+    let (opened, _) = second.progress();
+    println!();
+    println!(
+        "2回目: {opened} 件を開き、{} 件は前の記録を使った ({:.1} 秒)",
+        second.reused(),
+        again.as_secs_f64()
+    );
+    for (took, path) in reopened.iter().take(SLOWEST) {
+        println!("  開き直した: {took:>6} ms  {}", path.display());
+    }
+    if opened > 0 {
+        return Err(format!(
+            "2回目で {opened} 件を開き直した。\
+             印がそのファイルに効いていない (上の一覧を参照)"
+        )
+        .into());
+    }
+    if library != before {
+        return Err("使い回した記録が1回目と食い違う".into());
+    }
+
+    println!("✅ 走査できた (差分走査も効いている)");
     Ok(())
 }

@@ -4,12 +4,23 @@
 //! 載せる前に中身を数え上げる必要がある。列挙の結果は [`FoundPlugin`] に
 //! 揃えてあり、呼び出し側 (選択 UI) は形式を意識しない。
 //!
-//! **種別 (音源かエフェクトか) は宣言を読むだけで分かる。** インスタンス化して
-//! 入力ポートを数える必要は無いので、フォルダ走査で全部を起動せずに済む。
+//! **種別 (音源かエフェクトか) は宣言を読むだけで分かる。** 入力ポートを数える
+//! ために起動する必要は無い。
+//!
+//! 走査の重さは形式で違う。
+//!
+//! | 形式 | やること |
+//! |---|---|
+//! | CLAP | モジュールを読んで `clap_entry.init` まで。**作りはしない** |
+//! | VST3 (`moduleinfo.json` あり) | **JSON を1つ読むだけ** ([`load_vst3_file`]) |
+//! | VST3 (JSON なし) | モジュールを読み、`vst3-host` が中でプラグインを作る |
+//!
+//! 最後の道だけが桁違いに重い。音源は生成時にウェーブテーブルやプリセットを
+//! 読むので、1本で数秒かかることがある。
 
 #![allow(unsafe_code)]
 
-use crate::library::Role;
+use crate::library::{Role, Stamp};
 use crate::project::PluginKind;
 use clack_host::plugin::PluginDescriptor;
 use clack_host::prelude::*;
@@ -79,6 +90,21 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             collect_files(&path, depth + 1, out);
         }
     }
+}
+
+/// 差分走査のための印を取る。**中身は読まない** (メタデータだけ)。
+///
+/// **`.vst3` は Windows ではバンドルディレクトリのことがある。** ディレクトリの
+/// 更新時刻は中のファイルを書き換えても動かないので、**中の実体を見る**。
+/// 実体が見つからなければ諦めて `None` を返し、開いて確かめる側へ倒す。
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    let target = match kind_of(path) {
+        Some(PluginKind::Vst3) if path.is_dir() => {
+            vst3_host::discovery::get_vst3_binary_path(path).ok()?
+        }
+        _ => path.to_path_buf(),
+    };
+    Stamp::of(&target)
 }
 
 /// 開けなかった `.vst3` に添える手がかり。
@@ -226,6 +252,42 @@ fn file_wide_role(audio_class_count: usize, category: &str) -> Role {
     }
 }
 
+/// `moduleinfo.json` の宣言だけで一覧を作る。**モジュールを読み込まない。**
+///
+/// SDK 3.7.5 以降のバンドルは、クラスの ID・名前・作者・版・副カテゴリを
+/// すべて JSON に書き出している。**走査で要るのはこれで全部**なので、
+/// これが読めたならモジュールを開く理由が無い。
+///
+/// クラス ID の綴りは両方の道で揃う。JSON 側は読み込み時に大文字の
+/// 32桁へ正規化され、ファクトリ側も同じ正準形へ直してから返ってくる
+/// (Windows の COM 順の入れ替えは `vst3-host` が吸収する)。
+fn vst3_from_module_info(module: &vst3_host::discovery::ModuleInfo) -> Vec<FoundPlugin> {
+    module
+        .classes
+        .iter()
+        .filter(|class| class.category.contains(VST3_AUDIO_CLASS))
+        .map(|class| FoundPlugin {
+            id: class.class_id.clone(),
+            name: if class.name.is_empty() {
+                class.class_id.clone()
+            } else {
+                class.name.clone()
+            },
+            role: vst3_role(&class.sub_categories),
+            vendor: if class.vendor.is_empty() {
+                module.factory.vendor.clone()
+            } else {
+                class.vendor.clone()
+            },
+            version: if class.version.is_empty() {
+                module.version.clone()
+            } else {
+                class.version.clone()
+            },
+        })
+        .collect()
+}
+
 /// .vst3 を読み、含まれる音源クラスの一覧を返す。
 ///
 /// Windows では `Foo.vst3` がバンドル**ディレクトリ**のことも素の DLL のこともある。
@@ -236,19 +298,33 @@ fn file_wide_role(audio_class_count: usize, category: &str) -> Role {
 ///
 /// **種別の情報源は2つある。**
 ///
-/// | 出どころ | 粒度 | いつ取れるか |
-/// |---|---|---|
-/// | `moduleinfo.json` の `sub_categories` | クラスごと | SDK 3.7.5 以降のバンドルだけ |
-/// | ファクトリの `category` | **ファイルに1つ** | いつでも |
+/// | 出どころ | 粒度 | いつ取れるか | 代償 |
+/// |---|---|---|---|
+/// | `moduleinfo.json` の `sub_categories` | クラスごと | SDK 3.7.5 以降のバンドルだけ | JSON を1つ読むだけ |
+/// | ファクトリの `category` | **ファイルに1つ** | いつでも | **プラグインを実際に作る** |
 ///
-/// **前者を優先する。** 無いときは後者で代用するが、それは
-/// [`file_wide_role`] のとおりクラスが1つのファイルに限る。
+/// **前者で足りるならそこで返す。** 粒度が細かいうえに桁違いに安い。
+/// 後者に落ちる道は `get_detailed_plugin_info` を通り、そこでは使いもしない
+/// バス構成を調べるために `createInstance` と `initialize` が呼ばれる。
+/// 音源はそこでウェーブテーブルやプリセットを読むので、1本で数秒かかる。
+///
+/// 後者で代用できるのは [`file_wide_role`] のとおりクラスが1つのファイルに限る。
 /// 当てられないものは [`Role::Unknown`] のまま「未分類」へ置く
 /// (**間違った分類より、分からないと言うほうがよい**)。
 ///
 /// # Safety
 /// VST3 のロードは任意の DLL の実行を意味するため、信頼できるファイルのみを開くこと。
 pub fn load_vst3_file(path: &Path) -> Result<Vec<FoundPlugin>, Box<dyn Error>> {
+    // **JSON で足りるならモジュールを開かない。**
+    // 読めない・壊れている・音のクラスが1つも無い、のいずれでも下へ落ちる
+    // (「入っていません」と断るのは、モジュールに直接聞いてからにする)
+    if let Ok(Some(module)) = vst3_host::discovery::read_module_info(path) {
+        let plugins = vst3_from_module_info(&module);
+        if !plugins.is_empty() {
+            return Ok(plugins);
+        }
+    }
+
     let info = vst3_host::discovery::get_detailed_plugin_info(path)?;
 
     let audio_classes = info
@@ -454,5 +530,134 @@ mod tests {
     fn scanning_a_foreign_file_is_refused() {
         let error = scan_file(Path::new("a/b.dll")).expect_err("断ること");
         assert!(error.to_string().contains("拡張子"), "{error}");
+    }
+
+    /// **`moduleinfo.json` だけのバンドルを読めること。**
+    ///
+    /// 中に実体 (DLL) を一切置かない。それでも一覧が返るなら、
+    /// **モジュールを開く道を通っていない**と言い切れる。
+    ///
+    /// ついでに、**クラスごとに種別が分かれること**も見ている。同じことを
+    /// 従来の道でやると、音のクラスが2つあるファイルは全部「未分類」になる
+    /// ([`file_wide_role`])。
+    #[test]
+    fn a_bundle_with_module_info_is_read_without_loading_it() {
+        let root = temp_dir("module-info").join("Pack.vst3");
+        let json = root.join("Contents").join("Resources");
+        std::fs::create_dir_all(&json).unwrap();
+
+        // CID は32桁の16進。読み込み時に大文字へ正規化される
+        std::fs::write(
+            json.join("moduleinfo.json"),
+            br#"{
+                "Name": "Pack",
+                "Version": "2.5.0",
+                "Factory Info": { "Vendor": "Example Audio" },
+                "Classes": [
+                    {
+                        "CID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "Category": "Audio Module Class",
+                        "Name": "Pack Synth",
+                        "Sub Categories": ["Instrument", "Synth"]
+                    },
+                    {
+                        "CID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "Category": "Audio Module Class",
+                        "Name": "Pack Reverb",
+                        "Vendor": "Other Vendor",
+                        "Version": "1.2",
+                        "Sub Categories": ["Fx", "Reverb"]
+                    },
+                    {
+                        "CID": "cccccccccccccccccccccccccccccccc",
+                        "Category": "Component Controller Class",
+                        "Name": "Pack Controller"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let found = load_vst3_file(&root).expect("JSON だけで読めること");
+        assert_eq!(found.len(), 2, "音のクラスだけ拾うこと: {found:?}");
+
+        let synth = &found[0];
+        assert_eq!(synth.id, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "大文字の32桁");
+        assert_eq!(synth.name, "Pack Synth");
+        assert_eq!(synth.role, Role::Instrument);
+        assert_eq!(synth.vendor, "Example Audio", "無ければ作者を借りること");
+        assert_eq!(synth.version, "2.5.0", "無ければ版を借りること");
+
+        let reverb = &found[1];
+        assert_eq!(reverb.role, Role::Effect, "クラスごとに分かれること");
+        assert_eq!(reverb.vendor, "Other Vendor", "あれば自分のものを使うこと");
+        assert_eq!(reverb.version, "1.2");
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// **JSON が音のクラスを1つも宣言していなければ、下の道へ落ちること。**
+    ///
+    /// 実体が無いので開けずに終わる。**「入っていません」と断ってしまわない**
+    /// のが要点で、断るのはモジュールに直接聞いてからにする
+    #[test]
+    fn a_module_info_without_audio_classes_falls_through() {
+        let root = temp_dir("module-info-empty").join("Empty.vst3");
+        let json = root.join("Contents").join("Resources");
+        std::fs::create_dir_all(&json).unwrap();
+        std::fs::write(
+            json.join("moduleinfo.json"),
+            br#"{ "Name": "Empty", "Classes": [] }"#,
+        )
+        .unwrap();
+
+        load_vst3_file(&root).expect_err("実体が無いので開けないこと");
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// バンドルの印は**中の実体**から取ること。
+    ///
+    /// ディレクトリの更新時刻は中を書き換えても動かないので、そこを見ていると
+    /// 差分走査が更新に気付けない
+    #[test]
+    fn a_bundle_is_stamped_by_its_binary() {
+        let root = temp_dir("bundle-stamp").join("Stamped.vst3");
+        let binary = root
+            .join("Contents")
+            .join("x86_64-win")
+            .join("Stamped.vst3");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"0123456789").unwrap();
+
+        let taken = stamp(&root).expect("印が取れること");
+        assert_eq!(taken.size, 10, "中の実体の大きさになること");
+        assert_eq!(taken, Stamp::of(&binary).unwrap());
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// 実体の無いバンドルからは印を取らないこと (**開いて確かめる側へ倒す**)
+    #[test]
+    fn a_bundle_without_a_binary_has_no_stamp() {
+        let root = temp_dir("bundle-no-binary").join("Hollow.vst3");
+        std::fs::create_dir_all(root.join("Contents")).unwrap();
+
+        assert!(stamp(&root).is_none());
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// 素のファイルはそのまま印を取ること (`.clap` はこちら)
+    #[test]
+    fn a_plain_file_is_stamped_directly() {
+        let root = temp_dir("file-stamp");
+        let path = root.join("Plain.clap");
+        std::fs::write(&path, b"01234").unwrap();
+
+        let taken = stamp(&path).expect("印が取れること");
+        assert_eq!(taken.size, 5);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

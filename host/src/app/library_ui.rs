@@ -104,6 +104,8 @@ impl App {
 
         // ここまで来たら走査は終わり
         let problems = scan.problems().to_vec();
+        let (opened, _) = scan.progress();
+        let reused = scan.reused();
         self.scan = None;
         self.scanning_now = None;
         self.library.sort();
@@ -112,6 +114,12 @@ impl App {
             "{} 個のプラグインが見つかりました。",
             self.library.plugins.len()
         );
+        // **開かずに済んだ数を出す。** 2回目以降が速い理由が分かるように
+        if reused > 0 {
+            body.push_str(&format!(
+                "\n\n{opened} 件を開き、{reused} 件は変わっていないので前の記録を使いました。"
+            ));
+        }
         if let Err(e) = library::save(&self.library) {
             body.push_str(&format!("\n\n※ 記録を保存できませんでした:\n{e}"));
         }
@@ -213,18 +221,28 @@ impl App {
                     }
                 }
             }
+            let ready = !scanning && !self.library.folders.is_empty();
             if ui
-                .add_enabled(
-                    !scanning && !self.library.folders.is_empty(),
-                    egui::Button::new("すべて走査"),
-                )
+                .add_enabled(ready, egui::Button::new("走査"))
                 .on_hover_text(
-                    "登録したフォルダを全部走査し直します。\
-                     プラグインの数によっては数分かかります",
+                    "登録したフォルダを走査します。\n\
+                     前の走査から変わっていないファイルは開き直さないので、\
+                     2回目以降は速く終わります",
                 )
                 .clicked()
             {
                 self.scan = Some(Scan::start(&mut self.library));
+            }
+            if ui
+                .add_enabled(ready, egui::Button::new("すべて開き直す"))
+                .on_hover_text(
+                    "変わっていないファイルも含めて全部開きます。\n\
+                     分類がおかしいときに使ってください。\
+                     プラグインの数によっては数分かかります",
+                )
+                .clicked()
+            {
+                self.scan = Some(Scan::start_full(&mut self.library));
             }
         });
 
@@ -257,8 +275,8 @@ impl App {
 
         if let Some(index) = remove {
             let folder = self.library.folders.remove(index);
-            // そのフォルダから見つけた記録も一緒に片付ける
-            self.library.forget_under(&folder);
+            // そのフォルダから見つけた記録も一緒に片付ける (戻り値は捨てる)
+            self.library.take_under(&folder);
             let _ = library::save(&self.library);
         }
 
@@ -523,6 +541,8 @@ mod tests {
             version: "1.0".to_string(),
             role,
             favorite,
+            // 絞り込みは印を見ない
+            stamp: None,
         }
     }
 

@@ -5,7 +5,8 @@
 //! `target\debug\config\` に落ちるため、**`cargo clean` すると消える**
 //! (走査し直しには時間がかかるので、消したくないときは退避すること)。
 //!
-//! ここが持つのは**データと入出力だけ**。走査そのものは別 (フェーズ2)。
+//! 一覧そのもの ([`Library`]) と、走査の進行 ([`Scan`]) を持つ。
+//! ファイルを実際に開くのは [`crate::discovery`] の側。
 
 use crate::project::PluginKind;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,43 @@ impl Role {
     }
 }
 
+/// ファイルの印。**一致すれば開き直さない** ([`Scan::start`] の差分走査)。
+///
+/// 更新時刻とバイト数の組。中身のハッシュではないので、**同じ大きさのまま
+/// 時刻を保って書き換えられると気付けない**。プラグインの入れ替えは
+/// インストーラがやることなので、実用上はこれで足りる。
+///
+/// **取れなかったら `None`。** 迷ったら開いて確かめる側へ倒す
+/// (見落として古い記録を出すより、無駄に開くほうがましなので)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stamp {
+    /// 最終更新時刻 (UNIX 元期からの秒)
+    pub modified: u64,
+    /// バイト数
+    pub size: u64,
+}
+
+impl Stamp {
+    /// ファイルから取る。**中身は読まない** (メタデータだけ)。
+    ///
+    /// バンドルの中の実体を指すこと。ディレクトリを渡しても、
+    /// 中のファイルを書き換えただけでは更新時刻が動かない
+    /// (解決は [`crate::discovery::stamp`] がやる)
+    pub fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(Self {
+            modified,
+            size: meta.len(),
+        })
+    }
+}
+
 /// 一覧の1件。
 ///
 /// **載せるのに要るのは `kind` / `path` / `id` の3つだけ**で、残りは表示用。
@@ -68,6 +106,9 @@ pub struct Entry {
     pub version: String,
     pub role: Role,
     pub favorite: bool,
+    /// 走査した時点のファイルの印。**次の走査で開き直すかを決める**。
+    /// 印の無い記録 (古いファイルから読んだもの) は開き直す
+    pub stamp: Option<Stamp>,
 }
 
 impl Default for Entry {
@@ -81,6 +122,7 @@ impl Default for Entry {
             version: String::new(),
             role: Role::Unknown,
             favorite: false,
+            stamp: None,
         }
     }
 }
@@ -154,22 +196,24 @@ impl Library {
         }
     }
 
-    /// そのフォルダから見つかった記録を捨てる (再走査の前に呼ぶ)。
+    /// そのフォルダから見つかった記録を**一覧から外して返す** (再走査の前に呼ぶ)。
     ///
-    /// **星は引き継ぐ。** 捨てた中で星が付いていたものを返すので、
-    /// 走査し直したあとに付け直せる。
-    pub fn forget_under(&mut self, folder: &Path) -> Vec<(PathBuf, String)> {
-        let mut kept_favorites = Vec::new();
+    /// 捨てずに返すのは、走査のあとで2つのことに使うため。
+    ///
+    /// - **星を引き継ぐ** (開き直したものに付け直す)
+    /// - **印が変わっていなければそのまま戻す** (開き直さない)
+    ///
+    /// 戻り値を捨てれば、そのフォルダの記録を消したことになる。
+    pub fn take_under(&mut self, folder: &Path) -> Vec<Entry> {
+        let mut taken = Vec::new();
         self.plugins.retain(|entry| {
             if !entry.path.starts_with(folder) {
                 return true;
             }
-            if entry.favorite {
-                kept_favorites.push((entry.path.clone(), entry.id.clone()));
-            }
+            taken.push(entry.clone());
             false
         });
-        kept_favorites
+        taken
     }
 
     /// 走査で見つけた1件を入れる。**同じものが居れば置き換える**
@@ -368,25 +412,65 @@ pub fn existing_standard_folders() -> Vec<PathBuf> {
 pub struct Scan {
     /// まだ開いていない候補 (**後ろから取る**ので逆順に積んである)
     queue: Vec<PathBuf>,
-    /// 最初に見つけた候補の数
+    /// 開くと決めた候補の数 (**使い回すぶんは入らない**)
     total: usize,
+    /// 開かずに前の記録を戻したファイルの数
+    reused: usize,
     /// 開けなかったものの説明
     problems: Vec<String>,
     /// 走査前に星が付いていたもの。**走査し直しても消さない**
     favorites: Vec<(PathBuf, String)>,
 }
 
+/// 前の記録をそのまま使えるか決める。**開き直すなら `None`。**
+///
+/// 使い回せるのは、そのファイルの記録が残っていて、**印が全て一致する**とき。
+/// 1ファイルに複数のプラグインが入りうるので、**1件でも印が違えば全部開き直す**
+/// (同じファイルから来た記録の印は揃っているはずで、揃っていないほうが異常)。
+///
+/// `stamp` が `None` (メタデータが取れない) なら開いて確かめる。
+fn reusable(previous: &[Entry], path: &Path, stamp: Option<Stamp>) -> Option<Vec<Entry>> {
+    let stamp = stamp?;
+    let found: Vec<Entry> = previous
+        .iter()
+        .filter(|entry| entry.path == path)
+        .cloned()
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found
+        .iter()
+        .all(|entry| entry.stamp == Some(stamp))
+        .then_some(found)
+}
+
 impl Scan {
     /// 登録されたフォルダから候補を集める。**まだ1つも開かない。**
     ///
-    /// 対象フォルダの記録はここで捨てる (消えたプラグインを残さないため)。
-    /// 星だけは控えて、見つかり直したら付け直す。
+    /// **変わっていないファイルは開き直さない** ([`reusable`])。プラグインを
+    /// 開くのは1本で数秒かかることがあるので、2回目以降はここでほとんどが
+    /// 落ちる。何件を使い回したかは [`reused`](Self::reused) で分かる。
     pub fn start(library: &mut Library) -> Self {
-        let mut favorites = Vec::new();
+        Self::begin(library, true)
+    }
+
+    /// 印を見ずに**全部開き直す**。
+    ///
+    /// 分類がおかしいときや、こちらの読み取りを直したあとに使う
+    /// (記録の中身はビルドによって変わるが、ファイルの印は変わらないため)。
+    pub fn start_full(library: &mut Library) -> Self {
+        Self::begin(library, false)
+    }
+
+    fn begin(library: &mut Library, reuse: bool) -> Self {
+        let mut previous = Vec::new();
         let mut queue = Vec::new();
 
         for folder in library.folders.clone() {
-            favorites.extend(library.forget_under(&folder));
+            // 記録はいったん全部外す。**在るものだけを入れ直す**ので、
+            // 消えたプラグインが居残らない
+            previous.extend(library.take_under(&folder));
             for path in crate::discovery::plugin_files(&folder) {
                 // 前に落ちたファイルは開きに行かない
                 if library.blocked.contains(&path) {
@@ -398,13 +482,39 @@ impl Scan {
 
         queue.sort();
         queue.dedup();
-        let total = queue.len();
+
+        let favorites = previous
+            .iter()
+            .filter(|entry| entry.favorite)
+            .map(|entry| (entry.path.clone(), entry.id.clone()))
+            .collect();
+
+        // **開かずに済むものはここで戻す。** 残りが `queue` になる
+        let mut reused = 0;
+        let mut to_open = Vec::with_capacity(queue.len());
+        for path in queue {
+            let kept = reuse
+                .then(|| reusable(&previous, &path, crate::discovery::stamp(&path)))
+                .flatten();
+            match kept {
+                Some(entries) => {
+                    reused += 1;
+                    for entry in entries {
+                        library.insert(entry);
+                    }
+                }
+                None => to_open.push(path),
+            }
+        }
+
+        let total = to_open.len();
         // pop() で前から取れるように積み直す
-        queue.reverse();
+        to_open.reverse();
 
         Self {
-            queue,
+            queue: to_open,
             total,
+            reused,
             problems: Vec::new(),
             favorites,
         }
@@ -419,6 +529,10 @@ impl Scan {
         let Some(kind) = crate::discovery::kind_of(&path) else {
             return Some(path); // 候補の集め方が変わらない限り起きない
         };
+
+        // **開く前に印を取る。** 途中で書き換えられても、記録した印は
+        // 実際に読んだものと揃う (次の走査でずれに気付ける)
+        let stamp = crate::discovery::stamp(&path);
 
         mark_scanning(&path);
         match crate::discovery::scan_file(&path) {
@@ -437,6 +551,7 @@ impl Scan {
                         version: plugin.version,
                         role: plugin.role,
                         favorite,
+                        stamp,
                     });
                 }
             }
@@ -451,9 +566,14 @@ impl Scan {
         self.queue.is_empty()
     }
 
-    /// (開いた数, 全体)
+    /// (開いた数, 開くと決めた数)。**使い回したぶんは入らない**
     pub fn progress(&self) -> (usize, usize) {
         (self.total - self.queue.len(), self.total)
+    }
+
+    /// 開かずに前の記録を戻したファイルの数
+    pub fn reused(&self) -> usize {
+        self.reused
     }
 
     /// 開けなかったものの説明。**空でも成功とは限らない**
@@ -477,6 +597,15 @@ mod tests {
             version: "1.0".to_string(),
             role,
             favorite: false,
+            stamp: None,
+        }
+    }
+
+    /// 印を1つ作る (中身に意味は無い。**一致するかだけを見る**)
+    fn stamp(modified: u64) -> Stamp {
+        Stamp {
+            modified,
+            size: 1024,
         }
     }
 
@@ -606,33 +735,145 @@ mod tests {
         assert!(library.plugins[0].favorite, "星は残ること");
     }
 
-    /// フォルダごと忘れられること。星の付いていたものは呼び出し側へ返す
+    /// フォルダごと取り出せること。**記録はそのまま返る** (星も付いたまま)
     #[test]
-    fn a_folder_can_be_forgotten() {
+    fn a_folder_can_be_taken_out() {
         let mut library = sample();
         library.toggle_favorite(
             &PathBuf::from("C:\\plugins\\Synth.clap"),
             "com.example.synth",
         );
 
-        let kept = library.forget_under(Path::new("C:\\plugins"));
-        assert!(library.plugins.is_empty(), "全部消えること");
-        assert_eq!(kept.len(), 1, "星の付いていたものが返ること");
-        assert_eq!(kept[0].1, "com.example.synth");
+        let taken = library.take_under(Path::new("C:\\plugins"));
+        assert!(library.plugins.is_empty(), "全部外れること");
+        assert_eq!(taken.len(), 3, "外したものが全部返ること");
+        assert_eq!(
+            taken.iter().filter(|entry| entry.favorite).count(),
+            1,
+            "星も付いたまま返ること"
+        );
     }
 
     /// 別のフォルダの記録は巻き込まないこと
     #[test]
-    fn forgetting_one_folder_leaves_the_others() {
+    fn taking_one_folder_leaves_the_others() {
         let mut library = Library::default();
         library.insert(entry("A", "com.a", Role::Instrument));
         let mut other = entry("B", "com.b", Role::Instrument);
         other.path = PathBuf::from("D:\\other\\B.clap");
         library.insert(other);
 
-        library.forget_under(Path::new("C:\\plugins"));
+        library.take_under(Path::new("C:\\plugins"));
         assert_eq!(library.plugins.len(), 1);
         assert_eq!(library.plugins[0].id, "com.b");
+    }
+
+    // ---- 差分走査 ----
+
+    /// **印が同じなら開き直さない。** 記録がそのまま返ること
+    #[test]
+    fn an_unchanged_file_is_reused() {
+        let mut kept = entry("Synth", "com.example.synth", Role::Instrument);
+        kept.stamp = Some(stamp(100));
+        let path = kept.path.clone();
+
+        let reused = reusable(&[kept.clone()], &path, Some(stamp(100)));
+        assert_eq!(reused, Some(vec![kept]));
+    }
+
+    /// 印が違えば開き直すこと (更新時刻でも大きさでも)
+    #[test]
+    fn a_changed_file_is_opened_again() {
+        let mut kept = entry("Synth", "com.example.synth", Role::Instrument);
+        kept.stamp = Some(stamp(100));
+        let path = kept.path.clone();
+
+        assert_eq!(reusable(&[kept.clone()], &path, Some(stamp(101))), None);
+
+        let bigger = Stamp {
+            modified: 100,
+            size: 2048,
+        };
+        assert_eq!(reusable(&[kept], &path, Some(bigger)), None);
+    }
+
+    /// **印の無い記録は開き直すこと。**
+    /// 差分走査を入れる前に書かれた一覧が、ずっと使い回されると困る
+    #[test]
+    fn a_record_without_a_stamp_is_opened_again() {
+        let kept = entry("Synth", "com.example.synth", Role::Instrument);
+        assert_eq!(kept.stamp, None);
+        let path = kept.path.clone();
+
+        assert_eq!(reusable(&[kept], &path, Some(stamp(100))), None);
+    }
+
+    /// **印が取れなければ開き直すこと** (消えた・権限が無い)
+    #[test]
+    fn a_file_we_cannot_stamp_is_opened_again() {
+        let mut kept = entry("Synth", "com.example.synth", Role::Instrument);
+        kept.stamp = Some(stamp(100));
+        let path = kept.path.clone();
+
+        assert_eq!(reusable(&[kept], &path, None), None);
+    }
+
+    /// 記録が無いファイルは当然開くこと (新しく置かれたもの)
+    #[test]
+    fn a_file_we_have_never_seen_is_opened() {
+        assert_eq!(
+            reusable(&[], Path::new("C:\\plugins\\New.clap"), Some(stamp(100))),
+            None
+        );
+    }
+
+    /// **1ファイルに複数入っていれば、まとめて返すこと。**
+    /// 1件だけ戻すと、同じファイルの他のプラグインが一覧から消える
+    #[test]
+    fn every_plugin_in_the_file_comes_back_together() {
+        let path = PathBuf::from("C:\\plugins\\Pack.clap");
+        let make = |id: &str| {
+            let mut entry = entry("Pack", id, Role::Instrument);
+            entry.path = path.clone();
+            entry.stamp = Some(stamp(100));
+            entry
+        };
+        let previous = vec![make("com.pack.one"), make("com.pack.two")];
+
+        let reused = reusable(&previous, &path, Some(stamp(100))).expect("使い回せること");
+        assert_eq!(reused.len(), 2);
+    }
+
+    /// 同じファイルの記録で印が食い違っていたら、**全部開き直すこと**
+    #[test]
+    fn a_file_with_mismatched_stamps_is_opened_again() {
+        let path = PathBuf::from("C:\\plugins\\Pack.clap");
+        let make = |id: &str, at: u64| {
+            let mut entry = entry("Pack", id, Role::Instrument);
+            entry.path = path.clone();
+            entry.stamp = Some(stamp(at));
+            entry
+        };
+        let previous = vec![make("com.pack.one", 100), make("com.pack.two", 101)];
+
+        assert_eq!(reusable(&previous, &path, Some(stamp(100))), None);
+    }
+
+    /// 別のファイルの記録を巻き込まないこと
+    #[test]
+    fn reuse_only_looks_at_the_same_path() {
+        let mut other = entry("Other", "com.other", Role::Instrument);
+        other.path = PathBuf::from("C:\\plugins\\Other.clap");
+        other.stamp = Some(stamp(100));
+
+        assert_eq!(
+            reusable(
+                &[other],
+                Path::new("C:\\plugins\\Synth.clap"),
+                Some(stamp(100))
+            ),
+            None
+        );
     }
 
     /// 名前で並ぶこと (大文字小文字を区別しない)
