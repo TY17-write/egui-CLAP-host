@@ -27,7 +27,8 @@ const VERSION: u32 = 1;
 /// |---|---|
 /// | 1 | 最初 (印を持たない記録もここに入る) |
 /// | 2 | VST3 は `moduleinfo.json` があればそれを読む (種別がクラス単位になった) |
-pub const SCANNER_VERSION: u32 = 2;
+/// | 3 | JSON が無い VST3 もファクトリから読む。**「未分類」が減る** |
+pub const SCANNER_VERSION: u32 = 3;
 
 /// 設定を置くディレクトリの名前 (実行ファイルの隣に作る)
 const CONFIG_DIR: &str = "config";

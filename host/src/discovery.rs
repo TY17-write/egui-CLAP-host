@@ -11,12 +11,14 @@
 //!
 //! | 形式 | やること |
 //! |---|---|
-//! | CLAP | モジュールを読んで `clap_entry.init` まで。**作りはしない** |
+//! | CLAP | モジュールを読んで `clap_entry.init` まで |
 //! | VST3 (`moduleinfo.json` あり) | **JSON を1つ読むだけ** ([`load_vst3_file`]) |
-//! | VST3 (JSON なし) | モジュールを読み、`vst3-host` が中でプラグインを作る |
+//! | VST3 (JSON なし) | モジュールを読んでファクトリに聞く |
 //!
-//! 最後の道だけが桁違いに重い。音源は生成時にウェーブテーブルやプリセットを
-//! 読むので、1本で数秒かかることがある。
+//! **どの道もプラグインを作らない。** 音源は生成時にウェーブテーブルや
+//! プリセットを読み、1本で数秒かかる。`vst3-host` の
+//! `get_detailed_plugin_info` はバス構成のために生成するので使わない
+//! (走査でバス構成は要らない)。
 
 #![allow(unsafe_code)]
 
@@ -243,19 +245,6 @@ fn vst3_role(sub_categories: &[String]) -> Role {
     }
 }
 
-/// ファイル全体のカテゴリを、その中のクラスに当ててよいか決める。
-///
-/// **当てられるのは、音のクラスが1つだけのとき。** 複数入っていると、
-/// ファイル全体の値は代表の1つのものでしかない。他のクラスに当てると
-/// 間違える (検証用の VST3 で、エフェクトが音源として出た)。
-fn file_wide_role(audio_class_count: usize, category: &str) -> Role {
-    if audio_class_count == 1 {
-        vst3_role(std::slice::from_ref(&category.to_string()))
-    } else {
-        Role::Unknown
-    }
-}
-
 /// `moduleinfo.json` の宣言だけで一覧を作る。**モジュールを読み込まない。**
 ///
 /// SDK 3.7.5 以降のバンドルは、クラスの ID・名前・作者・版・副カテゴリを
@@ -292,6 +281,33 @@ fn vst3_from_module_info(module: &vst3_host::discovery::ModuleInfo) -> Vec<Found
         .collect()
 }
 
+/// ファクトリの宣言から一覧を作る。**モジュールは読むが、プラグインは作らない。**
+///
+/// `moduleinfo.json` が無いバンドル向け。`IPluginFactory2` 以降が
+/// クラスごとの副カテゴリを持っているので、JSON があるときと同じ粒度で分かる。
+fn vst3_from_factory(listed: &vst3_host::discovery::FactoryClasses) -> Vec<FoundPlugin> {
+    listed
+        .classes
+        .iter()
+        .filter(|class| class.category.contains(VST3_AUDIO_CLASS))
+        .map(|class| FoundPlugin {
+            id: class.class_id.clone(),
+            name: if class.name.is_empty() {
+                class.class_id.clone()
+            } else {
+                class.name.clone()
+            },
+            role: vst3_role(&class.sub_categories),
+            vendor: if class.vendor.is_empty() {
+                listed.factory.vendor.clone()
+            } else {
+                class.vendor.clone()
+            },
+            version: class.version.clone(),
+        })
+        .collect()
+}
+
 /// .vst3 を読み、含まれる音源クラスの一覧を返す。
 ///
 /// Windows では `Foo.vst3` がバンドル**ディレクトリ**のことも素の DLL のこともある。
@@ -300,20 +316,20 @@ fn vst3_from_module_info(module: &vst3_host::discovery::ModuleInfo) -> Vec<Found
 /// CLAP と違って `PluginEntry` に当たるものは返さない。`vst3-host` の `Plugin` が
 /// モジュールを自分で抱えるので、載せるときに開き直せばよい。
 ///
-/// **種別の情報源は2つある。**
+/// **種別の情報源は2つあり、どちらもクラス単位で分かる。**
 ///
-/// | 出どころ | 粒度 | いつ取れるか | 代償 |
-/// |---|---|---|---|
-/// | `moduleinfo.json` の `sub_categories` | クラスごと | SDK 3.7.5 以降のバンドルだけ | JSON を1つ読むだけ |
-/// | ファクトリの `category` | **ファイルに1つ** | いつでも | **プラグインを実際に作る** |
+/// | 出どころ | いつ取れるか | 代償 |
+/// |---|---|---|
+/// | `moduleinfo.json` の `sub_categories` | SDK 3.7.5 以降のバンドルだけ | JSON を1つ読むだけ |
+/// | ファクトリの `sub_categories` | `IPluginFactory2` 以降 (ほぼ全部) | モジュールを読む |
 ///
-/// **前者で足りるならそこで返す。** 粒度が細かいうえに桁違いに安い。
-/// 後者に落ちる道は `get_detailed_plugin_info` を通り、そこでは使いもしない
-/// バス構成を調べるために `createInstance` と `initialize` が呼ばれる。
-/// 音源はそこでウェーブテーブルやプリセットを読むので、1本で数秒かかる。
+/// **前者で足りるならそこで返す。** 桁違いに安い。
 ///
-/// 後者で代用できるのは [`file_wide_role`] のとおりクラスが1つのファイルに限る。
-/// 当てられないものは [`Role::Unknown`] のまま「未分類」へ置く
+/// **どちらもプラグインを作らない。** `get_detailed_plugin_info` は使いもしない
+/// バス構成を調べるために `createInstance` と `initialize` を呼ぶので使わない。
+/// 音源はそこでウェーブテーブルやプリセットを読み、1本で数秒かかる。
+///
+/// 副カテゴリを宣言していないものは [`Role::Unknown`] のまま「未分類」へ置く
 /// (**間違った分類より、分からないと言うほうがよい**)。
 ///
 /// # Safety
@@ -329,46 +345,8 @@ pub fn load_vst3_file(path: &Path) -> Result<Vec<FoundPlugin>, Box<dyn Error>> {
         }
     }
 
-    let info = vst3_host::discovery::get_detailed_plugin_info(path)?;
-
-    let audio_classes = info
-        .classes
-        .iter()
-        .filter(|class| class.category.contains(VST3_AUDIO_CLASS));
-    let declared = info.module_info.as_ref().map(|module| &module.classes);
-
-    let file_role = file_wide_role(audio_classes.clone().count(), &info.info.category);
-
-    let plugins: Vec<FoundPlugin> = audio_classes
-        .map(|class| {
-            let from_module_info = declared.and_then(|classes| {
-                classes
-                    .iter()
-                    .find(|entry| entry.class_id.eq_ignore_ascii_case(&class.class_id))
-            });
-            FoundPlugin {
-                id: class.class_id.clone(),
-                name: if class.name.is_empty() {
-                    class.class_id.clone()
-                } else {
-                    class.name.clone()
-                },
-                role: match from_module_info {
-                    Some(entry) => vst3_role(&entry.sub_categories),
-                    None => file_role,
-                },
-                vendor: match from_module_info {
-                    Some(entry) if !entry.vendor.is_empty() => entry.vendor.clone(),
-                    _ => info.info.vendor.clone(),
-                },
-                version: if class.version.is_empty() {
-                    info.info.version.clone()
-                } else {
-                    class.version.clone()
-                },
-            }
-        })
-        .collect();
+    let listed = vst3_host::discovery::list_plugin_classes(path)?;
+    let plugins = vst3_from_factory(&listed);
 
     if plugins.is_empty() {
         return Err("このファイルには VST3 の音源が含まれていません".into());
@@ -490,20 +468,65 @@ mod tests {
         assert_eq!(of("Instrument | Synth"), Role::Instrument, "空白があっても");
     }
 
-    /// **クラスが複数あるファイルには、全体のカテゴリを当てないこと。**
+    /// **クラスごとに種別が分かれること** (ファクトリから読んだ場合)。
     ///
-    /// 当てると間違える。検証用の VST3 (1ファイルに音源とエフェクト、
-    /// `moduleinfo.json` 無し) で、エフェクトが音源として出た。
-    /// 「未分類」に置くほうが正しい。
+    /// ここが以前の弱点だった。ファイル全体のカテゴリしか取れなかったころは、
+    /// 音のクラスが2つあるファイルを全部「未分類」に置くしかなかった
+    /// (当てると間違える。検証用の VST3 でエフェクトが音源として出た)。
+    /// `list_plugin_classes` がクラスごとの副カテゴリを返すので、その妥協は消えた。
     #[test]
-    fn a_file_wide_category_only_applies_to_a_single_class() {
-        assert_eq!(file_wide_role(1, "Instrument|Synth"), Role::Instrument);
-        assert_eq!(file_wide_role(1, "Fx|Reverb"), Role::Effect);
-        // 2つ以上なら、どちらのものか分からない
-        assert_eq!(file_wide_role(2, "Instrument|Synth"), Role::Unknown);
-        assert_eq!(file_wide_role(5, "Fx"), Role::Unknown);
-        // クラスが1つでもカテゴリが空なら分からない
-        assert_eq!(file_wide_role(1, ""), Role::Unknown);
+    fn each_factory_class_gets_its_own_role() {
+        use vst3_host::discovery::{ClassInfo, FactoryClasses, FactoryInfo};
+
+        let class = |name: &str, sub: &[&str]| ClassInfo {
+            name: name.to_string(),
+            category: "Audio Module Class".to_string(),
+            class_id: format!("{name}-id"),
+            sub_categories: sub.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let listed = FactoryClasses {
+            factory: FactoryInfo {
+                vendor: "Example Audio".to_string(),
+                ..Default::default()
+            },
+            classes: vec![
+                class("Synth", &["Instrument", "Synth"]),
+                class("Reverb", &["Fx", "Reverb"]),
+                // 宣言が無いものは未分類のまま
+                class("Mystery", &[]),
+                // 音のクラスでないものは拾わない
+                ClassInfo {
+                    name: "Controller".to_string(),
+                    category: "Component Controller Class".to_string(),
+                    class_id: "controller-id".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let found = vst3_from_factory(&listed);
+        assert_eq!(found.len(), 3, "音のクラスだけ拾うこと: {found:?}");
+        assert_eq!(found[0].role, Role::Instrument);
+        assert_eq!(found[1].role, Role::Effect);
+        assert_eq!(found[2].role, Role::Unknown);
+        assert_eq!(found[0].vendor, "Example Audio", "無ければ作者を借りること");
+    }
+
+    /// 名前が空なら ID で代用すること (一覧が空欄にならない)
+    #[test]
+    fn a_nameless_factory_class_shows_its_id() {
+        use vst3_host::discovery::{ClassInfo, FactoryClasses};
+
+        let listed = FactoryClasses {
+            classes: vec![ClassInfo {
+                category: "Audio Module Class".to_string(),
+                class_id: "AABBCC".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(vst3_from_factory(&listed)[0].name, "AABBCC");
     }
 
     /// **隣に同名の .clap があるときだけ手がかりを添えること。**
@@ -541,9 +564,7 @@ mod tests {
     /// 中に実体 (DLL) を一切置かない。それでも一覧が返るなら、
     /// **モジュールを開く道を通っていない**と言い切れる。
     ///
-    /// ついでに、**クラスごとに種別が分かれること**も見ている。同じことを
-    /// 従来の道でやると、音のクラスが2つあるファイルは全部「未分類」になる
-    /// ([`file_wide_role`])。
+    /// ついでに、**クラスごとに種別が分かれること**も見ている。
     #[test]
     fn a_bundle_with_module_info_is_read_without_loading_it() {
         let root = temp_dir("module-info").join("Pack.vst3");
