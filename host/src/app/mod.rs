@@ -310,40 +310,6 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 音源の操作はオーディオトラックの窓へ移した (下の `audio_track_windows`)
-            {
-
-                // パラメータ汎用エディタ (一時的に無効化中)
-                /*
-                if loaded.params.is_empty() {
-                    ui.label("(このプラグインには表示可能なパラメータがありません)");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height((ui.available_height() - 160.0).max(60.0))
-                        .show(ui, |ui| {
-                            for param in &mut loaded.params {
-                                let mut slider =
-                                    egui::Slider::new(&mut param.value, param.min..=param.max)
-                                        .text(&param.name);
-                                if param.is_stepped {
-                                    slider = slider.step_by(1.0);
-                                }
-                                if ui.add(slider).changed() {
-                                    let _ = loaded.producer.push(GuiMsg::ParamValue {
-                                        track: 0,
-                                        // チェーンの何段目か。この UI を戻すときは
-                                        // 段を選べるようにすること
-                                        node: 0,
-                                        id: param.id,
-                                        value: param.value,
-                                    });
-                                }
-                            }
-                        });
-                }
-                */
-            }
-
             if self.audio_tracks.iter().all(|track| track.nodes.is_empty()) {
                 ui.label(
                     "音源が未ロードです (「オーディオトラック」の窓から載せてください)。\

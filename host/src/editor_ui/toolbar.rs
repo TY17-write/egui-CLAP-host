@@ -276,19 +276,6 @@ pub(super) fn toolbar(
     ui.horizontal(|ui| {
         if let Some(idx) = state.selected {
             if let Some(note) = state.editor.notes.get_mut(idx) {
-                /* どうやってもUIがズレるので削除しました。→後続のラベルがあるため基本不要
-                // 表示名は桁数で幅が変わる ((9,4) → (10,4)) ため、
-                // 固定幅の領域に左寄せで置いて後続のウィジェットを動かさない
-                let name = format!("選択中: {}", note.name());
-                ui.allocate_ui_with_layout(
-                    vec2(120.0, 18.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.label(name);
-                    },
-                );
-                */
-
                 // 2桁分の幅を確保して、9→10 でレイアウトが動かないようにする
                 ui.label("半音");
                 let resp = ui.add_sized(

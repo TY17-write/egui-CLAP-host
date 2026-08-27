@@ -12,7 +12,7 @@ clack-extensions = { workspace = true }
 # (C のツールチェーンも不要になる)。
 #
 # crates.io 版ではなくフォークを指す。エディタを開く経路に手元の音源の半分が
-# 通らない箇所があり、上流待ちにできないため (docs/vst3_host_plan.md のフェーズ6)。
+# 通らない箇所があり、上流待ちにできないため (docs/archive/vst3_host_plan.md のフェーズ6)。
 # 版はここで固定しないが、Cargo.lock がコミットを固定するので再現性は保たれる。
 vst3-host = { git = "https://github.com/TY17-write/rust-vst3-host.git", default-features = false }
 cpal = "0.15"

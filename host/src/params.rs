@@ -1,23 +1,26 @@
-//! プラグインのパラメータ列挙 (汎用パラメータ UI 用)。
+//! CLAP プラグインのパラメータ列挙。
+//!
+//! **ID を名前から引くために使う。** 検証バイナリ (`gain_smoke` / `chain_smoke`) が
+//! プラグイン側の定数を写し取らずにパラメータを指定できるのはこれによる。
 
 use crate::host::MiniHost;
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_host::prelude::*;
 
-/// GUI に表示するパラメータ1つ分の情報
-pub struct ParamUi {
+/// 列挙したパラメータ1つ分
+pub struct ParamEntry {
     pub id: ClapId,
     pub name: String,
     pub min: f64,
     pub max: f64,
-    /// スライダーにバインドされる現在値
+    /// 列挙した時点の値 (取れなければ既定値)
     pub value: f64,
     /// 整数ステップのパラメータか
     pub is_stepped: bool,
 }
 
 /// プラグインの全パラメータを列挙する。params 拡張がなければ空を返す。
-pub fn read_params(instance: &mut PluginInstance<MiniHost>) -> Vec<ParamUi> {
+pub fn read_params(instance: &mut PluginInstance<MiniHost>) -> Vec<ParamEntry> {
     let mut handle = instance.plugin_handle();
     let Some(params_ext) = handle.get_extension::<PluginParams>() else {
         return vec![];
@@ -46,7 +49,7 @@ pub fn read_params(instance: &mut PluginInstance<MiniHost>) -> Vec<ParamUi> {
 
         let value = params_ext.get_value(&mut handle, id).unwrap_or(default);
 
-        result.push(ParamUi {
+        result.push(ParamEntry {
             id,
             name,
             min,

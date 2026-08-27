@@ -292,7 +292,7 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 (時間軸ごと写すので写像が単調)。
 
 強さの既定値はスウィングと違って**典拠が無く、耳で決めた出発点**
-(`docs/archive/waltz-plan.md`)。
+([archive/waltz-plan.md](archive/waltz-plan.md))。
 
 書き出した MIDI にも跳ねが乗る。読み戻すと跳ねが二重に掛かるので、
 編集を保存する用途には使わないこと。
@@ -755,11 +755,15 @@ B-P の基準 311.127Hz は12平均律の E♭4 と同じ高さで、`(半音3, 
 
 | | 中身 |
 |---|---|
-| `app/` | アプリの状態と毎フレームの処理。`mod.rs` が `App` と `update`、以下 `routing` (繋ぎ方と音量) / `plugins` (音源の読み込み) / `project_io` (保存と MIDI) / `render` (書き出し) / `mixer_ui` (オーディオトラックの窓) / `track` / `notice` |
-| `editor_ui/` | ピアノロール。`grid` (描画と操作) / `geometry` (座標と当たり判定・テストの大半) / `state` (選択と編集) / `history` / `gutter` / `toolbar` / `color` / `help` / `metrics` |
-| `audio/` | オーディオスレッド側。`graph` (ルーティングとミキサ) / `transport` / `buffers` / `clap` / `vst3` / `offline` (書き出し) |
+| `app/` | アプリの状態と毎フレームの処理。`mod.rs` が `App` と `update`、以下 `routing` (繋ぎ方と音量) / `plugins` (音源の読み込み) / `project_io` (保存と MIDI) / `render` (書き出し) / `mixer_ui` (オーディオトラックの窓) / `library_ui` (プラグイン一覧の窓) / `monitor_ui` (上部のマスターメーター) / `track` (トラックと音源の持ち物) / `notice` (結果の通知) |
+| `editor_ui/` | ピアノロール。`grid` (描画と操作) / `geometry` (座標と当たり判定・テストの大半) / `state` (選択と編集) / `history` / `gutter` / `toolbar` / `shortcuts` (キー操作と再生の開始・停止) / `color` / `help` / `metrics` |
+| `audio/` | オーディオスレッド側。`graph` (ルーティングとミキサ) / `transport` / `buffers` / `config` (ストリームとポート構成の取り決め) / `events` (バックエンドに依らないイベント列) / `clap` / `vst3` / `offline` (書き出し) |
 | `meter/` | マスターの計測。`loudness` (BS.1770 の K特性) / `spectrum` (FFT) |
-| その他 | `sequencer` (ノートとトラックの型) / `project` (.ron) / `midi` / `wav` / `opus` / `ccs` / `discovery` / `gui` / `host` / `theme` |
+| データと計算 | `sequencer` (ノートとトラックの型) / `swing` (裏拍の比と表拍の遅れ) / `waltz` (不均等な拍) |
+| ファイル入出力 | `project` (.ron) / `midi` / `wav` / `opus` / `ccs` |
+| プラグインの発見 | `discovery` (ファイルの中身の数え上げ) / `subscan` (別プロセスでの走査) / `library` (一覧の保存) |
+| プラグイン GUI | `gui` (開閉とリサイズ) / `plugin_window` (Win32 のネイティブウィンドウ) / `timers` (clap.timer-support) |
+| その他 | `host` (clack のホストハンドラ) / `params` (パラメータ列挙・検証バイナリが使う) / `theme` |
 
 ## プラグイン独自 GUI
 

@@ -9,7 +9,6 @@ use crate::audio::vst3::SharedPlugin;
 use crate::audio::GuiMsg;
 use crate::gui::{PluginGuiManager, Vst3GuiManager};
 use crate::host::{MainThreadMessage, MiniHost, MiniHostMainThread, MiniHostShared};
-use crate::params::{self, ParamUi};
 use crate::{audio, discovery, project};
 use clack_host::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
@@ -128,8 +127,6 @@ pub(super) struct ClapTrack {
     pub(super) instance: PluginInstance<MiniHost>,
     pub(super) receiver: Receiver<MainThreadMessage>,
     pub(super) sender: Sender<MainThreadMessage>,
-    #[allow(dead_code)] // パラメータ UI 無効化中
-    pub(super) params: Vec<ParamUi>,
     /// プラグイン独自 GUI の管理 (gui 拡張がない場合は None)
     pub(super) gui: Option<PluginGuiManager>,
 }
@@ -305,7 +302,6 @@ pub(super) fn instantiate_clap(
     };
 
     let node = audio::activate_node(&mut instance, stream_config)?;
-    let params = params::read_params(&mut instance);
 
     // gui 拡張があれば GUI マネージャを用意する
     let gui_ext = instance.access_handler(|mt| mt.gui.get());
@@ -322,7 +318,6 @@ pub(super) fn instantiate_clap(
                 instance,
                 receiver,
                 sender,
-                params,
                 gui,
             }),
         },

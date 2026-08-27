@@ -45,6 +45,7 @@ CLAP の C API を安全な Rust API で包み、**main-thread / audio-thread �
 | [opus-rs](https://crates.io/crates/opus_rs) | Opus の符号化 (純 Rust) | BSD-3-Clause |
 | [ogg](https://crates.io/crates/ogg) | Ogg 容器 (純 Rust) | BSD-3-Clause |
 | serde / ron | プロジェクトファイル (.ron) の読み書き | MIT OR Apache-2.0 |
+| base64 | 音源の状態 (不透明なバイト列) を .ron に載せる | MIT OR Apache-2.0 |
 | rtrb | オーディオスレッドとのリングバッファ | MIT OR Apache-2.0 |
 | crossbeam-channel | プラグインからのメインスレッド要求 | MIT OR Apache-2.0 |
 | rfd | ファイルダイアログ | MIT |
