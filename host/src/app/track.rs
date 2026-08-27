@@ -295,13 +295,7 @@ pub(super) fn instantiate_clap(
     let channels = {
         let inputs = audio::config::get_config_from_ports(&mut instance.plugin_handle(), true);
         let outputs = audio::config::get_config_from_ports(&mut instance.plugin_handle(), false);
-        let main = |config: &audio::config::PluginAudioPortsConfig| {
-            config
-                .ports
-                .get(config.main_port_index as usize)
-                .map_or(0, |port| port.port_layout.channel_count())
-        };
-        (main(&inputs), main(&outputs))
+        (inputs.main_channel_count(), outputs.main_channel_count())
     };
 
     let node = audio::activate_node(&mut instance, stream_config)?;
@@ -341,11 +335,19 @@ pub(super) fn instantiate_vst3(
     let (plugin, node) = audio::activate_vst3_node(path, class_id, stream_config)?;
 
     // 入力側は `vst3-host` に問い合わせる術が無く、こちらが要求した数になる
-    // (`audio::activate_vst3_node` の説明を参照)
-    let channels = (
-        graph::BUS_CHANNELS as u16,
-        plugin.lock().output_channel_count() as u16,
-    );
+    // (`audio::activate_vst3_node` の説明を参照)。
+    //
+    // **出力は 0 を潰さずに出す。** `output_channel_count()` は 0 をステレオに
+    // 丸めるので、モニタリング系が「2→2ch」と嘘の表示になる
+    let channels = {
+        let plugin = plugin.lock();
+        let outputs = if audio::vst3::produces_audio(&plugin) {
+            plugin.output_channel_count() as u16
+        } else {
+            0
+        };
+        (graph::BUS_CHANNELS as u16, outputs)
+    };
 
     let gui = Vst3GuiManager::new(&plugin.lock());
     let (sender, receiver) = crossbeam_channel::unbounded();

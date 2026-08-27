@@ -23,6 +23,21 @@ use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
 use vst3_host::plugin::Plugin;
 
+/// この VST3 が音を返すか。
+///
+/// **`output_channel_count()` では判定できない。** `vst3-host` は「報告が 0 なら
+/// ステレオ」と丸めるので (`clamp_output_channels`)、出力バスを1つも持たない
+/// モニタリング系でも 2 が返ってくる。バスの並びを直接見るしかない。
+///
+/// **聞けなかったときは「音を返す」とみなす。** 素通しに倒すと、普通のエフェクトが
+/// 丸ごと効かなくなる。分からないときは今までどおりに動かすほうが害が小さい。
+pub fn produces_audio(plugin: &Plugin) -> bool {
+    match plugin.bus_arrangements() {
+        Ok(buses) => buses.outputs.iter().any(|bus| bus.channel_count() > 0),
+        Err(_) => true,
+    }
+}
+
 /// 音源を取れずに送り損ねたイベントを溜めておく上限。
 ///
 /// 1ブロックに数十件しか出ないので、これだけあれば数ブロック分の取りこぼしを
@@ -109,6 +124,11 @@ pub struct Vst3Processor {
     /// 捨ててしまうと note-off が失われて音が鳴りっぱなしになる。
     /// 位置は失われるが、鳴り続けるよりはるかにましと判断した。
     deferred: Vec<BlockEvent>,
+    /// 音を返すか。**出力バスを持たないプラグイン (モニタリング系) は false**。
+    ///
+    /// バッファの器は1chぶん作ってあるので、これが無いと「無音を書き込む段」に
+    /// なってしまい、そこから後ろが鳴らなくなる。
+    produces_audio: bool,
 }
 
 impl Vst3Processor {
@@ -118,11 +138,15 @@ impl Vst3Processor {
     /// `output_channel_count` はあるが入力側を問い合わせる術が無く、
     /// `Vst3HostBuilder::input_channels` で指定した数にバスが並ぶ。
     /// そのため `mod.rs` が渡した値をそのまま使う。
+    ///
+    /// `produces_audio` は [`produces_audio`](self::produces_audio) で調べた値。
+    /// **`plugin_channels` からは分からない** (0 がステレオに丸められるため)。
     pub fn new(
         plugin: SharedPlugin,
         plugin_channels: usize,
         input_channels: usize,
         stream_config: &StreamAudioConfig,
+        produces_audio: bool,
     ) -> Self {
         Self {
             plugin,
@@ -136,7 +160,13 @@ impl Vst3Processor {
             active: 0,
             active_ccs: 0,
             deferred: Vec::with_capacity(MAX_DEFERRED),
+            produces_audio,
         }
+    }
+
+    /// 音を返すか (返さないものはチェーンで素通しになる)
+    pub fn produces_audio(&self) -> bool {
+        self.produces_audio
     }
 
     /// メインスレッドへ返せる形にする。
@@ -236,8 +266,11 @@ impl Vst3Processor {
         let channels = self.output_channels;
 
         match outputs.len() {
-            // 出力バスが無い。入ってきた音を残さず無音にする
-            // (上書きの約束を守るため。加算だった頃は何もしないのが正しかった)
+            // 出力バスが無い。**上書きの約束を守って無音にする。**
+            //
+            // 音が途切れないのは呼び出し側の仕事で、`TrackProcessor::process` が
+            // 入ってきた音を控えて書き戻す ([`Node::produces_audio`])。
+            // ここで素通しにすると、上書きの約束が場所によって変わってしまう
             0 => buf[..frames * channels].fill(0.0),
             // モノラル出力は全チャンネルへ複製する
             1 => {

@@ -115,6 +115,15 @@ impl FullAudioConfig {
         }
     }
 
+    /// このプラグインが音を返すか。
+    ///
+    /// **返さないものはチェーンで素通しにする。** モニタリング系
+    /// (アナライザ・チューナー・メーター) は出力を持たないので、書かせた
+    /// バッファをそのまま採ると、そこから後ろが無音になる。
+    pub fn produces_audio(&self) -> bool {
+        self.plugin_output_port_config.main_channel_count() > 0
+    }
+
     /// CPAL デバイスとプラグインの両方に合う最良の構成を探す
     pub fn find_best_from(
         device: &Device,
@@ -169,6 +178,15 @@ impl Display for FullAudioConfig {
 pub struct PluginAudioPortsConfig {
     pub ports: Vec<PluginAudioPortInfo>,
     pub main_port_index: u32,
+    /// **出力ポートを1つも持たないと申告されたか。**
+    ///
+    /// モニタリング系のプラグイン (アナライザ・チューナー・メーター) がこれに当たる。
+    /// バッファの器が無いと組み立てが通らないので `ports` には既定のステレオを
+    /// 入れてあり、**「音を返さない」という事実だけをここに残す**。
+    ///
+    /// **ポート拡張そのものを持たないプラグインは含まない。** 申告しないだけで
+    /// 音を書くものがあり、それを素通しにすると鳴らなくなる。
+    pub no_audio_output: bool,
 }
 
 impl PluginAudioPortsConfig {
@@ -176,6 +194,7 @@ impl PluginAudioPortsConfig {
         PluginAudioPortsConfig {
             main_port_index: 0,
             ports: vec![],
+            no_audio_output: false,
         }
     }
 
@@ -188,11 +207,32 @@ impl PluginAudioPortsConfig {
                 port_layout: AudioPortLayout::Stereo,
                 name: "Default".into(),
             }],
+            no_audio_output: false,
+        }
+    }
+
+    /// 音を返さないプラグイン向けの構成 (器は既定のステレオ)
+    fn silent() -> Self {
+        PluginAudioPortsConfig {
+            no_audio_output: true,
+            ..Self::default()
         }
     }
 
     pub fn main_port(&self) -> &PluginAudioPortInfo {
         &self.ports[self.main_port_index as usize]
+    }
+
+    /// メインポートのチャンネル数。**音を返さないと申告されていれば 0**。
+    ///
+    /// 画面の「2→0ch」表示と、素通しにするかの判定がここを見る。
+    pub fn main_channel_count(&self) -> u16 {
+        if self.no_audio_output {
+            return 0;
+        }
+        self.ports
+            .get(self.main_port_index as usize)
+            .map_or(0, |port| port.port_layout.channel_count())
     }
 
     pub fn total_channel_count(&self) -> usize {
@@ -385,8 +425,9 @@ pub fn get_config_from_ports(
         if is_input {
             return PluginAudioPortsConfig::empty();
         }
-        eprintln!("警告: 出力ポートが1つもありません。デフォルトのステレオ構成を使います。");
-        return PluginAudioPortsConfig::default();
+        // 出力ポートが無いと**申告している**。モニタリング系がこれに当たるので、
+        // 音を返さないものとして扱う (チェーンでは素通しになる)
+        return PluginAudioPortsConfig::silent();
     }
 
     let main_port_index = if let Some(main_port_index) = main_port_index {
@@ -413,6 +454,8 @@ pub fn get_config_from_ports(
     PluginAudioPortsConfig {
         main_port_index,
         ports: discovered_ports,
+        // ポートを申告しているので、音を返すかはチャンネル数で決まる
+        no_audio_output: false,
     }
 }
 

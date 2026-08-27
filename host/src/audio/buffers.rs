@@ -233,6 +233,11 @@ impl HostAudioBuffers {
         muxed
     }
 
+    /// 組んだときのポート構成 (音を返すかの判定に使う)
+    pub fn config(&self) -> &FullAudioConfig {
+        &self.config
+    }
+
     /// プラグイン出力を CPAL バッファに書き出す (ダウンミックス/インターリーブ込み)
     pub fn write_to_cpal_buffer<S: FromSample<f32>>(&mut self, destination: &mut [S]) {
         let muxed = self.muxed_output(destination.len());

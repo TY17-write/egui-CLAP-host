@@ -53,6 +53,11 @@ impl ClapProcessor {
         self.audio_processor.stop_processing()
     }
 
+    /// 音を返すか (返さないものはチェーンで素通しになる)
+    pub fn produces_audio(&self) -> bool {
+        self.buffers.config().produces_audio()
+    }
+
     /// 1ブロック処理して `buf` を**置き換える**。
     ///
     /// `buf` は入力と出力を兼ねる。入ってきた音を読み、処理した音で上書きする。

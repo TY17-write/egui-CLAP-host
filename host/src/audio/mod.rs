@@ -194,6 +194,18 @@ impl Node {
         self.bypassed
     }
 
+    /// 音を返す段か。
+    ///
+    /// **モニタリング系 (アナライザ・チューナー・メーター) は出力を持たない。**
+    /// そういう段が書いたバッファをそのまま採ると、そこから後ろが無音になる。
+    /// 呼び出し側 ([`TrackProcessor::process`]) が素通しにする判断に使う。
+    pub fn produces_audio(&self) -> bool {
+        match &self.backend {
+            Backend::Clap(processor) => processor.produces_audio(),
+            Backend::Vst3(processor) => processor.produces_audio(),
+        }
+    }
+
     /// メインスレッドへ返せる形にする (このメソッド自体もメインスレッドで呼ぶ)
     pub fn into_retired(self) -> RetiredProcessor {
         match self.backend {
@@ -386,8 +398,13 @@ impl TrackProcessor {
             // 消音を取りこぼして「戻した瞬間に鳴り出す」ことになる
             // (理由は [`Node::bypassed`])。入ってきた音を控えておき、
             // 段を通したあとに書き戻して**出した音だけを捨てる**。
-            let bypassed = node.is_bypassed();
-            if bypassed {
+            //
+            // **音を返さない段も同じ扱い。** モニタリング系 (アナライザ・
+            // チューナー・メーター) は出力バスを持たないので、書かせたバッファを
+            // そのまま採ると**そこから後ろが無音になる**。音は見せたうえで、
+            // 入ってきた音を残す ([`Node::produces_audio`])。
+            let keep_input = node.is_bypassed() || !node.produces_audio();
+            if keep_input {
                 // 器は `reserve` で取ってある。ここで伸びるのは、それを通らない
                 // 検証バイナリのような経路だけ
                 if bypass_scratch.len() < buf.len() {
@@ -401,7 +418,7 @@ impl TrackProcessor {
                 return Err(e);
             }
 
-            if bypassed {
+            if keep_input {
                 buf.copy_from_slice(&bypass_scratch[..buf.len()]);
             }
         }
@@ -550,6 +567,8 @@ pub fn activate_vst3_node(
 
     let mut plugin = vst3_host.load_plugin_class(path, class_id)?;
     let plugin_channels = plugin.output_channel_count();
+    // **バスを見て決める。** `plugin_channels` は 0 がステレオに丸められている
+    let produces_audio = vst3::produces_audio(&plugin);
     plugin.start_processing()?;
 
     let shared = SharedPlugin::new(plugin);
@@ -558,6 +577,7 @@ pub fn activate_vst3_node(
         plugin_channels,
         bus.output_channel_count,
         &bus,
+        produces_audio,
     );
 
     Ok((shared, Node::new(Backend::Vst3(processor))))
@@ -590,13 +610,13 @@ pub fn reconfigure_vst3_node(
     stream_config: &StreamAudioConfig,
 ) -> Result<Node, Box<dyn Error>> {
     let bus = bus_config(stream_config);
-    let plugin_channels = {
+    let (plugin_channels, produces_audio) = {
         let mut plugin = shared.lock();
         // reconfigure は処理中には呼べない
         plugin.stop_processing()?;
         plugin.reconfigure(bus.sample_rate as f64, bus.max_likely_buffer_size as usize)?;
         plugin.start_processing()?;
-        plugin.output_channel_count()
+        (plugin.output_channel_count(), vst3::produces_audio(&plugin))
     };
 
     Ok(Node::new(Backend::Vst3(Vst3Processor::new(
@@ -604,6 +624,7 @@ pub fn reconfigure_vst3_node(
         plugin_channels,
         bus.output_channel_count,
         &bus,
+        produces_audio,
     ))))
 }
 

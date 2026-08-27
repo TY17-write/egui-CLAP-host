@@ -7,7 +7,7 @@
 //!
 //! 見るのは3つ。
 //!
-//! 1. **1つの `.clap` から2つのプラグインが見えること** (音源とエフェクト)
+//! 1. **1つの `.clap` から複数のプラグインが見えること** (音源・エフェクト・モニタ)
 //! 2. **`out = in * gain + offset` になっていること**
 //! 3. **2段の順序を入れ替えると結果が変わること** — この治具が存在する理由。
 //!    掛け算だけだと順序が結果に出ず、チェーンの順が守られているか分からない
@@ -48,9 +48,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("  発見: {} ({})", plugin.name, plugin.id);
     }
 
-    // 1. 1つのファイルに2つ入っていること
-    if plugins.len() != 2 {
-        return Err(format!("プラグインが2つ見つかるはずが {} 個でした", plugins.len()).into());
+    // 1. 1つのファイルに複数入っていること (本数そのものは縛らない。
+    //    治具が増えても落ちないように、必要なものがあるかだけを見る)
+    if plugins.len() < 2 {
+        return Err(format!(
+            "1つのファイルに複数入っているはずが {} 個でした",
+            plugins.len()
+        )
+        .into());
     }
     if !plugins.iter().any(|plugin| plugin.id == GAIN_ID) {
         return Err(format!("{GAIN_ID} がこのファイルにありません").into());
