@@ -147,6 +147,16 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
 
 /// 左のトラック欄。トラックごとに名前と段の増減ボタンを、
 /// グリッドの段と同じ高さで並べる (行の位置が揃うようにするため)。
+/// 子 Ui の描画範囲を `rect` に絞る。**親のクリップと必ず交差させる。**
+///
+/// `Ui::set_clip_rect` は今のクリップを**置き換える** (`painter_at` は交差させる)。
+/// そのまま渡すと、ScrollArea が絞った範囲を広げ直してしまい、画面の外にある
+/// 行までが描かれる。**実際にトラックを増やすとツールバーや下端のボタンの上に
+/// トラック欄が重なって出た。**
+fn clip_within(child: &mut egui::Ui, parent: &egui::Ui, rect: Rect) {
+    child.set_clip_rect(rect.intersect(parent.clip_rect()));
+}
+
 /// トラック欄の見出し (常に見える位置に置く)。高さはルーラーと同じにして、
 /// 下のトラック一覧の1行目がグリッドの1段目と揃うようにする。
 pub(super) fn track_gutter_header(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -159,7 +169,7 @@ pub(super) fn track_gutter_header(ui: &mut egui::Ui, state: &mut EditorState) {
             .max_rect(rect.shrink2(vec2(6.0, 2.0)))
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    content.set_clip_rect(rect);
+    clip_within(&mut content, ui, rect);
     content.label(
         egui::RichText::new("トラック")
             .size(11.0)
@@ -227,7 +237,7 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
                 )
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
-        content.set_clip_rect(rect);
+        clip_within(&mut content, ui, rect);
         // トグル4つ (M/S/W/V) + 名前 + ボタン3つを 200px に収めるため間隔を詰める。
         // **右端は clip_rect で切られる**ので、増やすときは実際に見て確かめること
         content.spacing_mut().item_spacing.x = 2.0;
@@ -366,7 +376,7 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
                     ))
                     .layout(egui::Layout::left_to_right(egui::Align::Min)),
             );
-            second.set_clip_rect(rect);
+            clip_within(&mut second, ui, rect);
             second.spacing_mut().item_spacing.x = 2.0;
             lane_buttons(&mut second, state, track, false);
         } else {
