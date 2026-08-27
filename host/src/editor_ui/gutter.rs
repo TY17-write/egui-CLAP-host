@@ -75,10 +75,28 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
             ui.weak("CC 段の値はベロシティをそのまま使います。書いていない区間は 0 です。");
             ui.separator();
 
+            // 入れ替えは行を回し終えてから行う (回している最中に段の番号が動くと、
+            // 同じフレームの残りの行がずれる)
+            let mut swap = None;
+
             for lane in first_cc..lanes {
                 let kind = state.editor.lane_kind(track, lane);
                 let current = kind.cc();
                 ui.horizontal(|ui| {
+                    // **並び替え。** 制御段どうしなので、CC とヴェロシティを
+                    // またいで動かせる (種別もブロックと一緒に動く)
+                    let up = ui.add_enabled(lane > first_cc, egui::Button::new("▲").small());
+                    if up.clicked() {
+                        swap = Some((lane, lane - 1));
+                    }
+                    up.on_hover_text("1つ上の制御段と入れ替える");
+
+                    let down = ui.add_enabled(lane + 1 < lanes, egui::Button::new("▼").small());
+                    if down.clicked() {
+                        swap = Some((lane, lane + 1));
+                    }
+                    down.on_hover_text("1つ下の制御段と入れ替える");
+
                     ui.label(format!("段 {}", lane + 1));
 
                     if kind == LaneKind::Velocity {
@@ -140,6 +158,12 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
                         }
                     }
                 });
+            }
+
+            if let Some((from, to)) = swap {
+                state.history.record(EditGroup::Once);
+                state.editor.swap_lanes((track, from), (track, to));
+                state.dirty = true;
             }
         });
 
@@ -436,11 +460,12 @@ fn lane_strips(ui: &mut egui::Ui, state: &mut EditorState, track: usize, track_r
         );
 
         let armed = state.lane_swap_source == Some((track, lane));
-        // 相手待ちの段があるとき、種別が違えば入れ替えられない
+        // 相手待ちの段があるとき、音符段と制御段の間では入れ替えられない
+        // (制御段どうしは CC ↔ ヴェロシティでもよい。`swap_lanes` と同じ規則)
         let selectable = match state.lane_swap_source {
             Some((source_track, source_lane)) => {
-                state.editor.lane_cc(source_track, source_lane).is_some()
-                    == state.editor.lane_cc(track, lane).is_some()
+                state.editor.lane_kind(source_track, source_lane).is_note()
+                    == state.editor.lane_kind(track, lane).is_note()
             }
             None => true,
         };

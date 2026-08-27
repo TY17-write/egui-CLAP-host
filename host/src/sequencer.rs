@@ -527,13 +527,12 @@ impl MidiEditor {
 
     /// 2つの段の中身を入れ替える。入れ替えたら true。
     ///
-    /// **同じ種別どうしでしか入れ替えない。** 音符段と制御段を入れ替えると、
-    /// 音符が CC として送られたり、その逆が起きたりする。どちらも見た目では
-    /// 気付きにくいので、そもそも行わない。CC 段とヴェロシティ段の間も同じ
-    /// (ブロックの値の意味が変わってしまう)。
+    /// **音符段と制御段の間では入れ替えない。** 音符が CC として送られたり、
+    /// その逆が起きたりする。どちらも見た目では気付きにくいので、そもそも行わない。
     ///
-    /// CC 段どうしのときは**番号も一緒に動かす**。段ごと入れ替える操作なので、
-    /// ブロックが書かれた当時の CC のまま付いていくほうが筋が通る。
+    /// **制御段どうしは入れ替えられる** (CC ↔ CC も CC ↔ ヴェロシティも)。
+    /// **種別もブロックと一緒に動かす**ので、CC ブロックは CC のまま、
+    /// ヴェロシティのブロックはヴェロシティのままで、並び順だけが変わる。
     pub fn swap_lanes(&mut self, a: (usize, usize), b: (usize, usize)) -> bool {
         if a == b {
             return false;
@@ -545,8 +544,12 @@ impl MidiEditor {
         }
         let a_kind = self.lane_kind(a_track, a_lane);
         let b_kind = self.lane_kind(b_track, b_lane);
-        // CC どうしは番号が違っても入れ替えてよいので、種別の枠だけで見る
-        if std::mem::discriminant(&a_kind) != std::mem::discriminant(&b_kind) {
+        // **音符段と制御段の間だけを断る。**
+        //
+        // 制御段どうし (CC ↔ CC、CC ↔ ヴェロシティ) は入れ替えてよい。
+        // 種別もブロックと一緒に動くので、CC ブロックは CC のまま、
+        // ヴェロシティのブロックはヴェロシティのままで、並び順だけが変わる。
+        if a_kind.is_note() != b_kind.is_note() {
             return false;
         }
 
@@ -1908,21 +1911,58 @@ mod tests {
         assert_eq!(editor.tracks[0].velocity_lane(), Some(1));
     }
 
-    /// 音符段とヴェロシティ段は入れ替えないこと (値の意味が変わってしまう)
+    /// 音符段と制御段は入れ替えないこと (音符が CC として送られてしまう)
     #[test]
-    fn a_velocity_lane_does_not_swap_with_other_kinds() {
+    fn a_velocity_lane_does_not_swap_with_a_note_lane() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        assert!(editor.add_velocity_lane(0)); // 段1
+
+        assert!(!editor.swap_lanes((0, 0), (0, 1)), "音符段とは入れ替えない");
+        assert_eq!(
+            editor.tracks[0].velocity_lane(),
+            Some(1),
+            "動いていないこと"
+        );
+    }
+
+    /// **CC 段とヴェロシティ段は入れ替えられること。**
+    ///
+    /// 並び順を変えるだけの操作なので、**種別もブロックと一緒に動く**。
+    /// CC ブロックは CC のまま、ヴェロシティのブロックはヴェロシティのまま。
+    #[test]
+    fn a_velocity_lane_swaps_with_a_cc_lane() {
         let mut editor = MidiEditor::default();
         editor.tracks[0].lanes = 1;
         editor.add_cc_lane(0, 64); // 段1
         assert!(editor.add_velocity_lane(0)); // 段2
+        editor.notes = vec![
+            Note {
+                lane: 1,
+                velocity: 90, // CC の値
+                ..note(0.0, 1.0, 0, 4)
+            },
+            Note {
+                lane: 2,
+                velocity: 40,
+                velocity_to: 120, // ヴェロシティの坂
+                ..note(0.0, 1.0, 0, 4)
+            },
+        ];
 
-        assert!(!editor.swap_lanes((0, 0), (0, 2)), "音符段とは入れ替えない");
-        assert!(!editor.swap_lanes((0, 1), (0, 2)), "CC 段とも入れ替えない");
+        assert!(editor.swap_lanes((0, 1), (0, 2)));
+
+        assert_eq!(editor.tracks[0].velocity_lane(), Some(1), "上へ動くこと");
+        assert_eq!(editor.lane_cc(0, 2), Some(64), "CC 段は下へ");
+
+        // ブロックが種別と一緒に動いていること (取り違えると値の意味が変わる)
+        let velocity_block = editor.notes.iter().find(|note| note.lane == 1).unwrap();
         assert_eq!(
-            editor.tracks[0].velocity_lane(),
-            Some(2),
-            "動いていないこと"
+            (velocity_block.velocity, velocity_block.velocity_to),
+            (40, 120)
         );
+        let cc_block = editor.notes.iter().find(|note| note.lane == 2).unwrap();
+        assert_eq!(cc_block.velocity, 90);
     }
 
     /// CC 段どうしの入れ替えでは、番号も一緒に動くこと。
