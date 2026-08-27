@@ -1,7 +1,7 @@
 //! 左のトラック欄と、段まわりの操作 (段の帯・段の増減・CC 段の一覧)。
 
 use super::history::EditGroup;
-use super::metrics::{GUTTER_W, ROW_H, RULER_H};
+use super::metrics::{GUTTER_W, RULER_H};
 use super::state::EditorState;
 use crate::sequencer::LaneKind;
 use crate::swing;
@@ -47,24 +47,27 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
     }
 
     let mut open = true;
-    egui::Window::new(format!("制御段 — {}", state.editor.tracks[track].name))
+    egui::Window::new(format!("段の設定 — {}", state.editor.tracks[track].name))
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
         .show(ctx, |ui| {
-            // 追加・削除はここにも置く。トラック欄が狭いときは行に出ないので、
-            // ここが唯一の入口になる。
+            // **追加・削除は全部ここにも置く。** 段が1つのトラックでは行に
+            // 出ないので、ここが唯一の入口になる。
             ui.horizontal(|ui| {
-                ui.label("制御段:");
-                cc_lane_buttons(ui, state, track);
+                ui.label("段:");
+                lane_settings_buttons(ui, state, track);
             });
             ui.separator();
 
             let lanes = state.editor.lanes(track);
             let first_cc = state.editor.tracks[track].normal_lanes();
             if first_cc >= lanes {
-                ui.label("このトラックに制御段はありません。");
-                ui.weak("上の「+」で CC 段、「+V」でヴェロシティ段を追加できます。");
+                ui.label("このトラックに制御段 (CC・ヴェロシティ) はありません。");
+                ui.weak(
+                    "上の段の「+」で音符段、右の「+」で CC 段、\
+                     「+V」でヴェロシティ段を追加できます。",
+                );
                 return;
             }
 
@@ -208,6 +211,13 @@ pub(super) fn track_gutter(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
+    // **行の間に余白を入れない。**
+    //
+    // グリッドは段を隙間なく並べるので、ここで既定の余白 (3px) が入ると
+    // **トラックが増えるほど段の位置が下へずれていく** (18本で 54px)。
+    // 少ないうちは気付かないので、必ずここで 0 にしておくこと。
+    ui.spacing_mut().item_spacing.y = 0.0;
+
     for track in 0..state.editor.track_count() {
         let lanes = state.editor.lanes(track);
         // グリッドの段と行の位置が揃うよう、縦ズームに追従させる
@@ -238,9 +248,36 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
                 .layout(egui::Layout::left_to_right(egui::Align::Min)),
         );
         clip_within(&mut content, ui, rect);
-        // トグル4つ (M/S/W/V) + 名前 + ボタン3つを 200px に収めるため間隔を詰める。
+        // 名前 + トグル4つ (M/S/W/V) + 印を 200px に収めるため間隔を詰める。
         // **右端は clip_rect で切られる**ので、増やすときは実際に見て確かめること
         content.spacing_mut().item_spacing.x = 2.0;
+
+        // **名前をいちばん左に、書き換えられる形で置く。**
+        //
+        // 以前はトグルの右に 44px で置いていたが、それでは「ト…」としか出ず、
+        // どのトラックか分からなかった。行の先頭に回して幅を稼ぐ。
+        //
+        // 2段目がある高さなら残り幅を名前に使い、無いときは段のボタンと
+        // 同居するので詰める (隠れるより窮屈なほうがまし)。
+        let two_rows = rect.height() >= LANE_BUTTON_ROW_Y + LANE_BUTTON_ROW_H;
+        let name_w = if two_rows { 96.0 } else { 56.0 };
+        let mut name = state.editor.tracks[track].name.clone();
+        let response = content.add(
+            egui::TextEdit::singleline(&mut name)
+                .desired_width(name_w)
+                .font(egui::FontId::proportional(11.0))
+                .margin(vec2(2.0, 0.0)),
+        );
+        if response.changed() {
+            // **1文字ごとに履歴へ積まない。** まとめて1ステップにする
+            state.history.record(EditGroup::TrackName);
+            state.editor.tracks[track].name = name;
+            state.dirty = true;
+        }
+        if response.lost_focus() {
+            state.history.end_group();
+        }
+        response.on_hover_text("トラック名 (クリックして書き換えられます)");
 
         // ミュート / ソロ。編集ではないのでアンドゥ履歴には積まない。
         // 変更したらシーケンスを送り直す (鳴らす/止めるの切り替えのため)。
@@ -327,20 +364,6 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
             "不均等な拍は奇数の N/4 拍子のときだけ使えます"
         });
 
-        // 狭いときは名前の枠を詰める (右のボタンを見切れさせないため)
-        let name_w = if rect.height() >= LANE_BUTTON_ROW_Y + LANE_BUTTON_ROW_H {
-            44.0
-        } else {
-            32.0
-        };
-        let name = state.editor.tracks[track].name.clone();
-        content.allocate_ui(vec2(name_w, ROW_H - 4.0), |ui| {
-            ui.add(
-                egui::Label::new(egui::RichText::new(name).size(11.0).color(palette::FG))
-                    .truncate(),
-            );
-        });
-
         // **このトラックを鳴らすオーディオトラックがあるか。**
         //
         // 音源は打ち込みトラックではなくオーディオトラックに載る。ここを見ている
@@ -359,14 +382,15 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
                 .to_string(),
         });
 
-        // 段の増減は2段目へ回す。1行に詰めると 200px に収まらないうえ、
+        // 段の増減は2段目へ回す。1行に詰めると収まらないうえ、
         // **通常段と CC 段で別のボタンが要る** (最下段は CC 段のことがあるので、
         // 1組では「消したい段と違うものが消える」)。
         //
-        // ただし2段目が入らない高さのときは、同じ行に続けて置く。
-        // **隠れると段を増やす手立てが無くなる**ので、窮屈なほうがまだよい
-        // (段が1つのトラックは既定でこの高さになる)。
-        if rect.height() >= LANE_BUTTON_ROW_Y + LANE_BUTTON_ROW_H {
+        // **2段目が入らない高さのときは、ボタン1つに畳んで設定窓へ送る。**
+        // 以前は同じ行に6個続けて置いていたが、名前の欄を入れたことで
+        // 幅が足りなくなり、右端の「CC」が見切れた。設定窓には同じ操作が
+        // 全部あるので、畳んでも手立ては失われない。
+        if two_rows {
             drop(content);
             let mut second = ui.new_child(
                 egui::UiBuilder::new()
@@ -378,9 +402,9 @@ fn track_gutter_content(ui: &mut egui::Ui, state: &mut EditorState) {
             );
             clip_within(&mut second, ui, rect);
             second.spacing_mut().item_spacing.x = 2.0;
-            lane_buttons(&mut second, state, track, false);
+            lane_buttons(&mut second, state, track);
         } else {
-            lane_buttons(&mut content, state, track, true);
+            lane_settings_button(&mut content, state, track);
         }
     }
 }
@@ -463,15 +487,66 @@ fn lane_strips(ui: &mut egui::Ui, state: &mut EditorState, track: usize, track_r
     }
 }
 
-/// 段の増減 (通常段と CC 段で別々)。トラック欄の2段目に置く。
+/// 段の設定窓を開くボタン1つ。**2段目が入らない高さのときに使う。**
 ///
-/// `compact` のときは、同じ行に続けて置くので見出しと区切りを省く。
-fn lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize, compact: bool) {
+/// 段が1つのトラック (既定) はこの高さになる。ボタンを6個並べる幅が無いので、
+/// 全部を持っている設定窓 ([`lane_config_window`]) への入口だけを出す。
+fn lane_settings_button(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
     let lanes = state.editor.lanes(track);
+    let has_control = state.editor.tracks[track].normal_lanes() < lanes;
+    // 制御段があるトラックは色で分かるようにする (2段目の「CC」と同じ流儀)
+    let label = egui::RichText::new("段…").size(10.0).color(if has_control {
+        palette::GREEN
+    } else {
+        palette::FG_DIM
+    });
+    let response = ui.add(egui::Button::new(label).small());
+    if response.clicked() {
+        state.lane_config_track = (state.lane_config_track != Some(track)).then_some(track);
+    }
+    response.on_hover_text("段の追加・削除と CC の割り当てを開く");
+}
+
+/// 段の増減ひとそろい。**トラック欄の2段目に置く。**
+///
+/// 設定窓には [`lane_settings_buttons`] のほうを置く (窓を開くボタンが要らないため)。
+fn lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
+    normal_lane_buttons(ui, state, track, true);
+    ui.separator();
+    open_lane_config_button(ui, state, track);
+    cc_lane_buttons(ui, state, track);
+}
+
+/// 設定窓の中に置く段の増減。
+///
+/// **窓を開くボタンは出さない** (すでに開いている窓の中なので、押すと閉じてしまう)。
+fn lane_settings_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
+    normal_lane_buttons(ui, state, track, false);
+    ui.separator();
+    cc_lane_buttons(ui, state, track);
+}
+
+/// 段の設定窓を開く／閉じるボタン
+fn open_lane_config_button(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
+    let lanes = state.editor.lanes(track);
+    let has_control = state.editor.tracks[track].normal_lanes() < lanes;
+    let label = egui::RichText::new("CC").size(10.0).color(if has_control {
+        palette::GREEN
+    } else {
+        palette::FG_DIM
+    });
+    let response = ui.add(egui::Button::new(label).small());
+    if response.clicked() {
+        state.lane_config_track = (state.lane_config_track != Some(track)).then_some(track);
+    }
+    response.on_hover_text("段の設定 (CC の番号など) を開く");
+}
+
+/// 通常 (音符) 段の追加・削除
+fn normal_lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize, label: bool) {
     let normal = state.editor.tracks[track].normal_lanes();
 
-    // ---- 通常段 ----
-    if !compact {
+    if label {
         ui.label(egui::RichText::new("段").size(10.0).color(palette::FG_DIM));
     }
     if ui
@@ -496,33 +571,10 @@ fn lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize, compac
         state.editor.remove_last_normal_lane(track);
     }
     response.on_hover_text(if removable {
-        "いちばん下の段を削除 (CC 段には触れません)"
+        "いちばん下の段を削除 (制御段には触れません)"
     } else {
         "その段にノートがある (または段が1つ) ので消せません"
     });
-
-    if !compact {
-        ui.separator();
-    }
-
-    // ---- CC 段 ----
-    let has_cc = normal < lanes;
-    let label = egui::RichText::new("CC").size(10.0).color(if has_cc {
-        palette::GREEN
-    } else {
-        palette::FG_DIM
-    });
-    let response = ui.add(egui::Button::new(label).small());
-    if response.clicked() {
-        state.lane_config_track = (state.lane_config_track != Some(track)).then_some(track);
-    }
-    response.on_hover_text("CC 段の番号の一覧を開く");
-
-    // 狭いときは CC の増減を行に出さない。**押せるが見切れる**より、
-    // 一覧 (上の「CC」ボタン) にまとめたほうが扱える。一覧側にも同じ操作がある。
-    if !compact {
-        cc_lane_buttons(ui, state, track);
-    }
 }
 
 /// 制御段 (CC・ヴェロシティ) の追加・削除。
@@ -556,6 +608,32 @@ fn cc_lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
         "このトラックにはすでにヴェロシティ段があります"
     } else {
         "ヴェロシティ段を最下段に追加 (クレシェンド・デクレシェンド用)"
+    });
+
+    // **ヴェロシティ段だけを名指しで外す。**
+    //
+    // 下の「−」は最下段しか外せないので、CC 段を後から足すと
+    // ヴェロシティ段が下でなくなり、先に CC 段を消すしかなくなる。
+    let velocity_lane = state.editor.tracks[track].velocity_lane();
+    let velocity_removable = velocity_lane.is_some_and(|lane| {
+        !state
+            .editor
+            .notes
+            .iter()
+            .any(|note| note.track == track && note.lane == lane)
+    });
+    let response = ui.add_enabled(velocity_removable, egui::Button::new("−V").small());
+    if response.clicked() {
+        state.history.record(EditGroup::Once);
+        state.editor.remove_velocity_lane(track);
+        state.dirty = true;
+    }
+    response.on_hover_text(if velocity_removable {
+        "ヴェロシティ段を削除 (最下段でなくても外せます)"
+    } else if has_velocity {
+        "その段にブロックがあるので消せません"
+    } else {
+        "ヴェロシティ段がありません"
     });
 
     let removable = has_control

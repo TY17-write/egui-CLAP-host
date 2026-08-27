@@ -26,6 +26,12 @@ const TRACK_SENDS_W: f32 = 74.0;
 const NODE_NAME_W: f32 = 150.0;
 const NODE_CHANNELS_W: f32 = 56.0;
 
+/// MIDI の割り当てを選ぶ一覧の高さ。
+///
+/// **打ち込みトラックは何本でも作れる**ので、全部並べると窓が画面の外まで
+/// 伸びる。ここで切ってスクロールさせる (8本ぶんくらいが見える高さ)。
+const MIDI_PICK_H: f32 = 160.0;
+
 /// M / S / B のような1文字の切り替えの文字。
 ///
 /// **入っているときだけ色を付ける。** 打ち込みトラック欄 (`editor_ui::gutter`)
@@ -427,22 +433,34 @@ impl App {
                     });
 
                     // **複数選べる。** ドラムをキックとハイハットで別の打ち込みに
-                    // 書き、音源1つで受ける、といった使い方のため
-                    ui.horizontal_wrapped(|ui| {
-                        for track in 0..midi_tracks {
-                            let selected = current.contains(track);
-                            // いっぱいのときは、外すほうだけ押せる
-                            let can_click = selected || !current.is_full();
-                            let button = ui.add_enabled(
-                                can_click,
-                                egui::SelectableLabel::new(selected, format!("{}", track + 1)),
-                            );
-                            let name = midi_names.get(track).map(String::as_str).unwrap_or("?");
-                            if button.on_hover_text(name).clicked() {
-                                midi_toggle = Some(track);
+                    // 書き、音源1つで受ける、といった使い方のため。
+                    //
+                    // **番号ではなく名前で選ぶ。** 番号だけだと、どれがどのパートか
+                    // 覚えていないと選べない。トラックが増えると縦に伸びるので、
+                    // 高さを決めてスクロールさせる (窓が画面外まで伸びないように)。
+                    egui::ScrollArea::vertical()
+                        .id_salt(("midi_pick", index))
+                        .max_height(MIDI_PICK_H)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for track in 0..midi_tracks {
+                                let selected = current.contains(track);
+                                // いっぱいのときは、外すほうだけ押せる
+                                let can_click = selected || !current.is_full();
+                                let name = midi_names.get(track).map(String::as_str).unwrap_or("?");
+                                // 番号も残す。名前を空にしても選べなくならないように
+                                let label = format!("{}  {name}", track + 1);
+                                if ui
+                                    .add_enabled(
+                                        can_click,
+                                        egui::SelectableLabel::new(selected, label),
+                                    )
+                                    .clicked()
+                                {
+                                    midi_toggle = Some(track);
+                                }
                             }
-                        }
-                    });
+                        });
                     if current.is_full() {
                         ui.weak(format!(
                             "受けられるのは {} 本までです",

@@ -483,6 +483,48 @@ impl MidiEditor {
         true
     }
 
+    /// ヴェロシティ段を外す。**最下段でなくても外せる。**
+    ///
+    /// [`remove_last_control_lane`](Self::remove_last_control_lane) は最下段しか
+    /// 外せないので、**CC 段と併用していてヴェロシティ段が下にないと外せなかった**
+    /// (先に CC 段を消すしかない)。トラックに1本しか無いものなので、位置を
+    /// 気にせず名指しで外せるようにする。
+    ///
+    /// ブロックが乗っているときは外さない (音符段の削除と同じ扱い)。
+    pub fn remove_velocity_lane(&mut self, track: usize) -> bool {
+        let Some(info) = self.tracks.get(track) else {
+            return false;
+        };
+        let Some(lane) = info.velocity_lane() else {
+            return false;
+        };
+        if self
+            .notes
+            .iter()
+            .any(|note| note.track == track && note.lane == lane)
+        {
+            return false;
+        }
+
+        let info = &mut self.tracks[track];
+        info.lanes -= 1;
+        if lane < info.lane_kinds.len() {
+            info.lane_kinds.remove(lane);
+        }
+        // 末尾が音符段だけになったら詰める (`set_lane_kind` と同じ後始末)
+        while info.lane_kinds.last().is_some_and(|kind| kind.is_note()) {
+            info.lane_kinds.pop();
+        }
+
+        // 外した位置より下の段は繰り上がる
+        for note in &mut self.notes {
+            if note.track == track && note.lane > lane {
+                note.lane -= 1;
+            }
+        }
+        true
+    }
+
     /// 2つの段の中身を入れ替える。入れ替えたら true。
     ///
     /// **同じ種別どうしでしか入れ替えない。** 音符段と制御段を入れ替えると、
@@ -1829,6 +1871,40 @@ mod tests {
         let mut editor = MidiEditor::default();
         assert!(editor.add_velocity_lane(0));
         assert!(!editor.add_velocity_lane(0), "2本目は作らない");
+        assert_eq!(editor.tracks[0].velocity_lane(), Some(1));
+    }
+
+    /// **ヴェロシティ段が最下段でなくても外せること。**
+    ///
+    /// CC 段を後から足すとヴェロシティ段が下でなくなる。最下段しか外せない
+    /// ままだと、**先に CC 段を消すしか手が無かった**。
+    #[test]
+    fn a_velocity_lane_can_be_removed_from_under_a_cc_lane() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        assert!(editor.add_velocity_lane(0)); // 段1
+        editor.add_cc_lane(0, 64); // 段2 (ヴェロシティ段より下)
+
+        // CC 段にブロックを置いておく (巻き込まれたら分かるように)
+        editor.notes = vec![Note {
+            lane: 2,
+            ..note(0.0, 1.0, 0, 4)
+        }];
+
+        assert!(editor.remove_velocity_lane(0), "下でなくても外せること");
+        assert_eq!(editor.lanes(0), 2);
+        assert_eq!(editor.tracks[0].velocity_lane(), None);
+        assert_eq!(editor.lane_cc(0, 1), Some(64), "CC 段が繰り上がること");
+        assert_eq!(editor.notes[0].lane, 1, "ブロックも一緒に繰り上がること");
+
+        assert!(!editor.remove_velocity_lane(0), "無ければ何もしない");
+    }
+
+    /// ヴェロシティ段にブロックが乗っていれば外さないこと (事故防止)
+    #[test]
+    fn a_velocity_lane_with_blocks_is_not_removed() {
+        let mut editor = with_velocity_lane(&[(0.0, 1.0, 40, 80)]);
+        assert!(!editor.remove_velocity_lane(0));
         assert_eq!(editor.tracks[0].velocity_lane(), Some(1));
     }
 

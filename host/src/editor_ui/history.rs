@@ -42,6 +42,8 @@ pub(super) enum EditGroup {
     Semitone,
     Octave,
     Velocity,
+    /// トラック名の入力。**1文字ごとに積まないため**にまとめる
+    TrackName,
 }
 
 /// 履歴の上限 (これを超えたら古いものから捨てる)

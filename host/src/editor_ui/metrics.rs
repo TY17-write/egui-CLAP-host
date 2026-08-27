@@ -26,8 +26,12 @@ pub(super) const ROW_ZOOM_STEP: f32 = 1.15;
 /// ルーラーの高さ
 pub(super) const RULER_H: f32 = 22.0;
 
-/// 左のトラック欄の幅
-pub(super) const GUTTER_W: f32 = 200.0;
+/// 左のトラック欄の幅。
+///
+/// **入れるものを数えて決めてある。** 名前の入力欄 + 切り替え4つ (M/S/W/V) +
+/// 印が1行に収まる幅。ここを削ると名前が「ト…」になって用をなさなくなり、
+/// 増やすとグリッドが狭くなる。項目を足すときは実際に見て確かめること。
+pub(super) const GUTTER_W: f32 = 230.0;
 
 /// 指定できるオクターブの範囲
 pub(super) const MIN_OCTAVE: i32 = -2;
