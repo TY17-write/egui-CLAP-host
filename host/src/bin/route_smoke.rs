@@ -239,6 +239,7 @@ fn hits(at: &[f32], semitone: i32, track: usize) -> impl Iterator<Item = Note> +
         semitone,
         octave: 4,
         velocity: 100,
+        velocity_to: 100,
         track,
         lane: 0,
     })

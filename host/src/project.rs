@@ -12,7 +12,7 @@
 //! **エディタに触る前に全部検証し、1つでも駄目なら何も変更しない**。
 //! 問題はまとめて列挙して返す (直すたびに読み直すのを避けるため)。
 
-use crate::sequencer::{MidiEditor, Note, ScaleMode, TrackInfo};
+use crate::sequencer::{LaneKind, MidiEditor, Note, ScaleMode, TrackInfo};
 use crate::swing;
 use crate::waltz;
 use base64::Engine;
@@ -23,8 +23,9 @@ use std::path::PathBuf;
 ///
 /// 1: シーケンスと設定のみ / 2: 音源 (`plugins`) を追加 /
 /// 3: 音源を**オーディオトラック** (`audio_tracks`) へ移した /
-/// 4: MIDI の割り当てを**複数持てる形** (`midi_tracks`) にした
-const VERSION: u32 = 4;
+/// 4: MIDI の割り当てを**複数持てる形** (`midi_tracks`) にした /
+/// 5: ヴェロシティを書く段 (`velocity_lanes` と、ノートの `velocity_to`) を追加
+const VERSION: u32 = 5;
 
 /// 音源の種別。
 ///
@@ -246,10 +247,17 @@ struct TrackEntry {
     swing: bool,
     #[serde(default)]
     waltz: bool,
-    /// 段ごとの CC 番号 (`None` は音符段)。CC 段が無ければ空。
+    /// 段ごとの CC 番号 (`None` は CC 段でない)。CC 段が無ければ空。
     /// これより前のバージョンのファイルには無いので `default` で空になる。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lane_ccs: Vec<Option<u8>>,
+    /// ヴェロシティを書く段の番号。**別項目にしてある**ので、
+    /// バージョン4 までのファイルは `lane_ccs` をそのまま読めばよい。
+    ///
+    /// トラックに1本までだが、手で書いたファイルのために配列で受ける
+    /// (読み込みでは先頭だけを採る)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    velocity_lanes: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -264,6 +272,10 @@ struct NoteEntry {
     octave: i32,
     #[serde(default)]
     velocity: u8,
+    /// ヴェロシティ段のブロックの終了値。
+    /// **音符段と CC 段では意味を持たない**ので、開始値と同じなら書かない
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    velocity_to: Option<u8>,
     #[serde(default)]
     track: usize,
     #[serde(default)]
@@ -328,7 +340,17 @@ pub fn to_string(
                 soloed: info.soloed,
                 swing: info.swing,
                 waltz: info.waltz,
-                lane_ccs: info.lane_ccs.clone(),
+                // 種別は2つの項目に分けて書く (古いビルドでも CC 段は読める)。
+                // 末尾の `None` は詰める (意味のない並びを残さない)
+                lane_ccs: {
+                    let mut ccs: Vec<Option<u8>> =
+                        info.lane_kinds.iter().map(|kind| kind.cc()).collect();
+                    while ccs.last().is_some_and(Option::is_none) {
+                        ccs.pop();
+                    }
+                    ccs
+                },
+                velocity_lanes: info.velocity_lane().into_iter().collect(),
             })
             .collect(),
         notes: editor
@@ -340,6 +362,8 @@ pub fn to_string(
                 semitone: note.semitone,
                 octave: note.octave,
                 velocity: note.velocity,
+                // 坂になっているブロックだけ書く。平らなら省く
+                velocity_to: (note.velocity_to != note.velocity).then_some(note.velocity_to),
                 track: note.track,
                 lane: note.lane,
             })
@@ -439,6 +463,35 @@ fn migrate_plugins(entries: Vec<Option<PluginEntry>>) -> (Vec<AudioTrackSnapshot
     }
 
     (tracks, overflow)
+}
+
+/// ファイルの2項目から段の種別を組み立てる。
+///
+/// **ヴェロシティ段が優先。** 手で両方に書いたファイルでも、1つの段が
+/// 2つの意味を持たないようにする。範囲外の CC 番号は音符段に落とす
+/// (壊れたファイルで段が丸ごと使えなくなるより、そのほうがまし)。
+///
+/// **トラックに1本まで**なので、`velocity_lanes` は先頭だけを採る。
+fn build_lane_kinds(lane_ccs: Vec<Option<u8>>, velocity_lanes: &[usize]) -> Vec<LaneKind> {
+    let mut kinds: Vec<LaneKind> = lane_ccs
+        .into_iter()
+        .map(|cc| match cc.filter(|number| *number <= 127) {
+            Some(number) => LaneKind::Cc(number),
+            None => LaneKind::Note,
+        })
+        .collect();
+
+    if let Some(lane) = velocity_lanes.first().copied() {
+        if kinds.len() <= lane {
+            kinds.resize(lane + 1, LaneKind::Note);
+        }
+        kinds[lane] = LaneKind::Velocity;
+    }
+
+    while kinds.last().is_some_and(|kind| kind.is_note()) {
+        kinds.pop();
+    }
+    kinds
 }
 
 /// 空のオーディオトラック [`AUDIO_TRACKS`] 本
@@ -617,6 +670,8 @@ fn build(project: Project) -> Loaded {
                 semitone: entry.semitone,
                 octave: entry.octave,
                 velocity: entry.velocity,
+                // 書かれていなければ平ら (バージョン4 以前はここが無い)
+                velocity_to: entry.velocity_to.unwrap_or(entry.velocity),
                 track: entry.track,
                 lane: entry.lane,
             })
@@ -637,12 +692,10 @@ fn build(project: Project) -> Loaded {
                 swing: entry.swing,
                 waltz: entry.waltz,
                 // 範囲外の CC 番号は音符段として読む (壊れたファイルで
-                // 段が丸ごと使えなくなるより、音符段に落ちるほうがまし)
-                lane_ccs: entry
-                    .lane_ccs
-                    .into_iter()
-                    .map(|cc| cc.filter(|number| *number <= 127))
-                    .collect(),
+                // 段が丸ごと使えなくなるより、音符段に落ちるほうがまし)。
+                // ヴェロシティ段は別項目から重ねる (**そちらを優先**。
+                // 手で両方に書いたファイルでも、段が2つの意味を持たない)
+                lane_kinds: build_lane_kinds(entry.lane_ccs, &entry.velocity_lanes),
             })
             .collect(),
         tempo: project.tempo,
@@ -698,6 +751,7 @@ mod tests {
                 semitone: 3,
                 octave: 4,
                 velocity: 100,
+                velocity_to: 100,
                 track: 0,
                 lane: 1,
             },
@@ -707,6 +761,7 @@ mod tests {
                 semitone: 12,
                 octave: 5,
                 velocity: 64,
+                velocity_to: 64,
                 track: 1,
                 lane: 0,
             },
@@ -810,6 +865,7 @@ mod tests {
             semitone: 0,
             octave: 4,
             velocity: 100,
+            velocity_to: 100,
             track: 0,
             lane: 0,
         }];
@@ -873,6 +929,47 @@ mod tests {
         let restored =
             from_str(&to_string(&MidiEditor::default(), &empty_audio_tracks()).unwrap()).unwrap();
         assert_eq!(restored.audio_tracks.len(), AUDIO_TRACKS);
+    }
+
+    /// **ヴェロシティ段と坂が往復すること。**
+    ///
+    /// 段の種別は `lane_ccs` と `velocity_lanes` の2項目に分かれて書かれるので、
+    /// 組み立て直しで取り違えないかをここで見る。
+    #[test]
+    fn a_velocity_lane_and_its_ramp_survive_a_round_trip() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        editor.add_cc_lane(0, 64); // 段1 は CC
+        assert!(editor.add_velocity_lane(0)); // 段2 がヴェロシティ
+        editor.notes = vec![Note {
+            start_tick: 0.0,
+            duration: 4.0,
+            semitone: 0,
+            octave: 4,
+            velocity: 40,
+            velocity_to: 120,
+            track: 0,
+            lane: 2,
+        }];
+
+        let restored = load(&save(&editor)).unwrap();
+        assert_eq!(restored.tracks[0].velocity_lane(), Some(2));
+        assert_eq!(restored.tracks[0].lane_cc(1), Some(64), "CC 段も残ること");
+        assert_eq!(restored.notes[0].velocity, 40);
+        assert_eq!(restored.notes[0].velocity_to, 120, "坂の終わりも残ること");
+    }
+
+    /// バージョン4 以前のファイルは、坂を持たない平らな音符として読めること
+    #[test]
+    fn version_four_notes_have_no_ramp() {
+        let text = "(version: 4, tempo: 120, beats: 4, beat_type: 4, \
+                    tracks: [ (name: \"A\", lanes: 1) ], \
+                    notes: [ (start: 0.0, duration: 1.0, velocity: 90) ])";
+
+        let editor = load(text).expect("読めること");
+        assert_eq!(editor.notes[0].velocity, 90);
+        assert_eq!(editor.notes[0].velocity_to, 90, "書かれていなければ平ら");
+        assert_eq!(editor.tracks[0].velocity_lane(), None);
     }
 
     /// **複数の打ち込みを割り当てたまま往復すること。**

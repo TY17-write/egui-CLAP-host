@@ -78,6 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         semitone: 0,
         octave: 4,
         velocity: 127,
+        velocity_to: 127,
         track: 0,
         lane: 0,
     }];
@@ -219,6 +220,7 @@ fn bypass_pass(entry: &PluginEntry, plugin_id: &str) -> Result<Vec<String>, Box<
         semitone: 0,
         octave: 4,
         velocity: 127,
+        velocity_to: 127,
         track: 0,
         lane: 0,
     }];

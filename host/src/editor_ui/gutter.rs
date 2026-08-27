@@ -3,6 +3,7 @@
 use super::history::EditGroup;
 use super::metrics::{GUTTER_W, ROW_H, RULER_H};
 use super::state::EditorState;
+use crate::sequencer::LaneKind;
 use crate::swing;
 use crate::theme::palette;
 use crate::waltz;
@@ -46,7 +47,7 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
     }
 
     let mut open = true;
-    egui::Window::new(format!("CC 段 — {}", state.editor.tracks[track].name))
+    egui::Window::new(format!("制御段 — {}", state.editor.tracks[track].name))
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
@@ -54,7 +55,7 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
             // 追加・削除はここにも置く。トラック欄が狭いときは行に出ないので、
             // ここが唯一の入口になる。
             ui.horizontal(|ui| {
-                ui.label("CC 段:");
+                ui.label("制御段:");
                 cc_lane_buttons(ui, state, track);
             });
             ui.separator();
@@ -62,19 +63,30 @@ pub(super) fn lane_config_window(ctx: &egui::Context, state: &mut EditorState) {
             let lanes = state.editor.lanes(track);
             let first_cc = state.editor.tracks[track].normal_lanes();
             if first_cc >= lanes {
-                ui.label("このトラックに CC 段はありません。");
-                ui.weak("上の「+」で最下段に追加できます。");
+                ui.label("このトラックに制御段はありません。");
+                ui.weak("上の「+」で CC 段、「+V」でヴェロシティ段を追加できます。");
                 return;
             }
 
-            ui.label("置いたブロックの長さだけ CC が効きます。");
-            ui.weak("値はベロシティをそのまま使います。書いていない区間は 0 です。");
+            ui.label("置いたブロックの長さだけ効きます。");
+            ui.weak("CC 段の値はベロシティをそのまま使います。書いていない区間は 0 です。");
             ui.separator();
 
             for lane in first_cc..lanes {
-                let current = state.editor.lane_cc(track, lane);
+                let kind = state.editor.lane_kind(track, lane);
+                let current = kind.cc();
                 ui.horizontal(|ui| {
                     ui.label(format!("段 {}", lane + 1));
+
+                    if kind == LaneKind::Velocity {
+                        ui.colored_label(palette::PURPLE, "ヴェロシティ");
+                        ui.weak("このトラックの全ての音符段に効きます")
+                            .on_hover_text(
+                                "ブロックは開始値から終了値へ変化します。\
+                                 区間にかかった音符は、その音符が始まる位置の値になります。\
+                                 ブロックの外は音符自身の値のままです。",
+                            );
+                    }
 
                     if let Some(number) = current {
                         let mut number = number;
@@ -503,10 +515,11 @@ fn lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize, compac
     }
 }
 
-/// CC 段の追加・削除。トラック欄の2段目と、CC 段の一覧の両方から使う。
+/// 制御段 (CC・ヴェロシティ) の追加・削除。
+/// トラック欄の2段目と、一覧の両方から使う。
 fn cc_lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
     let lanes = state.editor.lanes(track);
-    let has_cc = state.editor.tracks[track].normal_lanes() < lanes;
+    let has_control = state.editor.tracks[track].normal_lanes() < lanes;
 
     if ui
         .small_button("+")
@@ -520,7 +533,22 @@ fn cc_lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
         state.dirty = true;
     }
 
-    let removable = has_cc
+    // **トラックに1本まで。** すでにあれば押せない
+    let has_velocity = state.editor.tracks[track].velocity_lane().is_some();
+    let response = ui.add_enabled(!has_velocity, egui::Button::new("+V").small());
+    if response.clicked() {
+        state.history.record(EditGroup::Once);
+        state.editor.add_velocity_lane(track);
+        state.lane_config_track = Some(track);
+        state.dirty = true;
+    }
+    response.on_hover_text(if has_velocity {
+        "このトラックにはすでにヴェロシティ段があります"
+    } else {
+        "ヴェロシティ段を最下段に追加 (クレシェンド・デクレシェンド用)"
+    });
+
+    let removable = has_control
         && !state
             .editor
             .notes
@@ -529,14 +557,14 @@ fn cc_lane_buttons(ui: &mut egui::Ui, state: &mut EditorState, track: usize) {
     let response = ui.add_enabled(removable, egui::Button::new("−").small());
     if response.clicked() {
         state.history.record(EditGroup::Once);
-        state.editor.remove_last_cc_lane(track);
+        state.editor.remove_last_control_lane(track);
         state.dirty = true;
     }
     response.on_hover_text(if removable {
-        "いちばん下の CC 段を削除"
-    } else if has_cc {
-        "その CC 段にブロックがあるので消せません"
+        "いちばん下の制御段を削除"
+    } else if has_control {
+        "その段にブロックがあるので消せません"
     } else {
-        "CC 段がありません"
+        "制御段がありません"
     });
 }

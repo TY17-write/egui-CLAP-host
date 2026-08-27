@@ -418,6 +418,7 @@ mod tests {
             semitone,
             octave,
             velocity: 100,
+            velocity_to: 100,
             track: 0,
             lane,
         }

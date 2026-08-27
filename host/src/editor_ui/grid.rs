@@ -8,13 +8,13 @@ use super::color::note_fill;
 use super::geometry::{
     edge_scroll_delta, hit_note, horizontal_offset_for_anchor, is_inside_lanes, move_delta,
     note_rect, note_row, resize_delta, row_to_track_lane, seek_target, to_content_pos,
-    to_screen_pos, track_row_offsets, velocity_fill_rect, Hit,
+    to_screen_pos, track_row_offsets, velocity_fill_rect, velocity_ramp_points, Hit,
 };
 use super::history::EditGroup;
 use super::metrics::{PPQ_ZOOM_PER_PIXEL, ROW_ZOOM_STEP, RULER_H};
 use super::state::{DragKind, DragState, EditorState, MiddleDrag, NoteDefaults};
 use super::EditorCommand;
-use crate::sequencer::Note;
+use crate::sequencer::{LaneKind, Note};
 use crate::theme::palette;
 use eframe::egui::{
     self, vec2, Align2, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke,
@@ -147,19 +147,22 @@ pub(super) fn grid(
         }
     }
 
-    // ---- CC 段の地色 ----
+    // ---- 制御段の地色 ----
     // 音符段と見分けが付かないと、音高のつもりで置いた音が CC になってしまう。
     // トラックの地色より上に敷いて、どちらのトラックでも同じ色に見えるようにする。
+    // **CC とヴェロシティも色で分ける** (ブロックの値の意味が違うため)。
     for (track, offset) in row_offsets.iter().enumerate() {
         for lane in 0..state.editor.lanes(track) {
-            if state.editor.lane_cc(track, lane).is_none() {
-                continue;
-            }
+            let tint = match state.editor.lane_kind(track, lane) {
+                LaneKind::Note => continue,
+                LaneKind::Cc(_) => palette::GREEN,
+                LaneKind::Velocity => palette::PURPLE,
+            };
             let top = origin.y + RULER_H + (*offset + lane) as f32 * row_h;
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(origin.x, top), vec2(size.x, row_h)),
                 CornerRadius::ZERO,
-                palette::GREEN.gamma_multiply(0.14),
+                tint.gamma_multiply(0.14),
             );
         }
     }
@@ -239,9 +242,11 @@ pub(super) fn grid(
         let rect = note_rect(origin, note_row(&row_offsets, note), note, ppq, row_h);
         // CC ブロックは音高で色を変えても意味が無い。音符と取り違えないよう、
         // 段の地色と同じ緑で塗り分ける (ベロシティの塗り高さはそのまま使える)。
-        let fill = match state.editor.lane_cc(note.track, note.lane) {
-            Some(_) => palette::GREEN,
-            None => note_fill(note, state.editor.scale),
+        let kind = state.editor.lane_kind(note.track, note.lane);
+        let fill = match kind {
+            LaneKind::Cc(_) => palette::GREEN,
+            LaneKind::Velocity => palette::PURPLE,
+            LaneKind::Note => note_fill(note, state.editor.scale),
         };
         // ベロシティは「下からの塗りの高さ」で表す。明度やアルファを直接下げると
         // ダークな背景で弱いノートが見えなくなるため、色相はそのままに
@@ -251,22 +256,33 @@ pub(super) fn grid(
             CornerRadius::same(4),
             fill.gamma_multiply(VELOCITY_GHOST_ALPHA),
         );
-        let level = velocity_fill_rect(rect, note.velocity);
-        painter.rect_filled(
-            level,
-            if level.height() >= rect.height() - 0.5 {
-                CornerRadius::same(4)
-            } else {
-                // 上辺はゴーストとの境目なので角を丸めない
-                CornerRadius {
-                    nw: 0,
-                    ne: 0,
-                    sw: 4,
-                    se: 4,
-                }
-            },
-            fill,
-        );
+        // 文字を抜き色にするかの判定に使う (文字は左端から書くので、左端の高さで見る)
+        let filled_top;
+        if kind == LaneKind::Velocity {
+            // **坂は形で見せる。** クレシェンドかデクレシェンドかを、
+            // 数字を読まずに分かるようにする
+            let points = velocity_ramp_points(rect, note.velocity, note.velocity_to);
+            filled_top = points[0].y;
+            painter.add(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
+        } else {
+            let level = velocity_fill_rect(rect, note.velocity);
+            filled_top = level.top();
+            painter.rect_filled(
+                level,
+                if level.height() >= rect.height() - 0.5 {
+                    CornerRadius::same(4)
+                } else {
+                    // 上辺はゴーストとの境目なので角を丸めない
+                    CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: 4,
+                        se: 4,
+                    }
+                },
+                fill,
+            );
+        }
 
         if state.is_selected(idx) {
             painter.rect_stroke(
@@ -281,15 +297,22 @@ pub(super) fn grid(
         if rect.width() > 26.0 && rect.height() >= NOTE_LABEL_SIZE + 2.0 {
             // 文字の位置まで実塗りが来ていれば背景色で抜き、
             // ゴーストの上に載るときは前景色にして読めるようにする
-            let color = if level.top() <= rect.center().y {
+            let color = if filled_top <= rect.center().y {
                 palette::BG
             } else {
                 palette::FG
             };
-            // CC 段では音名に意味が無いので、送る値のほうを出す
-            let label = match state.editor.lane_cc(note.track, note.lane) {
-                Some(number) => format!("CC{number}={}", note.velocity.min(127)),
-                None => note.name(),
+            // 制御段では音名に意味が無いので、効く値のほうを出す
+            let label = match kind {
+                LaneKind::Cc(number) => format!("CC{number}={}", note.velocity.min(127)),
+                // 平らなら1つ、坂なら矢印で向きが分かる形に
+                LaneKind::Velocity if note.velocity == note.velocity_to => {
+                    format!("V {}", note.velocity.min(127))
+                }
+                LaneKind::Velocity => {
+                    format!("V {}→{}", note.velocity.min(127), note.velocity_to.min(127))
+                }
+                LaneKind::Note => note.name(),
             };
             painter.text(
                 rect.left_center() + vec2(4.0, 0.0),
@@ -682,6 +705,8 @@ pub(super) fn grid(
                     semitone: defaults.semitone,
                     octave: defaults.octave,
                     velocity: defaults.velocity,
+                    // 置いた直後は平ら。坂はツールバーで付ける
+                    velocity_to: defaults.velocity,
                     track,
                     lane,
                 });

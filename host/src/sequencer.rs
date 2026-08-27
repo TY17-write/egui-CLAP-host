@@ -83,8 +83,17 @@ pub struct Note {
     pub semitone: i32,
     /// オクターブ -2..=8 (基準4)
     pub octave: i32,
-    /// ベロシティ 0..=127
+    /// ベロシティ 0..=127。
+    ///
+    /// **制御段では別の意味になる。** CC 段では送る値、ヴェロシティ段では
+    /// 坂の**開始値** ([`LaneKind`])。
     pub velocity: u8,
+    /// ヴェロシティ段のブロックの**終了値**。
+    ///
+    /// **ヴェロシティ段でしか意味を持たない。** 音符段と CC 段では読まれない。
+    /// [`velocity`](Self::velocity) と同じなら平ら、違えばクレシェンド
+    /// (またはデクレシェンド) になる。
+    pub velocity_to: u8,
     /// 所属するトラック (0 始まり)。トラックごとに音源を持つ。
     pub track: usize,
     /// トラック内の段 (0 始まり)。音高とは独立で、どの段に置くかだけを表す。
@@ -94,6 +103,21 @@ pub struct Note {
 impl Note {
     pub fn end_tick(&self) -> f32 {
         self.start_tick + self.duration
+    }
+
+    /// ヴェロシティ段のブロックとして、`tick` の位置の値を読む。
+    ///
+    /// **区間の外は端の値で止める。** 区間にかかった音符しか参照しないので
+    /// 普段は効かないが、丸めで端をわずかに外れたときに跳ねないようにする。
+    /// 音価が0以下のブロックは坂にならないので開始値を返す。
+    fn velocity_at(&self, tick: f32) -> u8 {
+        if self.duration <= 0.0 {
+            return self.velocity;
+        }
+        let ratio = ((tick - self.start_tick) / self.duration).clamp(0.0, 1.0);
+        let from = self.velocity as f32;
+        let to = self.velocity_to as f32;
+        (from + (to - from) * ratio).round().clamp(0.0, 127.0) as u8
     }
 
     /// MIDI ノート番号。0..=127 の範囲外なら None。
@@ -121,6 +145,43 @@ impl Note {
 /// 必要な分だけ [+] で足していく運用にしている。
 pub const DEFAULT_LANES: usize = 1;
 
+/// 段の種別。
+///
+/// **音符段が上、それ以外 (制御段) が下**という並びで揃えてある
+/// ([`TrackInfo::normal_lanes`])。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaneKind {
+    /// 音符を置く段
+    #[default]
+    Note,
+    /// CC を書く段 (番号ごと)。ブロックの値は「書いた区間だけ効く」
+    Cc(u8),
+    /// ヴェロシティを書く段。
+    ///
+    /// **1つのブロックが坂を持つ** (開始値 → 終了値)。区間にかかった音符は、
+    /// **その音符が始まる位置**で坂を読んだ値になる。クレシェンドとデクレシェンドの
+    /// ためのもので、ブロック1つで書けるようにしてある。
+    ///
+    /// **トラックの全ての音符段に効く。** 段ごとではなくトラック単位の抑揚なので、
+    /// 段を分けて書いたパートにも同じ坂が乗る。
+    Velocity,
+}
+
+impl LaneKind {
+    /// 音符を置く段か (制御段でないか)
+    pub fn is_note(self) -> bool {
+        matches!(self, LaneKind::Note)
+    }
+
+    /// 割り当てられた CC 番号 (CC 段でなければ `None`)
+    pub fn cc(self) -> Option<u8> {
+        match self {
+            LaneKind::Cc(number) => Some(number),
+            _ => None,
+        }
+    }
+}
+
 /// トラック1本ぶんの情報。音源 (プラグイン) はホスト側が別に持つ。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrackInfo {
@@ -138,12 +199,14 @@ pub struct TrackInfo {
     /// 不均等な拍 (ウィンナ・ワルツ風) を掛けるか。
     /// スウィングと**併用できる** (適用順は `performed_notes` を参照)。
     pub waltz: bool,
-    /// 段ごとの CC 番号。`None` の段は通常の音符段。
+    /// 段ごとの種別。並びは段の並びと同じ。
     ///
     /// **`lanes` より短くてよい。** 足りない分は音符段として扱うので、段を増やした
     /// ときに長さを合わせ忘れても壊れない (`lanes` と二重に管理しないための作り)。
-    /// 読み書きは [`lane_cc`](Self::lane_cc) / [`set_lane_cc`](Self::set_lane_cc) を使う。
-    pub lane_ccs: Vec<Option<u8>>,
+    /// 読み書きは [`lane_kind`](Self::lane_kind) / [`set_lane_kind`](Self::set_lane_kind)。
+    ///
+    /// **段の挿入・削除と一緒にずれる**ので、段番号を別に覚えるより間違いが起きにくい。
+    pub lane_kinds: Vec<LaneKind>,
 }
 
 impl TrackInfo {
@@ -155,43 +218,60 @@ impl TrackInfo {
             soloed: false,
             swing: false,
             waltz: false,
-            lane_ccs: Vec::new(),
+            lane_kinds: Vec::new(),
         }
     }
 
-    /// この段に割り当てられた CC 番号。`None` なら音符段。
-    pub fn lane_cc(&self, lane: usize) -> Option<u8> {
-        self.lane_ccs.get(lane).copied().flatten()
+    /// この段の種別 (書かれていなければ音符段)
+    pub fn lane_kind(&self, lane: usize) -> LaneKind {
+        self.lane_kinds.get(lane).copied().unwrap_or_default()
     }
 
-    /// 通常 (音符) 段の数。**CC 段はこれより下に並ぶ。**
+    /// この段に割り当てられた CC 番号。`None` なら CC 段ではない。
+    pub fn lane_cc(&self, lane: usize) -> Option<u8> {
+        self.lane_kind(lane).cc()
+    }
+
+    /// ヴェロシティを書く段 (無ければ `None`)。
     ///
-    /// 段の並びは「通常段が上、CC 段が下」で揃えてある。境目がここなので、
+    /// **トラックに1本まで**という決まりはここで担保している (先に見つけたほうを使う)。
+    pub fn velocity_lane(&self) -> Option<usize> {
+        (0..self.lanes).find(|lane| self.lane_kind(*lane) == LaneKind::Velocity)
+    }
+
+    /// 通常 (音符) 段の数。**制御段はこれより下に並ぶ。**
+    ///
+    /// 段の並びは「通常段が上、制御段が下」で揃えてある。境目がここなので、
     /// 通常段を足すときの挿し込み位置にも、ノートを動かせる範囲の判定にも使う。
     pub fn normal_lanes(&self) -> usize {
-        let cc_count = self
-            .lane_ccs
+        let control = self
+            .lane_kinds
             .iter()
             .take(self.lanes)
-            .filter(|cc| cc.is_some())
+            .filter(|kind| !kind.is_note())
             .count();
-        self.lanes.saturating_sub(cc_count)
+        self.lanes.saturating_sub(control)
     }
 
-    /// 段を CC 段にする (`None` で音符段に戻す)。
+    /// 段の種別を決める。
     ///
-    /// 末尾が `None` だけになったら詰めておく。保存したときに意味のない
-    /// `None` が並ばないようにするため。
+    /// 末尾が音符段だけになったら詰めておく。保存したときに意味のない
+    /// 既定値が並ばないようにするため。
+    pub fn set_lane_kind(&mut self, lane: usize, kind: LaneKind) {
+        if !kind.is_note() && self.lane_kinds.len() <= lane {
+            self.lane_kinds.resize(lane + 1, LaneKind::Note);
+        }
+        if let Some(slot) = self.lane_kinds.get_mut(lane) {
+            *slot = kind;
+        }
+        while self.lane_kinds.last().is_some_and(|kind| kind.is_note()) {
+            self.lane_kinds.pop();
+        }
+    }
+
+    /// 段を CC 段にする (`None` で音符段に戻す)
     pub fn set_lane_cc(&mut self, lane: usize, cc: Option<u8>) {
-        if cc.is_some() && self.lane_ccs.len() <= lane {
-            self.lane_ccs.resize(lane + 1, None);
-        }
-        if let Some(slot) = self.lane_ccs.get_mut(lane) {
-            *slot = cc;
-        }
-        while self.lane_ccs.last().is_some_and(Option::is_none) {
-            self.lane_ccs.pop();
-        }
+        self.set_lane_kind(lane, cc.map_or(LaneKind::Note, LaneKind::Cc));
     }
 }
 
@@ -300,7 +380,8 @@ impl MidiEditor {
         };
         let at = info.normal_lanes();
         info.lanes += 1;
-        info.lane_ccs.insert(at.min(info.lane_ccs.len()), None);
+        info.lane_kinds
+            .insert(at.min(info.lane_kinds.len()), LaneKind::Note);
         for note in &mut self.notes {
             if note.track == track && note.lane >= at {
                 note.lane += 1;
@@ -311,12 +392,32 @@ impl MidiEditor {
 
     /// CC 段を末尾に追加する (トラック内でいちばん下)
     pub fn add_cc_lane(&mut self, track: usize, cc: u8) -> bool {
+        self.add_control_lane(track, LaneKind::Cc(cc))
+    }
+
+    /// ヴェロシティ段を末尾に追加する。
+    ///
+    /// **トラックに1本まで。** すでに持っていれば何もしない (`false`)。
+    /// トラック全体に効くものなので、2本あるとどちらが効くのか決められない。
+    pub fn add_velocity_lane(&mut self, track: usize) -> bool {
+        if self
+            .tracks
+            .get(track)
+            .is_some_and(|info| info.velocity_lane().is_some())
+        {
+            return false;
+        }
+        self.add_control_lane(track, LaneKind::Velocity)
+    }
+
+    /// 制御段を末尾に追加する (トラック内でいちばん下)
+    fn add_control_lane(&mut self, track: usize, kind: LaneKind) -> bool {
         let Some(info) = self.tracks.get_mut(track) else {
             return false;
         };
         let at = info.lanes;
         info.lanes += 1;
-        info.set_lane_cc(at, Some(cc));
+        info.set_lane_kind(at, kind);
         true
     }
 
@@ -346,8 +447,8 @@ impl MidiEditor {
 
         let info = &mut self.tracks[track];
         info.lanes -= 1;
-        if last < info.lane_ccs.len() {
-            info.lane_ccs.remove(last);
+        if last < info.lane_kinds.len() {
+            info.lane_kinds.remove(last);
         }
         for note in &mut self.notes {
             if note.track == track && note.lane > last {
@@ -357,14 +458,14 @@ impl MidiEditor {
         true
     }
 
-    /// CC 段のいちばん下 (= トラックの最下段) を削除する。
-    /// CC 段が無いとき、その段にブロックがあるときは削除しない。
-    pub fn remove_last_cc_lane(&mut self, track: usize) -> bool {
+    /// 制御段 (CC・ヴェロシティ) のいちばん下 = トラックの最下段を削除する。
+    /// 制御段が無いとき、その段にブロックがあるときは削除しない。
+    pub fn remove_last_control_lane(&mut self, track: usize) -> bool {
         let Some(info) = self.tracks.get(track) else {
             return false;
         };
         if info.normal_lanes() >= info.lanes {
-            return false; // CC 段が無い
+            return false; // 制御段が無い
         }
         let last = info.lanes - 1;
         if self
@@ -377,16 +478,17 @@ impl MidiEditor {
 
         let info = &mut self.tracks[track];
         info.lanes -= 1;
-        info.set_lane_cc(last, None);
-        info.lane_ccs.truncate(info.lanes);
+        info.set_lane_kind(last, LaneKind::Note);
+        info.lane_kinds.truncate(info.lanes);
         true
     }
 
     /// 2つの段の中身を入れ替える。入れ替えたら true。
     ///
-    /// **同じ種別どうしでしか入れ替えない。** 音符段と CC 段を入れ替えると、
+    /// **同じ種別どうしでしか入れ替えない。** 音符段と制御段を入れ替えると、
     /// 音符が CC として送られたり、その逆が起きたりする。どちらも見た目では
-    /// 気付きにくいので、そもそも行わない。
+    /// 気付きにくいので、そもそも行わない。CC 段とヴェロシティ段の間も同じ
+    /// (ブロックの値の意味が変わってしまう)。
     ///
     /// CC 段どうしのときは**番号も一緒に動かす**。段ごと入れ替える操作なので、
     /// ブロックが書かれた当時の CC のまま付いていくほうが筋が通る。
@@ -399,9 +501,10 @@ impl MidiEditor {
         if a_lane >= self.lanes(a_track) || b_lane >= self.lanes(b_track) {
             return false;
         }
-        let a_cc = self.lane_cc(a_track, a_lane);
-        let b_cc = self.lane_cc(b_track, b_lane);
-        if a_cc.is_some() != b_cc.is_some() {
+        let a_kind = self.lane_kind(a_track, a_lane);
+        let b_kind = self.lane_kind(b_track, b_lane);
+        // CC どうしは番号が違っても入れ替えてよいので、種別の枠だけで見る
+        if std::mem::discriminant(&a_kind) != std::mem::discriminant(&b_kind) {
             return false;
         }
 
@@ -415,9 +518,9 @@ impl MidiEditor {
             }
         }
 
-        if a_cc.is_some() {
-            self.tracks[a_track].set_lane_cc(a_lane, b_cc);
-            self.tracks[b_track].set_lane_cc(b_lane, a_cc);
+        if !a_kind.is_note() {
+            self.tracks[a_track].set_lane_kind(a_lane, b_kind);
+            self.tracks[b_track].set_lane_kind(b_lane, a_kind);
         }
         true
     }
@@ -513,6 +616,9 @@ impl MidiEditor {
         self.notes
             .iter()
             .map(|note| {
+                // **ヴェロシティ段はここでは乗せない。**
+                // 記譜そのものに書き込んである ([`apply_velocity_lanes`])。
+                // ここでも乗せると規則が二重になり、片方だけ直したときに食い違う
                 let swinging = self.track_swings(note.track);
                 let waltzing = self.track_waltzes(note.track);
                 // 音価0以下のノートは各出力が弾く。ここで下限を掛けてしまうと
@@ -547,6 +653,81 @@ impl MidiEditor {
             .collect()
     }
 
+    /// ヴェロシティ段がその音符に与える値。段が無い・区間の外なら `None`。
+    ///
+    /// **これが規則の本体。** 記譜へ書き込む [`apply_velocity_lanes`](Self::apply_velocity_lanes)
+    /// もここを通すので、判定が二重にならない。
+    ///
+    /// **音符段のノートだけが対象。** 制御段のブロック (CC・ヴェロシティ) は
+    /// 音として鳴らないので触らない。
+    fn lane_velocity_for(&self, note: &Note) -> Option<u8> {
+        let info = self.tracks.get(note.track)?;
+        if !info.lane_kind(note.lane).is_note() {
+            return None;
+        }
+        let lane = info.velocity_lane()?;
+
+        // その位置を含むブロックを探す。**開始位置で読む** (音の出だしの強さ)
+        let at = note.start_tick;
+        self.notes
+            .iter()
+            .find(|block| {
+                block.track == note.track
+                    && block.lane == lane
+                    && block.duration > 0.0
+                    && at >= block.start_tick
+                    && at < block.end_tick()
+            })
+            .map(|block| block.velocity_at(at))
+    }
+
+    /// ヴェロシティ段の坂を**記譜そのものへ書き込む**。変わったら `true`。
+    ///
+    /// **画面に出る値と鳴る値を1つにするため。** 記譜を据え置いて再生時にだけ
+    /// 乗せる形にすると、塗りの高さ (記譜) と実際の強さ (坂) が食い違い、
+    /// 2つを見比べながら書くことになる。
+    ///
+    /// **何度呼んでも結果は変わらない** (坂は位置から決まる)。編集のたびに
+    /// 呼べばよく、呼び忘れても次のフレームで揃う。
+    ///
+    /// **区間にかかっていない音符は書いた値のまま。** 段を足しただけで
+    /// トラック全体の強さが変わってしまうと、後から抑揚を付けにくい。
+    pub fn apply_velocity_lanes(&mut self) -> bool {
+        if !self
+            .tracks
+            .iter()
+            .any(|info| info.velocity_lane().is_some())
+        {
+            return false;
+        }
+
+        // 借用を分けるため、先に「どれをいくつにするか」を集める
+        let updates: Vec<(usize, u8)> = self
+            .notes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, note)| {
+                let velocity = self.lane_velocity_for(note)?;
+                (velocity != note.velocity).then_some((index, velocity))
+            })
+            .collect();
+
+        for (index, velocity) in &updates {
+            self.notes[*index].velocity = *velocity;
+        }
+        !updates.is_empty()
+    }
+
+    /// その音符の強さがヴェロシティ段に決められているか。
+    ///
+    /// 縛られている間は手で変えても書き戻されるので、画面側はそれを出す。
+    pub fn is_bound_by_velocity_lane(&self, index: usize) -> bool {
+        self.notes
+            .get(index)
+            .and_then(|note| self.lane_velocity_for(note))
+            .is_some()
+    }
+
     /// ノート列をサンプル時刻付きイベント列に変換する。
     /// 同時刻ではノートオフがノートオンより先に来るようソートされる。
     pub fn to_events(&self, sample_rate: f64) -> Vec<SeqEvent> {
@@ -573,6 +754,12 @@ impl MidiEditor {
             }
             let start = (note.start_tick.max(0.0) as f64 * spq) as u64;
             let end = (note.end_tick().max(0.0) as f64 * spq) as u64;
+
+            // **ヴェロシティ段のブロックは鳴らさない。** 抑揚の指示であって
+            // 音ではないので、`performed_notes` で音符へ乗せたら役目は終わり
+            if self.lane_kind(note.track, note.lane) == LaneKind::Velocity {
+                continue;
+            }
 
             // CC 段のブロックは、頭で値・尻で解除値。
             // 隣のブロックが同じ位置から始まるときの解除の抑制は下でまとめて行う。
@@ -616,9 +803,16 @@ impl MidiEditor {
         events
     }
 
-    /// その段に割り当てられた CC 番号 (音符段なら `None`)
+    /// その段に割り当てられた CC 番号 (CC 段でなければ `None`)
     pub fn lane_cc(&self, track: usize, lane: usize) -> Option<u8> {
         self.tracks.get(track)?.lane_cc(lane)
+    }
+
+    /// その段の種別 (トラックが無ければ音符段として扱う)
+    pub fn lane_kind(&self, track: usize, lane: usize) -> LaneKind {
+        self.tracks
+            .get(track)
+            .map_or(LaneKind::Note, |info| info.lane_kind(lane))
     }
 }
 
@@ -714,6 +908,7 @@ mod tests {
             semitone,
             octave,
             velocity: 100,
+            velocity_to: 100,
             track: 0,
             lane: 0,
         }
@@ -1494,6 +1689,166 @@ mod tests {
         assert_eq!(editor.lane_cc(0, 1), Some(64), "段の種別も変わらないこと");
     }
 
+    /// ヴェロシティ段を1本持つトラックを作る。段0 が音符段、段1 がヴェロシティ段
+    fn with_velocity_lane(blocks: &[(f32, f32, u8, u8)]) -> MidiEditor {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        assert!(editor.add_velocity_lane(0));
+        editor.notes = blocks
+            .iter()
+            .map(|(start, duration, from, to)| Note {
+                start_tick: *start,
+                duration: *duration,
+                velocity: *from,
+                velocity_to: *to,
+                lane: 1,
+                ..note(0.0, 1.0, 0, 4)
+            })
+            .collect();
+        editor
+    }
+
+    /// 音符段 (段0) のヴェロシティを並べて返す
+    fn note_lane_velocities(editor: &MidiEditor) -> Vec<u8> {
+        editor
+            .notes
+            .iter()
+            .filter(|note| note.lane == 0)
+            .map(|note| note.velocity)
+            .collect()
+    }
+
+    /// **坂が音符の開始位置で読まれ、記譜そのものに書き込まれること。**
+    ///
+    /// クレシェンドの本体。1つのブロックの中で、置いた位置に応じた強さになる。
+    /// **書き込む**ので、画面の塗りの高さがそのまま鳴る強さになる。
+    #[test]
+    fn a_velocity_ramp_is_written_into_the_notes() {
+        // 0拍から4拍かけて 40 → 120
+        let mut editor = with_velocity_lane(&[(0.0, 4.0, 40, 120)]);
+        for start in [0.0, 1.0, 2.0, 3.0] {
+            editor.notes.push(note(start, 0.5, 0, 4));
+        }
+
+        assert!(editor.apply_velocity_lanes(), "書き換わること");
+        // 40 + (120-40) * (0, 1/4, 2/4, 3/4) = 40, 60, 80, 100
+        assert_eq!(note_lane_velocities(&editor), vec![40, 60, 80, 100]);
+
+        assert!(
+            !editor.apply_velocity_lanes(),
+            "何度呼んでも結果が変わらないこと"
+        );
+        assert_eq!(note_lane_velocities(&editor), vec![40, 60, 80, 100]);
+    }
+
+    /// **区間の外は音符自身の値のまま。**
+    ///
+    /// 段を足しただけでトラック全体の強さが変わると、後から抑揚を付けにくい。
+    #[test]
+    fn notes_outside_a_velocity_block_keep_their_own() {
+        let mut editor = with_velocity_lane(&[(0.0, 1.0, 40, 40)]);
+        // 区間の中と外に1つずつ (既定のベロシティは 100)
+        editor.notes.push(note(0.5, 0.25, 0, 4));
+        editor.notes.push(note(2.0, 0.25, 0, 4));
+
+        editor.apply_velocity_lanes();
+        assert_eq!(
+            note_lane_velocities(&editor),
+            vec![40, 100],
+            "外は書いた値のまま"
+        );
+    }
+
+    /// **トラックの全ての音符段に効くこと。**
+    ///
+    /// 段を分けて書いたパートにも同じ抑揚が乗る、というのがこの段の役目。
+    #[test]
+    fn a_velocity_lane_binds_every_note_lane() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 2; // 音符段が2つ
+        assert!(editor.add_velocity_lane(0));
+        editor.notes = vec![
+            Note {
+                start_tick: 0.0,
+                duration: 4.0,
+                velocity: 55,
+                velocity_to: 55,
+                lane: 2,
+                ..note(0.0, 1.0, 0, 4)
+            },
+            note(0.0, 0.5, 0, 4),
+            Note {
+                lane: 1,
+                ..note(1.0, 0.5, 0, 4)
+            },
+        ];
+
+        editor.apply_velocity_lanes();
+        for note in editor.notes.iter().filter(|note| note.lane < 2) {
+            assert_eq!(note.velocity, 55, "段 {} にも効くこと", note.lane);
+        }
+        assert_eq!(editor.notes[0].velocity, 55, "ブロック自身は触らないこと");
+    }
+
+    /// ブロックを動かすと、外れた音符は**書き戻らない**こと。
+    ///
+    /// 記譜へ書き込む形なので、坂が外れた音符は**最後に書かれた値のまま残る**。
+    /// 元の値へ戻す仕組みは持たない (どこまでが「元」か決められないため)。
+    #[test]
+    fn moving_a_block_leaves_the_written_values_behind() {
+        let mut editor = with_velocity_lane(&[(0.0, 1.0, 30, 30)]);
+        editor.notes.push(note(0.5, 0.25, 0, 4));
+        editor.apply_velocity_lanes();
+        assert_eq!(note_lane_velocities(&editor), vec![30]);
+
+        // ブロックを音符の外へ動かす
+        editor.notes[0].start_tick = 4.0;
+        assert!(!editor.apply_velocity_lanes(), "外れた音符は触らない");
+        assert_eq!(note_lane_velocities(&editor), vec![30], "書いた値が残る");
+    }
+
+    /// **ヴェロシティ段のブロックは鳴らないこと。**
+    ///
+    /// 抑揚の指示であって音ではない。鳴ってしまうと、書いた覚えのない音が出る。
+    #[test]
+    fn velocity_blocks_do_not_sound() {
+        let mut editor = with_velocity_lane(&[(0.0, 4.0, 40, 120)]);
+        let only_block = editor.to_events(44100.0);
+        assert!(only_block.is_empty(), "ブロックだけでは何も鳴らない");
+
+        editor.notes.push(note(0.0, 1.0, 0, 4));
+        let with_note = editor.to_events(44100.0);
+        assert_eq!(with_note.len(), 2, "音符のオン・オフだけが出ること");
+    }
+
+    /// トラックに2本目のヴェロシティ段は作らせないこと。
+    ///
+    /// トラック全体に効くものなので、2本あるとどちらが効くのか決められない。
+    #[test]
+    fn a_track_gets_only_one_velocity_lane() {
+        let mut editor = MidiEditor::default();
+        assert!(editor.add_velocity_lane(0));
+        assert!(!editor.add_velocity_lane(0), "2本目は作らない");
+        assert_eq!(editor.tracks[0].velocity_lane(), Some(1));
+    }
+
+    /// 音符段とヴェロシティ段は入れ替えないこと (値の意味が変わってしまう)
+    #[test]
+    fn a_velocity_lane_does_not_swap_with_other_kinds() {
+        let mut editor = MidiEditor::default();
+        editor.tracks[0].lanes = 1;
+        editor.add_cc_lane(0, 64); // 段1
+        assert!(editor.add_velocity_lane(0)); // 段2
+
+        assert!(!editor.swap_lanes((0, 0), (0, 2)), "音符段とは入れ替えない");
+        assert!(!editor.swap_lanes((0, 1), (0, 2)), "CC 段とも入れ替えない");
+        assert_eq!(
+            editor.tracks[0].velocity_lane(),
+            Some(2),
+            "動いていないこと"
+        );
+    }
+
     /// CC 段どうしの入れ替えでは、番号も一緒に動くこと。
     ///
     /// ブロックだけ動かすと、書いた当時と違う CC を送ることになる。
@@ -1548,11 +1903,11 @@ mod tests {
         editor.tracks[0].lanes = 2;
         editor.add_cc_lane(0, 64);
 
-        assert!(editor.remove_last_cc_lane(0));
+        assert!(editor.remove_last_control_lane(0));
         assert_eq!(editor.lanes(0), 2);
         assert_eq!(editor.tracks[0].normal_lanes(), 2);
         assert!(
-            !editor.remove_last_cc_lane(0),
+            !editor.remove_last_control_lane(0),
             "CC 段が無ければ何も消さないこと"
         );
         assert_eq!(editor.lanes(0), 2);
@@ -1576,7 +1931,7 @@ mod tests {
         ];
 
         assert!(!editor.remove_last_normal_lane(0), "段1 にノートがある");
-        assert!(!editor.remove_last_cc_lane(0), "段2 にブロックがある");
+        assert!(!editor.remove_last_control_lane(0), "段2 にブロックがある");
         assert_eq!(editor.lanes(0), 3);
     }
 
@@ -1607,7 +1962,7 @@ mod tests {
         assert_eq!(track.lane_cc(0), None, "間の段は音符段のまま");
 
         track.set_lane_cc(2, None);
-        assert!(track.lane_ccs.is_empty(), "末尾の None は詰めること");
+        assert!(track.lane_kinds.is_empty(), "末尾の音符段は詰めること");
     }
 
     #[test]

@@ -262,6 +262,23 @@ pub(super) fn velocity_fill_rect(rect: Rect, velocity: u8) -> Rect {
     )
 }
 
+/// ヴェロシティ段のブロックの塗り (坂)。左が開始値、右が終了値の高さになる。
+///
+/// **矩形ではなく四角形で返す。** クレシェンドかデクレシェンドかを、
+/// 数字を読まずに形で分かるようにするため。
+pub(super) fn velocity_ramp_points(rect: Rect, from: u8, to: u8) -> Vec<Pos2> {
+    let top_of = |value: u8| {
+        let level = value.min(127) as f32 / 127.0;
+        rect.bottom() - rect.height() * level
+    };
+    vec![
+        Pos2::new(rect.left(), top_of(from)),
+        Pos2::new(rect.right(), top_of(to)),
+        Pos2::new(rect.right(), rect.bottom()),
+        Pos2::new(rect.left(), rect.bottom()),
+    ]
+}
+
 /// ノートの表示矩形を計算する。`row` は画面の行番号 (トラックの段を通しで数えた値)。
 ///
 /// 段の上下に空ける余白は高さの 1/12 (既定の 24px で従来どおり上下2px)。
@@ -352,6 +369,7 @@ mod tests {
             semitone: 0,
             octave: 4,
             velocity: 100,
+            velocity_to: 100,
             track: 0,
             lane,
         }

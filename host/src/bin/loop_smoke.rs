@@ -157,6 +157,7 @@ fn render(
             semitone: 0,
             octave: 4,
             velocity: 127,
+            velocity_to: 127,
             track: 0,
             lane: 0,
         })

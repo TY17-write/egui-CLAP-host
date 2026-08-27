@@ -69,6 +69,15 @@ pub fn editor_panel(
     }
     state.was_playing = playing;
 
+    // **ヴェロシティ段を記譜へ書き込む。**
+    //
+    // 描く前に済ませるので、塗りの高さがそのまま鳴る強さになる。前のフレームの
+    // 編集 (ブロックを動かした・音符を足した) はここで揃う。
+    // 何度呼んでも結果は変わらないので、毎フレーム通してよい。
+    if state.editor.apply_velocity_lanes() {
+        state.dirty = true;
+    }
+
     toolbar::toolbar(ui, state, playing, pos_quarters, &mut commands);
     ui.separator();
 

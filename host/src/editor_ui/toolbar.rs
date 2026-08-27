@@ -6,8 +6,9 @@ use super::metrics::{MAX_OCTAVE, MAX_ROW_H, MIN_OCTAVE, MIN_ROW_H, PPQ, ROW_H};
 use super::shortcuts::{start_playback, stop_playback};
 use super::state::EditorState;
 use super::EditorCommand;
-use crate::sequencer::ScaleMode;
+use crate::sequencer::{LaneKind, ScaleMode};
 use crate::swing;
+use crate::theme::palette;
 use crate::waltz;
 use eframe::egui;
 
@@ -275,6 +276,22 @@ pub(super) fn toolbar(
     let max_semitone = state.editor.scale.max_semitone();
     ui.horizontal(|ui| {
         if let Some(idx) = state.selected {
+            // **段の種別で出す項目を変える。** ヴェロシティ段のブロックに
+            // 音高の欄を出しても意味が無いし、坂の終了値はそこにしか無い
+            let kind = state
+                .editor
+                .notes
+                .get(idx)
+                .map(|note| state.editor.lane_kind(note.track, note.lane))
+                .unwrap_or_default();
+
+            if kind == LaneKind::Velocity {
+                velocity_block_controls(ui, state, idx);
+                return;
+            }
+            // ヴェロシティ段の区間に入っている音符か (入っていれば強さは坂が決める)
+            let bound_by_velocity_lane = state.editor.is_bound_by_velocity_lane(idx);
+
             if let Some(note) = state.editor.notes.get_mut(idx) {
                 // 2桁分の幅を確保して、9→10 でレイアウトが動かないようにする
                 ui.label("半音");
@@ -304,13 +321,26 @@ pub(super) fn toolbar(
                 }
 
                 ui.label("ベロシティ");
-                let resp = ui.add(egui::Slider::new(&mut note.velocity, 1..=127));
-                if resp.changed() {
-                    state.history.record(EditGroup::Velocity);
-                    state.dirty = true;
-                }
-                if resp.drag_stopped() || resp.lost_focus() {
-                    state.history.end_group();
+                // **ヴェロシティ段に縛られている間は触らせない。**
+                // 触れても次のフレームで坂の値に戻るので、動かせるように
+                // 見せるほうが分かりにくい
+                if bound_by_velocity_lane {
+                    let value = note.velocity;
+                    ui.add_enabled(false, egui::Slider::new(&mut { value }, 1..=127));
+                    ui.colored_label(palette::PURPLE, "← ヴェロシティ段")
+                        .on_hover_text(
+                            "この音符はヴェロシティ段のブロックに縛られています。\
+                             強さを変えるにはブロックの坂を動かしてください。",
+                        );
+                } else {
+                    let resp = ui.add(egui::Slider::new(&mut note.velocity, 1..=127));
+                    if resp.changed() {
+                        state.history.record(EditGroup::Velocity);
+                        state.dirty = true;
+                    }
+                    if resp.drag_stopped() || resp.lost_focus() {
+                        state.history.end_group();
+                    }
                 }
 
                 if ui.button("削除").clicked() {
@@ -333,6 +363,58 @@ pub(super) fn toolbar(
             ui.weak("操作の一覧は左下の「操作ガイド」から");
         }
     });
+}
+
+/// ヴェロシティ段のブロックの詳細 (坂の開始値と終了値)。
+///
+/// **音高の欄は出さない。** この段では意味を持たないため。
+/// 代わりに終了値を出し、クレシェンドを1つのブロックで書けるようにする。
+fn velocity_block_controls(ui: &mut egui::Ui, state: &mut EditorState, idx: usize) {
+    let Some(note) = state.editor.notes.get_mut(idx) else {
+        state.clear_selection();
+        return;
+    };
+
+    ui.label("ヴェロシティ");
+    let resp = ui.add(egui::Slider::new(&mut note.velocity, 1..=127).text("開始"));
+    if resp.changed() {
+        state.history.record(EditGroup::Velocity);
+        state.dirty = true;
+    }
+    if resp.drag_stopped() || resp.lost_focus() {
+        state.history.end_group();
+    }
+
+    let Some(note) = state.editor.notes.get_mut(idx) else {
+        return;
+    };
+    let resp = ui.add(egui::Slider::new(&mut note.velocity_to, 1..=127).text("終了"));
+    if resp.changed() {
+        state.history.record(EditGroup::Velocity);
+        state.dirty = true;
+    }
+    if resp.drag_stopped() || resp.lost_focus() {
+        state.history.end_group();
+    }
+
+    // 平らにするのは「間違えて坂にした」ときによくやるので、1押しで戻せるように
+    if ui
+        .button("平ら")
+        .on_hover_text("終了値を開始値に合わせる")
+        .clicked()
+    {
+        state.history.record(EditGroup::Once);
+        if let Some(note) = state.editor.notes.get_mut(idx) {
+            note.velocity_to = note.velocity;
+        }
+        state.dirty = true;
+    }
+
+    if ui.button("削除").clicked() {
+        state.history.record(EditGroup::Once);
+        state.delete_selection();
+        state.dirty = true;
+    }
 }
 
 fn tuplet_label(tuplet: u32) -> &'static str {

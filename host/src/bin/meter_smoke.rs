@@ -161,6 +161,7 @@ fn measure_plugin(plugin_path: &str) -> Result<Plugin, Box<dyn Error>> {
         semitone: 0,
         octave: 4,
         velocity: 127,
+        velocity_to: 127,
         track: 0,
         lane: 0,
     }];

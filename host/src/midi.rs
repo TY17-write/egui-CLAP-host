@@ -420,6 +420,8 @@ pub fn from_bytes(bytes: &[u8], scale: ScaleMode) -> Result<Imported, String> {
                 semitone,
                 octave,
                 velocity: velocity.clamp(1, 127),
+                // 音符段では読まれない
+                velocity_to: velocity.clamp(1, 127),
                 track: base_track,
                 lane,
             });
@@ -473,6 +475,8 @@ pub fn from_bytes(bytes: &[u8], scale: ScaleMode) -> Result<Imported, String> {
                     semitone: 0,
                     octave: 4,
                     velocity: value.clamp(1, 127),
+                    // CC 段では読まれない
+                    velocity_to: value.clamp(1, 127),
                     track,
                     lane,
                 });
@@ -572,6 +576,7 @@ mod tests {
             semitone,
             octave,
             velocity,
+            velocity_to: velocity,
             track: 0,
             lane: 0,
         }
