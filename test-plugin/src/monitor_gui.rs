@@ -10,8 +10,19 @@
 //! 依存を積みたくない**ため。`WM_PAINT` で完結するので、どの DAW に読ませても
 //! 追加の作法が要らない。
 //!
-//! 再描画は `SetTimer` の `WM_TIMER`。ホストの UI スレッドが普通のメッセージ
-//! ループを回していれば配送されるので、自前のポンプは要らない。
+//! # 描き直しの間隔
+//!
+//! **ホストの `clap.timer-support` に叩いてもらう。** 自前で `SetTimer` を張ると、
+//! `WM_TIMER` はメッセージの中で優先度が最も低いため、ホストが描画で回り続けて
+//! いる間は順番が回ってこない。**実測で 300〜500ms まで開いた** (要求は 33ms)。
+//! ホストのタイマーは直接呼ばれるので、その影響を受けない。
+//!
+//! 描くほうも同じ事情がある。`InvalidateRect` だけでは `WM_PAINT` 待ちになり、
+//! これも優先度が最も低い。[`MonitorWindow::redraw`] は `RDW_UPDATENOW` で
+//! その場で描かせる。
+//!
+//! `clap.timer-support` を持たないホストのために `SetTimer` も残してある
+//! (どこでも動くのが治具の前提)。そちらでは間隔が乱れるが、止まりはしない。
 //!
 //! **ちらつき止めに裏画面へ描いてから転送する。** 30fps で数十個の矩形を
 //! 直接描くと目に見えて散らつく。
@@ -28,8 +39,9 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect, SelectObject, SetBkMode,
-    SetTextColor, TextOutW, DEFAULT_GUI_FONT, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect, RedrawWindow, SelectObject,
+    SetBkMode, SetTextColor, TextOutW, DEFAULT_GUI_FONT, HBRUSH, HDC, PAINTSTRUCT, RDW_INVALIDATE,
+    RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -48,7 +60,7 @@ pub const HEIGHT: u32 = 210;
 /// ホストがエディタを開いている間の再描画間隔と揃えてある (33ms ≒ 30fps)。
 /// メーターは目で追うものなので、これ以上速くしても読めない
 const TIMER_ID: usize = 1;
-const REDRAW_MS: u32 = 33;
+pub const REDRAW_MS: u32 = 33;
 
 /// ウィンドウクラス名 (UTF-16, NUL 終端) — "test_monitor_view\0"
 const CLASS_NAME: &[u16] = &[
@@ -113,6 +125,13 @@ pub struct MonitorView {
     consumer: Option<rtrb::Consumer<f32>>,
     meters: Meters,
     last_tick: Instant,
+    /// 実測の再描画間隔 (ms) を均したもの。
+    ///
+    /// **カクつきの原因を切り分けるために出す。** 要求は
+    /// [`REDRAW_MS`] だが、`WM_TIMER` はメッセージの中で優先度が最も低いので、
+    /// ホストの描画と競ると届く間隔が乱れる。値が要求どおりなら、原因は
+    /// 間隔ではなく絵の作り方のほうにある。
+    frame_ms: f32,
 }
 
 impl MonitorView {
@@ -123,11 +142,12 @@ impl MonitorView {
             // 活性化するまでレートは分からない。最初の取り込みで作り直される
             meters: Meters::new(48_000),
             last_tick: Instant::now(),
+            frame_ms: REDRAW_MS as f32,
         }
     }
 
-    /// 1フレーム分を取り込む
-    fn tick(&mut self) {
+    /// 1フレーム分を取り込む。**ホストのタイマーからも `WM_TIMER` からも呼ぶ**
+    pub fn tick(&mut self) {
         // 掛け直されていれば新しい受け口へ持ち替える
         if let Some(consumer) = self.handoff.take() {
             self.consumer = Some(consumer);
@@ -137,6 +157,8 @@ impl MonitorView {
         let now = Instant::now();
         let dt = (now - self.last_tick).as_secs_f32();
         self.last_tick = now;
+        // 1フレームだけ跳ねても読めるように均す
+        self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
 
         let sample_rate = self.handoff.sample_rate();
         if let Some(consumer) = self.consumer.as_mut() {
@@ -156,7 +178,12 @@ pub struct MonitorWindow {
 }
 
 impl MonitorWindow {
-    /// 親の中に子ウィンドウを作る。`view` は窓より長生きすること
+    /// 親の中に子ウィンドウを作る。`view` は窓より長生きすること。
+    ///
+    /// `own_timer` は**自前で `SetTimer` を張るか**。ホストが
+    /// `clap.timer-support` を持っているならそちらに任せるので `false`。
+    /// `WM_TIMER` はメッセージの中で優先度が最も低く、ホストが描画で回り続けて
+    /// いる間は順番が回ってこない (実測で 300〜500ms まで開いた)。
     ///
     /// # Safety
     ///
@@ -166,6 +193,7 @@ impl MonitorWindow {
         view: *const RefCell<MonitorView>,
         width: u32,
         height: u32,
+        own_timer: bool,
     ) -> Option<Self> {
         register_class();
 
@@ -186,8 +214,26 @@ impl MonitorWindow {
         if hwnd.is_null() {
             return None;
         }
-        SetTimer(hwnd, TIMER_ID, REDRAW_MS, None);
+        if own_timer {
+            SetTimer(hwnd, TIMER_ID, REDRAW_MS, None);
+        }
         Some(Self { hwnd })
+    }
+
+    /// 取り込んで描き直す。**その場で描く。**
+    ///
+    /// `InvalidateRect` だけだと `WM_PAINT` 待ちになるが、これも
+    /// `WM_TIMER` と同じく優先度が最も低い。`RDW_UPDATENOW` で
+    /// キューを介さずに描かせる。
+    pub fn redraw(&self) {
+        unsafe {
+            RedrawWindow(
+                self.hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+        }
     }
 
     pub fn resize(&self, width: u32, height: u32) {
@@ -322,6 +368,14 @@ unsafe fn paint(hdc: HDC, width: i32, height: i32, view: &MonitorView) {
         12,
         8,
         "この段に入ってきた音 (出力ポートを持たない段)",
+        FG_DIM,
+    );
+    // 実測の再描画間隔。**要求どおりに届いているかを見るため**に出す
+    text(
+        hdc,
+        width - 80,
+        8,
+        &format!("{:.0} ms", view.frame_ms),
         FG_DIM,
     );
 

@@ -21,6 +21,9 @@ vst3-host = { git = "https://github.com/TY17-write/rust-vst3-host.git", default-
 cpal = "0.15"
 crossbeam-channel = "0.5"
 eframe = "0.31"
+# eframe の本体ウィンドウから HWND を取り出すため
+# (プラグインの窓の所有者にする。eframe は再輸出していないので直接引く)
+raw-window-handle = "0.6"
 rtrb = "0.3"
 rfd = "0.15"
 windows-sys = { version = "0.59", features = [

@@ -23,13 +23,14 @@
 //!
 //! 値は活性化してからの最大値で、`Reset` パラメータに 1 以上を書くと 0 に戻る。
 
-use crate::monitor_gui::{Handoff, MonitorView, MonitorWindow, HEIGHT, WIDTH};
+use crate::monitor_gui::{Handoff, MonitorView, MonitorWindow, HEIGHT, REDRAW_MS, WIDTH};
 use crate::AtomicF32;
+use clack_extensions::timer::{HostTimer, PluginTimer, PluginTimerImpl, TimerId};
 use clack_extensions::{audio_ports::*, gui::*, params::*};
 use clack_plugin::events::event_types::ParamValueEvent;
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
@@ -62,7 +63,10 @@ impl Plugin for TestMonitorPlugin {
             .register::<PluginAudioPorts>()
             .register::<PluginParams>()
             // 入ってきた音をその場で見せる ([`crate::monitor_gui`])
-            .register::<PluginGui>();
+            .register::<PluginGui>()
+            // **描き直しはホストに叩いてもらう。** 自前の WM_TIMER では
+            // ホストの描画に負けて間隔が乱れる (詳細は `set_parent`)
+            .register::<PluginTimer>();
     }
 }
 
@@ -86,11 +90,16 @@ impl DefaultPluginFactory for TestMonitorPlugin {
     }
 
     fn new_main_thread<'a>(
-        _host: HostMainThreadHandle<'a>,
+        host: HostMainThreadHandle<'a>,
         shared: &'a TestMonitorShared,
     ) -> Result<TestMonitorMainThread<'a>, PluginError> {
+        // ホストがタイマーを持っているかは、ここで一度だけ聞く
+        let host_timer = host.shared().get_extension::<HostTimer>();
         Ok(TestMonitorMainThread {
             shared,
+            host,
+            host_timer,
+            timer: Cell::new(None),
             // **窓より先に作り、窓より後に捨てる。** `Box` の中身は動かないので、
             // 窓へ渡した生ポインタは開け閉めをまたいで有効なまま
             view: Box::new(RefCell::new(MonitorView::new(shared.handoff.clone()))),
@@ -131,6 +140,12 @@ impl PluginShared<'_> for TestMonitorShared {}
 
 pub struct TestMonitorMainThread<'a> {
     shared: &'a TestMonitorShared,
+    /// ホストの口。**タイマーの登録・解除に要る**
+    host: HostMainThreadHandle<'a>,
+    /// ホストが駆動するタイマー。持たないホストでは `None` (自前の窓タイマーへ落ちる)
+    host_timer: Option<HostTimer>,
+    /// 登録できたタイマーの ID
+    timer: Cell<Option<TimerId>>,
     /// 窓が指す表示状態。**窓を閉じても捨てない** (掛け直しても続きから出す)
     view: Box<RefCell<MonitorView>>,
     /// 開いている窓。閉じると `None`。
@@ -141,6 +156,43 @@ pub struct TestMonitorMainThread<'a> {
 }
 
 impl<'a> PluginMainThread<'a, TestMonitorShared> for TestMonitorMainThread<'a> {}
+
+impl TestMonitorMainThread<'_> {
+    /// ホストのタイマーを登録する。**登録できたら `true`**。
+    ///
+    /// 持っていない・断られたホストでは `false` を返し、呼び出し側が自前の
+    /// 窓タイマーへ落とす。
+    fn ensure_host_timer(&self) -> bool {
+        if self.timer.get().is_some() {
+            return true;
+        }
+        let Some(extension) = &self.host_timer else {
+            return false;
+        };
+        match extension.register_timer(&self.host, REDRAW_MS) {
+            Ok(id) => {
+                self.timer.set(Some(id));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// ホストが叩いてくれる描き直し。
+///
+/// **これが本命の経路。** 取り込んでその場で描く
+/// ([`MonitorWindow::redraw`](crate::monitor_gui::MonitorWindow::redraw))。
+impl PluginTimerImpl for TestMonitorMainThread<'_> {
+    fn on_timer(&self, _timer_id: TimerId) {
+        if let Ok(mut view) = self.view.try_borrow_mut() {
+            view.tick();
+        }
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.redraw();
+        }
+    }
+}
 
 /// オーディオスレッドで動くプロセッサ
 pub struct TestMonitorAudioProcessor<'a> {
@@ -359,6 +411,10 @@ impl PluginGuiImpl for TestMonitorMainThread<'_> {
     /// 窓を閉じる。**表示状態 (`view`) は残す** ので、開き直すと続きから出る
     fn destroy(&self) {
         self.window.borrow_mut().take();
+        // 窓が無い間まで叩かせない
+        if let (Some(extension), Some(id)) = (&self.host_timer, self.timer.take()) {
+            let _ = extension.unregister_timer(&self.host, id);
+        }
     }
 
     fn set_scale(&self, _scale: f64) -> Result<(), PluginError> {
@@ -393,6 +449,14 @@ impl PluginGuiImpl for TestMonitorMainThread<'_> {
         // 掛け直しに備えて古い窓を先に捨てる
         self.window.borrow_mut().take();
 
+        // **描き直しはホストのタイマーに任せる。** 自前の `SetTimer` だと
+        // `WM_TIMER` がメッセージの中で最も優先度が低く、ホストが描画で回り
+        // 続けている間は順番が回ってこない (実測で 300〜500ms まで開いた)。
+        // `clap.timer-support` はホストが直接呼ぶので、要求どおりに届く。
+        //
+        // 持たないホストのために `SetTimer` も残す (どこでも動くのが前提の治具)。
+        let host_driven = self.ensure_host_timer();
+
         // SAFETY: `parent` はホストが渡した有効な HWND。`view` は `Box` の中なので
         // 場所が動かず、`self` (と窓) より長生きする
         let created = unsafe {
@@ -401,6 +465,7 @@ impl PluginGuiImpl for TestMonitorMainThread<'_> {
                 &*self.view as *const RefCell<MonitorView>,
                 WIDTH,
                 HEIGHT,
+                !host_driven,
             )
         };
         *self.window.borrow_mut() =

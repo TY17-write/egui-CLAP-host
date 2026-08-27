@@ -44,12 +44,23 @@ const MAX_HZ: f32 = 18_000.0;
 /// 山の落ちる速さ (dB/秒)
 const DECAY_DB_PER_SECOND: f32 = 90.0;
 
+/// 前回の変換からこれだけ溜まったら回し直す (2048点の 1/8 = 5.3ms @48kHz)。
+///
+/// **窓が満杯になるのを待ってはいけない。** 待つと 42.7ms に1回しか絵が変わらず、
+/// 再描画の間隔と拍が合わずにカクつく。直近の窓を滑らせながら、絵の更新より
+/// 細かい間隔で回し直す。溜まっていないときは変換しない (止めている間に
+/// 同じ入力を何度も回さないための足切り)。
+const REFRESH_FRAMES: usize = FFT_SIZE / 8;
+
 /// 簡易スペクトル。**見るためのもので、測るためのものではない**
 pub struct Spectrum {
     sample_rate: u32,
-    /// モノラルに落とした入力を溜める窓
-    window: [f32; FFT_SIZE],
-    filled: usize,
+    /// モノラルに落とした入力の輪。**常に直近 [`FFT_SIZE`] サンプルを持つ**
+    ring: [f32; FFT_SIZE],
+    /// 輪の次の書き込み位置 (ここが最も古いサンプルでもある)
+    at: usize,
+    /// 前回の変換から入った数
+    since_transform: usize,
     /// Hann 窓の係数
     hann: [f32; FFT_SIZE],
     /// FFT の作業領域
@@ -86,8 +97,9 @@ impl Spectrum {
 
         Self {
             sample_rate,
-            window: [0.0; FFT_SIZE],
-            filled: 0,
+            ring: [0.0; FFT_SIZE],
+            at: 0,
+            since_transform: 0,
             hann,
             re: [0.0; FFT_SIZE],
             im: [0.0; FFT_SIZE],
@@ -101,25 +113,33 @@ impl Spectrum {
     }
 
     pub fn reset(&mut self) {
-        self.filled = 0;
+        self.ring = [0.0; FFT_SIZE];
+        self.at = 0;
+        self.since_transform = 0;
         self.levels = [FLOOR_DB; BANDS];
     }
 
-    /// ステレオのインターリーブを受け取り、溜まったら変換する
+    /// ステレオのインターリーブを輪へ流し込む (**ここでは変換しない**)
     pub fn push(&mut self, interleaved: &[f32]) {
         for frame in interleaved.chunks_exact(2) {
-            self.window[self.filled] = 0.5 * (frame[0] + frame[1]);
-            self.filled += 1;
-            if self.filled == FFT_SIZE {
-                self.transform();
-                self.filled = 0;
-            }
+            self.ring[self.at] = 0.5 * (frame[0] + frame[1]);
+            self.at = (self.at + 1) % FFT_SIZE;
+            self.since_transform += 1;
         }
     }
 
-    /// 落ちを進める。`dt` は前回からの秒数
+    /// 画面に出す値を更新する。`dt` は前回からの秒数 (落ちの量に使う)。
+    ///
+    /// 新しい入力が [`REFRESH_FRAMES`] ぶん溜まっていれば回し直し、
+    /// 溜まっていなければ落ちだけ進める。
     pub fn update(&mut self, dt: f32) {
-        let drop = DECAY_DB_PER_SECOND * dt.max(0.0);
+        if self.since_transform >= REFRESH_FRAMES {
+            self.since_transform = 0;
+            self.transform();
+        }
+        // **長く止まっていたぶんを一度に落とさない。** 画面が止まっていた
+        // あとに一気に底へ張り付くと、鳴っているのに消えたように見える
+        let drop = DECAY_DB_PER_SECOND * dt.clamp(0.0, 0.5);
         for level in self.levels.iter_mut() {
             *level = (*level - drop).max(FLOOR_DB);
         }
@@ -136,8 +156,10 @@ impl Spectrum {
     }
 
     fn transform(&mut self) {
+        // 輪の古い側から並べ直して窓を掛ける (`at` が最も古い位置)
         for index in 0..FFT_SIZE {
-            self.re[index] = self.window[index] * self.hann[index];
+            let source = (self.at + index) % FFT_SIZE;
+            self.re[index] = self.ring[source] * self.hann[index];
             self.im[index] = 0.0;
         }
         fft(&mut self.re, &mut self.im);
@@ -463,6 +485,9 @@ fn loudness_of(energy: f64) -> f32 {
 
 // ------------------------------------------------------------------ まとめ
 
+/// 一度に取り込む上限 (フレーム数 × 2ch)。0.5秒ぶんあれば普段は溢れない
+const MAX_DRAIN_SAMPLES: usize = 48_000;
+
 /// スペクトルとラウドネスをまとめて回す
 pub struct Meters {
     loudness: Loudness,
@@ -483,8 +508,12 @@ impl Meters {
             *self = Self::new(sample_rate);
         }
 
-        // **偶数個ずつ取る。** 半端に切ると次の塊で L と R が入れ替わる
-        let available = source.slots() & !1;
+        // **偶数個ずつ取る。** 半端に切ると次の塊で L と R が入れ替わる。
+        //
+        // **上限も要る。** 画面が長く止まっていたあとに溜まったぶんを全部回すと、
+        // その1フレームだけ伸びて、そのせいでまた溜まる、という悪循環になる。
+        // 古いものは捨ててよい (メーターは欠けても音に影響しない)
+        let available = source.slots().min(MAX_DRAIN_SAMPLES) & !1;
         if available > 0 {
             if let Ok(chunk) = source.read_chunk(available) {
                 let (first, second) = chunk.as_slices();
@@ -632,6 +661,8 @@ mod tests {
             samples.push(value);
         }
         spectrum.push(&samples);
+        // **変換は `update` の仕事。** 押し込んだだけでは絵は変わらない
+        spectrum.update(0.0);
 
         let loudest = spectrum
             .levels()
@@ -654,8 +685,43 @@ mod tests {
     fn bands_fall_back_to_the_floor() {
         let mut spectrum = Spectrum::new(48_000);
         spectrum.levels = [-10.0; BANDS];
-        // 90dB/秒 なので 1秒で -100dB ぶん落ちる → 底に張り付く
+
+        // **1回では底まで行かない。** 一度に落とす量は 0.5秒ぶんで頭打ちに
+        // してある (画面が止まっていたあとに一気に消えないように)
         spectrum.update(1.0);
+        assert!(
+            spectrum.levels().iter().all(|level| *level > FLOOR_DB),
+            "一度に底まで落とさないこと"
+        );
+
+        for _ in 0..4 {
+            spectrum.update(0.5);
+        }
         assert!(spectrum.levels().iter().all(|level| *level == FLOOR_DB));
+    }
+
+    /// **絵が窓の満杯を待たないこと。**
+    ///
+    /// 満杯 (2048サンプル = 42.7ms) を待つと、再描画の間隔と拍が合わずにカクつく。
+    /// 窓の 1/8 だけ入れば回し直すことを縛っておく。
+    #[test]
+    fn the_picture_updates_before_the_window_fills() {
+        let mut spectrum = Spectrum::new(48_000);
+
+        // 窓の 1/8 ちょうど。満杯までは程遠い
+        let mut samples = Vec::new();
+        for frame in 0..REFRESH_FRAMES {
+            let phase = 2.0 * std::f64::consts::PI * 1000.0 * frame as f64 / 48_000.0;
+            let value = 0.5 * phase.sin() as f32;
+            samples.push(value);
+            samples.push(value);
+        }
+        spectrum.push(&samples);
+        spectrum.update(0.0);
+
+        assert!(
+            spectrum.levels().iter().any(|level| *level > FLOOR_DB),
+            "窓が満杯になる前に絵が出ること"
+        );
     }
 }

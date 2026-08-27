@@ -103,6 +103,13 @@ pub struct App {
     library_tab: Tab,
     /// 一覧の絞り込み (名前・ベンダー)
     library_filter: String,
+    /// 本体ウィンドウの HWND。**プラグインの窓の所有者にする**。
+    ///
+    /// 所有者を付けないと、本体をクリックしたときにプラグインの窓が裏へ回り、
+    /// メーターを見ながらエディタを触れない。
+    /// **窓ができてからでないと取れない**ので、最初の `update` で控える
+    /// ([`plugin_window::owner_of`](crate::plugin_window::owner_of))。
+    main_window: Option<windows_sys::Win32::Foundation::HWND>,
 }
 
 impl App {
@@ -119,7 +126,13 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // **本体ウィンドウを1回だけ控える。** プラグインの窓の所有者にする
+        // (付けないと、本体をクリックしたときに裏へ回る)
+        if self.main_window.is_none() {
+            self.main_window = crate::plugin_window::owner_of(frame);
+        }
+
         // 起動時の自動ロード (検証用 CLI)
         if let Some((path, open_gui)) = self.autoload.take() {
             // 拡張子で形式を見分ける (CLI なので聞き返す相手がいない)
@@ -154,17 +167,24 @@ impl eframe::App for App {
                             .and_then(|slot| slot.nodes.first_mut())
                         {
                             let name = track.name.clone();
+                            let owner = self.main_window;
                             let opened = match &mut track.plugin {
                                 TrackPlugin::Clap(clap) => clap.gui.as_mut().map(|gui| {
                                     gui.open(
                                         &mut clap.instance.plugin_handle(),
                                         &name,
                                         clap.sender.clone(),
+                                        owner,
                                     )
                                 }),
                                 TrackPlugin::Vst3(vst3) => {
                                     let mut plugin = vst3.plugin.lock();
-                                    Some(vst3.gui.open(&mut plugin, &name, vst3.sender.clone()))
+                                    Some(vst3.gui.open(
+                                        &mut plugin,
+                                        &name,
+                                        vst3.sender.clone(),
+                                        owner,
+                                    ))
                                 }
                             };
                             if let Some(Err(e)) = opened {

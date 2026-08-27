@@ -20,6 +20,7 @@ use crossbeam_channel::Sender;
 use std::error::Error;
 use std::ffi::CString;
 use vst3_host::plugin::{Plugin as Vst3Plugin, WindowHandle};
+use windows_sys::Win32::Foundation::HWND;
 
 /// プラグイン GUI の状態を管理する (メインスレッド専用)
 pub struct PluginGuiManager {
@@ -83,11 +84,14 @@ impl PluginGuiManager {
     }
 
     /// プラグイン GUI を開く
+    /// `owner` は本体ウィンドウ ([`plugin_window::owner_of`])。
+    /// **渡さないと、本体をクリックしたときにプラグインの窓が裏へ回る。**
     pub fn open(
         &mut self,
         plugin: &mut PluginMainThreadHandle,
         title: &str,
         sender: Sender<MainThreadMessage>,
+        owner: Option<HWND>,
     ) -> Result<(), Box<dyn Error>> {
         if self.is_open {
             return Ok(());
@@ -118,6 +122,7 @@ impl PluginGuiManager {
                 initial_size.height,
                 self.can_resize,
                 sender,
+                owner,
             )
             .ok_or("ネイティブウィンドウの作成に失敗しました")?;
 
@@ -229,11 +234,14 @@ impl Vst3GuiManager {
     }
 
     /// エディタを開く
+    /// `owner` は本体ウィンドウ ([`plugin_window::owner_of`])。
+    /// **渡さないと、本体をクリックしたときにエディタが裏へ回る。**
     pub fn open(
         &mut self,
         plugin: &mut Vst3Plugin,
         title: &str,
         sender: Sender<MainThreadMessage>,
+        owner: Option<HWND>,
     ) -> Result<(), Box<dyn Error>> {
         if self.is_open {
             return Ok(());
@@ -245,7 +253,7 @@ impl Vst3GuiManager {
         // まず仮の大きさ・リサイズ可で窓を作って貼り付ける。
         // 大きさも可否も、生きている view に聞き直して後から直す。
         let (width, height) = VST3_PROVISIONAL_SIZE;
-        let window = PluginWindow::create(title, width, height, true, sender)
+        let window = PluginWindow::create(title, width, height, true, sender, owner)
             .ok_or("ネイティブウィンドウの作成に失敗しました")?;
 
         // SAFETY: window はエディタを閉じる (close) まで生存する

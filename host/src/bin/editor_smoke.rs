@@ -104,7 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let opening = Instant::now();
     let opened = {
         let mut plugin = shared.lock();
-        gui.open(&mut plugin, &target.name, sender)
+        // 本体の窓が無い経路 (--egui を付けないとき)。所有者は付けようがない
+        gui.open(&mut plugin, &target.name, sender, None)
     };
     let elapsed = opening.elapsed().as_secs_f64();
 
@@ -169,12 +170,17 @@ fn run_with_egui(
     }
 
     impl eframe::App for SmokeApp {
-        fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-            // 本体と同じく、窓が立ち上がったあとにエディタを開く
+        fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+            // 本体と同じく、窓が立ち上がったあとにエディタを開く。
+            // **所有者も本体と同じように渡す** (裏へ回らないかをここで見るため)
             if !self.opened {
                 self.opened = true;
+                let owner = egui_clap_host::plugin_window::owner_of(frame);
                 let mut plugin = self.shared.lock();
-                if let Err(e) = self.gui.open(&mut plugin, &self.name, self.sender.clone()) {
+                if let Err(e) = self
+                    .gui
+                    .open(&mut plugin, &self.name, self.sender.clone(), owner)
+                {
                     println!("RESULT 開けない {e}");
                 }
             }

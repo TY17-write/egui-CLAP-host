@@ -379,7 +379,10 @@ impl App {
         let mut gui_error = None;
         let mut open = true;
 
-        // 打ち込みトラックの名前 (窓の中では self を借りられないので先に取る)
+        // プラグインの窓の所有者 (窓の中では self を借りられないので先に取る)
+        let owner = self.main_window;
+
+        // 打ち込みトラックの名前 (同上)
         let midi_names: Vec<String> = self
             .editor
             .editor
@@ -517,6 +520,7 @@ impl App {
                                                     &mut clap.instance.plugin_handle(),
                                                     &name,
                                                     clap.sender.clone(),
+                                                    owner,
                                                 ) {
                                                     gui_error =
                                                         Some(format!("GUI を開けません: {e}"));
@@ -538,6 +542,7 @@ impl App {
                                                 &mut plugin,
                                                 &name,
                                                 vst3.sender.clone(),
+                                                owner,
                                             ) {
                                                 gui_error = Some(format!("GUI を開けません: {e}"));
                                             }

@@ -8,6 +8,7 @@
 
 use crate::host::MainThreadMessage;
 use crossbeam_channel::Sender;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
@@ -39,14 +40,34 @@ pub struct PluginWindow {
     hwnd: HWND,
 }
 
+/// 本体ウィンドウの HWND を取り出す (プラグインの窓の所有者にする)。
+///
+/// **所有者が無いと裏へ回る。** 本体をクリックしたときにプラグインの窓が
+/// 後ろに隠れてしまい、メーターを見ながらエディタを触れない。
+/// Windows は**所有された窓を所有者より前に保つ**ので、これを渡すだけで直る。
+///
+/// `WS_EX_TOPMOST` (最前面固定) にはしない。他のアプリより前に出続けるのは
+/// 行儀が悪いし、求めているのは「本体より前」だけ。
+pub fn owner_of(window: &impl HasWindowHandle) -> Option<HWND> {
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
+        _ => None,
+    }
+}
+
 impl PluginWindow {
     /// ウィンドウを作成して表示する。サイズはクライアント領域の物理ピクセル。
+    ///
+    /// `owner` は本体ウィンドウ ([`owner_of`])。**所有者を付けると、
+    /// 本体をクリックしても裏に回らず、本体を最小化すれば一緒に引っ込む。**
+    /// `None` でも動くが、そのときは裏へ回る。
     pub fn create(
         title: &str,
         client_width: u32,
         client_height: u32,
         resizable: bool,
         sender: Sender<MainThreadMessage>,
+        owner: Option<HWND>,
     ) -> Option<Self> {
         ensure_class_registered();
 
@@ -78,7 +99,9 @@ impl PluginWindow {
                 CW_USEDEFAULT,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                null_mut(),
+                // **子ではなく所有者。** WS_CHILD を立てていないので、ここへ
+                // 渡した窓は親ではなく所有者になる (本体より前に留まる)
+                owner.unwrap_or(null_mut()),
                 null_mut(),
                 GetModuleHandleW(null()),
                 state as *const c_void,
