@@ -146,7 +146,7 @@ impl eframe::App for App {
                         target_track: addr,
                     });
                     self.instantiate(0, addr);
-                    self.set_midi_track(1, Some(0));
+                    self.set_midi_sources(1, audio::graph::MidiSources::one(0));
                     if open_gui {
                         if let Some(track) = self
                             .audio_tracks
@@ -346,7 +346,7 @@ impl eframe::App for App {
                         .audio_tracks
                         .iter()
                         .enumerate()
-                        .filter(|(_, slot)| slot.midi_track == Some(midi_track))
+                        .filter(|(_, slot)| slot.midi.contains(midi_track))
                         .map(|(index, slot)| format!("{index}: {}", slot.label()))
                         .collect();
                     (!users.is_empty()).then(|| users.join(" / "))

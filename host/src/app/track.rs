@@ -72,9 +72,12 @@ pub(super) struct TrackAudio {
 pub(super) struct AudioTrackUi {
     /// 上から順に通す。空なら何も鳴らない
     pub(super) nodes: Vec<TrackAudio>,
-    /// MIDI をどの打ち込みトラックから取るか。**`None` が未割り当て**
-    /// (起動直後は全部これ)
-    pub(super) midi_track: Option<usize>,
+    /// MIDI をどの打ち込みトラックから取るか。**空が未割り当て**
+    /// (起動直後は全部これ)。
+    ///
+    /// 複数入れられる。ドラムをキックとハイハットで別の打ち込みに書き、
+    /// 音源1つで受ける、といった使い方のため
+    pub(super) midi: graph::MidiSources,
     /// 送り先のオーディオトラック番号
     pub(super) sends: Vec<usize>,
     /// 音量 (dB)。**画面と同じ単位で持つ。**
@@ -161,7 +164,7 @@ impl TrackAudio {
                 };
                 let mut buffer = Vec::new();
                 if extension
-                    .save(&mut clap.instance.plugin_handle(), &mut buffer)
+                    .save(&clap.instance.plugin_handle(), &mut buffer)
                     .is_err()
                 {
                     buffer.clear();
@@ -187,7 +190,7 @@ impl TrackAudio {
                 };
                 let mut reader = std::io::Cursor::new(state);
                 extension
-                    .load(&mut clap.instance.plugin_handle(), &mut reader)
+                    .load(&clap.instance.plugin_handle(), &mut reader)
                     .is_ok()
             }
             TrackPlugin::Vst3(vst3) => vst3.plugin.lock().load_state(state).is_ok(),

@@ -319,6 +319,23 @@ pub fn push_choke(events: &mut BlockEvents, offset: u32) {
     events.push(BlockEvent::Choke { offset });
 }
 
+/// シーケンスイベント1つをブロックイベントにする
+fn note_event(offset: u32, event: &SeqEvent) -> BlockEvent {
+    match event.kind {
+        SeqEventKind::NoteOn { key, velocity } => BlockEvent::NoteOn {
+            offset,
+            key,
+            velocity,
+        },
+        SeqEventKind::NoteOff { key } => BlockEvent::NoteOff { offset, key },
+        SeqEventKind::Cc { number, value } => BlockEvent::Cc {
+            offset,
+            number,
+            value,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,22 +460,5 @@ mod tests {
             events.iter().next(),
             Some(&BlockEvent::Choke { offset: 32 })
         );
-    }
-}
-
-/// シーケンスイベント1つをブロックイベントにする
-fn note_event(offset: u32, event: &SeqEvent) -> BlockEvent {
-    match event.kind {
-        SeqEventKind::NoteOn { key, velocity } => BlockEvent::NoteOn {
-            offset,
-            key,
-            velocity,
-        },
-        SeqEventKind::NoteOff { key } => BlockEvent::NoteOff { offset, key },
-        SeqEventKind::Cc { number, value } => BlockEvent::Cc {
-            offset,
-            number,
-            value,
-        },
     }
 }

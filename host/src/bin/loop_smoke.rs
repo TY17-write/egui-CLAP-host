@@ -146,7 +146,7 @@ fn render(
     let mut graph = Graph::new();
     graph.reserve(BLOCK_SIZE);
     let audio_track = graph::audio_track_for(0).expect("1本なら収まる");
-    graph.place_chain(audio_track, Some(0), vec![node]);
+    graph.place_chain(audio_track, graph::MidiSources::one(0), vec![node]);
 
     let mut editor = MidiEditor::default(); // 120bpm → 四分音符 22050 サンプル
     editor.notes = notes

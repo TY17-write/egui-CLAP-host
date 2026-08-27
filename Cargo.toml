@@ -2,6 +2,16 @@
 resolver = "2"
 members = ["host", "test-plugin"]
 
+[workspace.lints.clippy]
+# テストと検証バイナリの土台作りで多用する形。
+#
+#     let mut editor = MidiEditor::default();
+#     editor.notes = vec![ ... ];   // ← ここを指摘してくる
+#
+# 構造体更新記法へ寄せると、既定から**何を変えたのか**が読み取りにくくなり、
+# 途中に説明のコメントも挟めなくなる。この書き方を意図して選んでいる。
+field_reassign_with_default = "allow"
+
 [workspace.dependencies]
 clack-host = { git = "https://github.com/prokopyl/clack.git" }
 clack-plugin = { git = "https://github.com/prokopyl/clack.git" }

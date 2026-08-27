@@ -22,8 +22,9 @@ use std::path::PathBuf;
 /// 今このビルドが書き出す形式のバージョン。
 ///
 /// 1: シーケンスと設定のみ / 2: 音源 (`plugins`) を追加 /
-/// 3: 音源を**オーディオトラック** (`audio_tracks`) へ移した
-const VERSION: u32 = 3;
+/// 3: 音源を**オーディオトラック** (`audio_tracks`) へ移した /
+/// 4: MIDI の割り当てを**複数持てる形** (`midi_tracks`) にした
+const VERSION: u32 = 4;
 
 /// 音源の種別。
 ///
@@ -61,8 +62,8 @@ pub struct AudioTrackSnapshot {
     pub name: String,
     /// 上から順に通す音源とエフェクト
     pub nodes: Vec<PluginSnapshot>,
-    /// MIDI をどの打ち込みトラックから取るか。`None` は未割り当て
-    pub midi_track: Option<usize>,
+    /// MIDI をどの打ち込みトラックから取るか。空は未割り当て
+    pub midi_tracks: Vec<usize>,
     /// 送り先のオーディオトラック番号。**マスター (0) では常に空**
     pub sends: Vec<usize>,
     /// チェーンの後に掛かる音量 (線形)。すべての送りに効く
@@ -78,7 +79,7 @@ impl Default for AudioTrackSnapshot {
         Self {
             name: String::new(),
             nodes: Vec::new(),
-            midi_track: None,
+            midi_tracks: Vec::new(),
             sends: Vec::new(),
             gain: 1.0,
             pan: 0.0,
@@ -96,6 +97,10 @@ pub const AUDIO_TRACKS: usize = 16;
 
 /// マスターのトラック番号
 pub const MASTER: usize = 0;
+
+/// 1本のオーディオトラックが受けられる打ち込みの本数
+/// (`audio::graph::MAX_MIDI_SOURCES` と同じ)。**上と同じ理由でここに持つ**
+pub const MAX_MIDI_SOURCES: usize = 8;
 
 /// 読み込んだプロジェクト
 pub struct Loaded {
@@ -174,9 +179,14 @@ fn default_gain() -> f32 {
 struct AudioTrackEntry {
     #[serde(default)]
     name: String,
-    /// `None` は未割り当て
-    #[serde(default)]
+    /// **バージョン3 以前の形** (打ち込み1本まで)。読むためだけに残してある。
+    /// 書き出すのは `midi_tracks` のほう
+    #[serde(default, skip_serializing)]
     midi_track: Option<usize>,
+    /// MIDI を取る打ち込みトラック。空は未割り当て。
+    /// **バージョン3 以前のファイルには無い**ので、そのときは `midi_track` から移す
+    #[serde(default)]
+    midi_tracks: Vec<usize>,
     /// 送り先。**片側だけ書く。** 両側に書くと「A は→B と言い、B は何も
     /// 言っていない」という矛盾したファイルが作れてしまう
     #[serde(default)]
@@ -283,7 +293,8 @@ pub fn to_string(
                 let track = audio_tracks.get(index).cloned().unwrap_or_default();
                 AudioTrackEntry {
                     name: track.name,
-                    midi_track: track.midi_track,
+                    midi_track: None,
+                    midi_tracks: track.midi_tracks,
                     // マスターは送り側にならないので、書いてあっても落とす
                     sends: if index == MASTER {
                         Vec::new()
@@ -421,7 +432,7 @@ fn migrate_plugins(entries: Vec<Option<PluginEntry>>) -> (Vec<AudioTrackSnapshot
         }
         tracks[audio_track] = AudioTrackSnapshot {
             nodes: vec![node],
-            midi_track: Some(midi_track),
+            midi_tracks: vec![midi_track],
             sends: vec![MASTER],
             ..Default::default()
         };
@@ -523,14 +534,31 @@ fn validate_audio_tracks(tracks: &[AudioTrackEntry]) -> Vec<String> {
         )];
     }
 
+    let mut problems = Vec::new();
+
+    // 打ち込みの割り当て本数。**画面では上限まででしか選べない**が、
+    // 手で書いたファイルや将来の版で作られたファイルが入口になりうる
+    for (index, track) in tracks.iter().enumerate() {
+        if track.midi_tracks.len() > MAX_MIDI_SOURCES {
+            problems.push(format!(
+                "・オーディオトラック {index} に打ち込みが {} 本割り当てられています \
+                 (受けられるのは {MAX_MIDI_SOURCES} 本まで)",
+                track.midi_tracks.len()
+            ));
+        }
+    }
+
     let lists: Vec<Vec<usize>> = tracks
         .iter()
         .map(|track| track.sends.iter().map(|send| send.to).collect())
         .collect();
 
-    crate::audio::graph::Routing::from_lists(&lists)
-        .err()
-        .unwrap_or_default()
+    problems.extend(
+        crate::audio::graph::Routing::from_lists(&lists)
+            .err()
+            .unwrap_or_default(),
+    );
+    problems
 }
 
 /// 検証済みのファイル内容をデータモデルに移す
@@ -548,7 +576,13 @@ fn build(project: Project) -> Loaded {
             tracks[index] = AudioTrackSnapshot {
                 name: entry.name,
                 nodes: entry.nodes.into_iter().filter_map(build_node).collect(),
-                midi_track: entry.midi_track,
+                // バージョン3 以前は1本まで (`midi_track`)。
+                // 両方書いてあるファイル (手で書いたもの) では新しいほうを採る
+                midi_tracks: if entry.midi_tracks.is_empty() {
+                    entry.midi_track.into_iter().collect()
+                } else {
+                    entry.midi_tracks
+                },
                 // マスターは送り側にならない
                 sends: if index == MASTER {
                     Vec::new()
@@ -799,7 +833,7 @@ mod tests {
     fn audio_track(midi: usize, path: &str, id: &str, state: &[u8]) -> AudioTrackSnapshot {
         AudioTrackSnapshot {
             nodes: vec![snapshot(path, id, state)],
-            midi_track: Some(midi),
+            midi_tracks: vec![midi],
             sends: vec![MASTER],
             ..Default::default()
         }
@@ -839,6 +873,66 @@ mod tests {
         let restored =
             from_str(&to_string(&MidiEditor::default(), &empty_audio_tracks()).unwrap()).unwrap();
         assert_eq!(restored.audio_tracks.len(), AUDIO_TRACKS);
+    }
+
+    /// **複数の打ち込みを割り当てたまま往復すること。**
+    ///
+    /// ドラムをキックとハイハットで分け、音源1つで受ける形。
+    #[test]
+    fn several_midi_tracks_survive_a_round_trip() {
+        let mut track = audio_track(0, "drums.clap", "d", b"1");
+        track.midi_tracks = vec![0, 2, 5];
+        let tracks = audio_tracks(&[(1, track)]);
+
+        let restored = from_str(&to_string(&MidiEditor::default(), &tracks).unwrap()).unwrap();
+        assert_eq!(restored.audio_tracks[1].midi_tracks, vec![0, 2, 5]);
+    }
+
+    /// **バージョン3 の `midi_track` が、そのまま新しい形へ移ること。**
+    /// 落ちると、開き直したときに音源が鳴らなくなる。
+    #[test]
+    fn version_three_midi_track_moves_to_the_list() {
+        let text = "(version: 3, tempo: 120, beats: 4, beat_type: 4, \
+                    tracks: [ (name: \"A\", lanes: 1) ], notes: [], \
+                    audio_tracks: [ (), (midi_track: Some(0), sends: [(to: 0)]) ])";
+
+        let loaded = from_str(text).expect("読めること");
+        assert_eq!(loaded.audio_tracks[1].midi_tracks, vec![0]);
+    }
+
+    /// 未割り当てのバージョン3 は、空のまま移ること
+    #[test]
+    fn version_three_without_an_assignment_stays_empty() {
+        let text = "(version: 3, tempo: 120, beats: 4, beat_type: 4, \
+                    tracks: [ (name: \"A\", lanes: 1) ], notes: [], \
+                    audio_tracks: [ (), (sends: [(to: 0)]) ])";
+
+        let loaded = from_str(text).expect("読めること");
+        assert!(loaded.audio_tracks[1].midi_tracks.is_empty());
+    }
+
+    /// **受けられる本数を超えたファイルは名指しで断ること。**
+    ///
+    /// 画面では上限まででしか選べないが、手で書いたファイルや将来の版で
+    /// 作られたファイルが入口になりうる。黙って切り詰めると、開いた人は
+    /// 割り当てが減ったことに気付けない。
+    #[test]
+    fn too_many_midi_tracks_are_rejected() {
+        let assigned: Vec<String> = (0..MAX_MIDI_SOURCES + 1)
+            .map(|track| track.to_string())
+            .collect();
+        let text = format!(
+            "(version: 4, tempo: 120, beats: 4, beat_type: 4, \
+             tracks: [ (name: \"A\", lanes: 1) ], notes: [], \
+             audio_tracks: [ (), (midi_tracks: [{}], sends: [(to: 0)]) ])",
+            assigned.join(", ")
+        );
+
+        let error = load(&text).expect_err("断ること");
+        assert!(
+            error.contains(&format!("{MAX_MIDI_SOURCES} 本まで")),
+            "本数を名指しすること: {error}"
+        );
     }
 
     /// チェーン (複数段) が順序ごと往復すること
@@ -924,12 +1018,12 @@ mod tests {
 
         let first = &loaded.audio_tracks[1];
         assert_eq!(first.nodes[0].id, "x");
-        assert_eq!(first.midi_track, Some(0), "打ち込みトラック0 を受け取る");
+        assert_eq!(first.midi_tracks, vec![0], "打ち込みトラック0 を受け取る");
         assert_eq!(first.sends, vec![MASTER], "マスターへ送る");
 
         let second = &loaded.audio_tracks[2];
         assert_eq!(second.nodes[0].id, "y");
-        assert_eq!(second.midi_track, Some(1));
+        assert_eq!(second.midi_tracks, vec![1]);
         assert!(loaded.overflow.is_empty());
     }
 
@@ -1089,6 +1183,11 @@ mod tests {
     fn audio_track_count_matches_the_engine() {
         assert_eq!(AUDIO_TRACKS, crate::audio::graph::AUDIO_TRACKS);
         assert_eq!(MASTER, crate::audio::graph::MASTER);
+        assert_eq!(
+            MAX_MIDI_SOURCES,
+            crate::audio::graph::MAX_MIDI_SOURCES,
+            "ずれると、保存できたファイルをエンジンが受け取れなくなる"
+        );
     }
 
     /// 知らないフィールドは無視し、欠けたフィールドは既定値で埋めること。

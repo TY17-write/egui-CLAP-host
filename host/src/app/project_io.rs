@@ -286,7 +286,7 @@ impl App {
                         bypassed: node.bypassed,
                     })
                     .collect(),
-                midi_track: track.midi_track,
+                midi_tracks: track.midi.iter().collect(),
                 // **繋ぎ方と音量は音源の有無と無関係。** 空のトラックのぶんも残す
                 // (繋ぎ替えてから音源を外しても、繋ぎ方は保たれる)
                 sends: track.sends.clone(),
@@ -311,7 +311,8 @@ impl App {
         // **繋ぎ方と音量はファイルのものを使う。** 検証は読み込みで済んでいる
         for (index, track) in tracks.iter().enumerate().take(graph::AUDIO_TRACKS) {
             let slot = &mut self.audio_tracks[index];
-            slot.midi_track = track.midi_track;
+            // 本数は読み込みの検証で見てあるので、ここへ入りきらないものは来ない
+            slot.midi = graph::MidiSources::from_slice(&track.midi_tracks).0;
             slot.sends = track.sends.clone();
             slot.gain_db = linear_to_db(track.gain);
             slot.pan = track.pan;
@@ -348,8 +349,8 @@ impl App {
                 }
             }
             // MIDI の割り当てをオーディオスレッドへ伝える
-            let midi_track = self.audio_tracks[index].midi_track;
-            self.set_midi_track(index, midi_track);
+            let midi = self.audio_tracks[index].midi;
+            self.set_midi_sources(index, midi);
         }
         failures
     }

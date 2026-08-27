@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
     tracks[1] = project::AudioTrackSnapshot {
         nodes: vec![snapshot],
-        midi_track: Some(0),
+        midi_tracks: vec![0],
         sends: vec![project::MASTER],
         ..Default::default()
     };

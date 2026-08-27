@@ -122,10 +122,14 @@ pub enum GuiMsg {
         addr: NodeAddr,
         bypassed: bool,
     },
-    /// そのトラックが MIDI を取る打ち込みトラック (`None` は未割り当て)
-    SetMidiTrack {
+    /// そのトラックが MIDI を取る打ち込みトラック (空は未割り当て)。
+    ///
+    /// **丸ごと差し替える。** 足す/外すを送ると、取りこぼしたときに画面と
+    /// オーディオスレッドで食い違ったまま戻らなくなる。
+    /// [`graph::MidiSources`] は `Copy` なので確保も解放も起きない。
+    SetMidiSources {
         track: usize,
-        midi_track: Option<usize>,
+        midi: graph::MidiSources,
     },
     /// 繋ぎ方・音量・パン・ミュート/ソロを丸ごと差し替える。
     ///
@@ -265,7 +269,10 @@ impl TrackProcessor {
     /// オーディオスレッドでノードを足すので、器を先に取っておく必要がある。
     pub fn empty(capacity: usize) -> Self {
         Self {
-            events: BlockEvents::with_capacity(128),
+            // 1トラックが受けられる打ち込みは
+            // [`MAX_MIDI_SOURCES`](graph::MAX_MIDI_SOURCES) 本まで。
+            // 打ち込み1本ぶんの見積り (128) をその本数ぶん取っておく
+            events: BlockEvents::with_capacity(128 * graph::MAX_MIDI_SOURCES),
             nodes: Vec::with_capacity(capacity),
             bypass_scratch: Vec::new(),
         }
@@ -767,9 +774,7 @@ impl StreamAudioProcessor {
                 GuiMsg::SetBypassed { addr, bypassed } => {
                     self.graph.set_bypassed(addr.track, addr.at, bypassed)
                 }
-                GuiMsg::SetMidiTrack { track, midi_track } => {
-                    self.graph.set_midi_track(track, midi_track)
-                }
+                GuiMsg::SetMidiSources { track, midi } => self.graph.set_midi_sources(track, midi),
                 // 丸ごと差し替える。組み立て済みなので検査は要らない
                 GuiMsg::SetMixer(mixer) => self.graph.set_mixer(mixer),
             }

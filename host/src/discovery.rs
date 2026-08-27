@@ -206,7 +206,7 @@ pub fn load_clap_file(path: &Path) -> Result<(PluginEntry, Vec<FoundPlugin>), Bo
             Some(FoundPlugin {
                 id,
                 name,
-                role: clap_role(&descriptor),
+                role: clap_role(descriptor),
                 vendor: text(descriptor.vendor()),
                 version: text(descriptor.version()),
             })

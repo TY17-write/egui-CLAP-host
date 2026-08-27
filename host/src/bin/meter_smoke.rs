@@ -151,7 +151,7 @@ fn measure_plugin(plugin_path: &str) -> Result<Plugin, Box<dyn Error>> {
     let node = activate_node(&mut instance, &stream_config)?;
     let mut graph = Graph::new();
     let audio_track = graph::audio_track_for(0).expect("1本なら収まる");
-    graph.place_chain(audio_track, Some(0), vec![node]);
+    graph.place_chain(audio_track, graph::MidiSources::one(0), vec![node]);
 
     // 4秒ぶん鳴らしっぱなしにする (Short-term の窓が埋まるまで)
     let mut editor = MidiEditor::default(); // 120bpm → 四分音符 0.5秒

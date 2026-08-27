@@ -58,7 +58,7 @@ impl StreamAudioConfig {
             .min_sample_rate()
             .max(SampleRate(44_100))
             .min(best.max_sample_rate());
-        let config = best.clone().with_sample_rate(sample_rate);
+        let config = best.with_sample_rate(sample_rate);
         let (min_buffer_size, max_likely_buffer_size) = buffer_size_range(&config);
 
         Ok(Self {

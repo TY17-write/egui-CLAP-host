@@ -11,8 +11,9 @@
 //!
 //! - **0番はマスター** ([`MASTER`])。ここの出力がそのまま最終出力になる
 //! - **0番は送り側にならない。** マスターから他へ送れないので、0 を含む輪は作れない
-//! - 打ち込みトラックとの対応は [`AudioTrack::midi_track`]。**多対1** になりうる
-//!   (同じ打ち込みを複数の音源で重ねる)
+//! - 打ち込みトラックとの対応は [`AudioTrack::midi`]。**多対多**になりうる。
+//!   1つの打ち込みを複数の音源で重ねられ、逆に1つの音源が複数の打ち込みを
+//!   受けられる (ドラムをキックとハイハットで分けて書く、など)
 //!
 //! 本数は固定。増減しないので**添字がそのまま識別子**になり、消したときに
 //! 番号がずれる問題が起きない。
@@ -36,9 +37,10 @@ pub const MASTER: usize = 0;
 
 /// 打ち込みトラックに対応するオーディオトラックの番号。
 ///
-/// **0 がマスターなので1つずらす。** 画面から作れるトラックがまだ
-/// 「打ち込み1本につき音源1つ」なので、この対応で足りている
-/// (任意に繋ぎ替えられるようにするのはフェーズ4)。
+/// **0 がマスターなので1つずらす。** これは**既定の対応**でしかない。
+/// 画面からは任意に繋ぎ替えられ、1本の音源が複数の打ち込みを受けることもできる
+/// ([`AudioTrack::midi`])。ここを使うのは、割り当ての指定が無いときに
+/// 埋める場面 (古いプロジェクトの移行、検証バイナリ) に限る。
 ///
 /// **16本に収まらなければ `None`。** 打ち込みトラック数に上限が無いので、
 /// 音を出せる系統より多く作れてしまう。
@@ -50,6 +52,117 @@ pub fn audio_track_for(midi_track: usize) -> Option<usize> {
 /// [`audio_track_for`] の逆。**マスターには打ち込みトラックが無い**ので `None`。
 pub fn midi_track_for(audio_track: usize) -> Option<usize> {
     (audio_track > MASTER && audio_track < AUDIO_TRACKS).then(|| audio_track - 1)
+}
+
+/// 1本のオーディオトラックが受けられる打ち込みトラックの本数。
+///
+/// ドラムをキック・スネア・ハイハット…と別の打ち込みに分け、音源は1つで
+/// 受ける使い方を想定した本数。
+pub const MAX_MIDI_SOURCES: usize = 8;
+
+/// オーディオトラックが MIDI を取る打ち込みトラックの集合。
+///
+/// **固定長で持つ。** オーディオスレッドで触るので確保させない。`Copy` なので
+/// リングバッファへそのまま載せられる。
+///
+/// **昇順・重複なし。** 順序が決まっていれば配る順も毎回同じになり、
+/// 同着のイベントの並びが再生のたびに変わることがない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MidiSources {
+    tracks: [usize; MAX_MIDI_SOURCES],
+    len: usize,
+}
+
+impl MidiSources {
+    /// 1本だけ割り当てた集合
+    pub fn one(track: usize) -> Self {
+        let mut sources = Self::default();
+        sources.insert(track);
+        sources
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// これ以上足せないか
+    pub fn is_full(&self) -> bool {
+        self.len >= MAX_MIDI_SOURCES
+    }
+
+    pub fn contains(&self, track: usize) -> bool {
+        self.tracks[..self.len].contains(&track)
+    }
+
+    /// 昇順に見る
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.tracks[..self.len].iter().copied()
+    }
+
+    /// 足す。すでにある・いっぱいなら `false`
+    pub fn insert(&mut self, track: usize) -> bool {
+        if self.contains(track) || self.is_full() {
+            return false;
+        }
+        // 昇順を保つ位置へ差し込む
+        let at = self.tracks[..self.len]
+            .iter()
+            .position(|&have| have > track)
+            .unwrap_or(self.len);
+        self.tracks.copy_within(at..self.len, at + 1);
+        self.tracks[at] = track;
+        self.len += 1;
+        true
+    }
+
+    /// 外す。無ければ `false`
+    pub fn remove(&mut self, track: usize) -> bool {
+        let Some(at) = self.tracks[..self.len]
+            .iter()
+            .position(|&have| have == track)
+        else {
+            return false;
+        };
+        self.tracks.copy_within(at + 1..self.len, at);
+        self.len -= 1;
+        true
+    }
+
+    /// あれば外し、無ければ足す。**いっぱいで足せなかったときは `false`**
+    pub fn toggle(&mut self, track: usize) -> bool {
+        if self.remove(track) {
+            true
+        } else {
+            self.insert(track)
+        }
+    }
+
+    /// 並びから作る。**入りきらなかった本数も返す** (黙って捨てない)
+    pub fn from_slice(tracks: &[usize]) -> (Self, usize) {
+        let mut sources = Self::default();
+        let mut dropped = 0;
+        for track in tracks {
+            if !sources.insert(*track) && !sources.contains(*track) {
+                dropped += 1;
+            }
+        }
+        (sources, dropped)
+    }
+}
+
+/// **値で回せること**が要る。オーディオスレッドの配り込みでは、集合を見ながら
+/// トラックを書き換えるので、借りたまま回すと通らない。`Copy` なので写しは安い。
+impl IntoIterator for MidiSources {
+    type Item = usize;
+    type IntoIter = std::iter::Take<std::array::IntoIter<usize, MAX_MIDI_SOURCES>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tracks.into_iter().take(self.len)
+    }
 }
 
 /// グラフの中を流れるチャンネル数。**デバイスとは独立**
@@ -65,8 +178,8 @@ pub const MAX_NODES: usize = 16;
 pub struct AudioTrack {
     /// 載っている音源とエフェクトの列。**空でも器はある** (ノードを足す先として)
     pub processor: Box<TrackProcessor>,
-    /// MIDI をどの打ち込みトラックから取るか。`None` は未割り当て
-    pub midi_track: Option<usize>,
+    /// MIDI をどの打ち込みトラックから取るか。空は未割り当て
+    pub midi: MidiSources,
 }
 
 impl AudioTrack {
@@ -74,7 +187,7 @@ impl AudioTrack {
     fn new() -> Self {
         Self {
             processor: Box::new(TrackProcessor::empty(MAX_NODES)),
-            midi_track: None,
+            midi: MidiSources::default(),
         }
     }
 }
@@ -461,9 +574,9 @@ impl Graph {
     }
 
     /// どの打ち込みトラックから MIDI を取るかを決める
-    pub fn set_midi_track(&mut self, index: usize, midi_track: Option<usize>) {
+    pub fn set_midi_sources(&mut self, index: usize, midi: MidiSources) {
         if let Some(slot) = self.tracks.get_mut(index) {
-            slot.midi_track = midi_track;
+            slot.midi = midi;
         }
     }
 
@@ -501,11 +614,11 @@ impl Graph {
     /// **メインスレッド専用** (確保が起きうる)。書き出しのために借りたものを
     /// 組み直すときと、検証バイナリが使う。再生中の載せ替えは
     /// [`set_node`](Self::set_node) のほう。
-    pub fn place_chain(&mut self, index: usize, midi_track: Option<usize>, nodes: Vec<Node>) {
+    pub fn place_chain(&mut self, index: usize, midi: MidiSources, nodes: Vec<Node>) {
         let Some(slot) = self.tracks.get_mut(index) else {
             return;
         };
-        slot.midi_track = midi_track;
+        slot.midi = midi;
         let _ = slot.processor.take_nodes();
         for node in nodes {
             slot.processor.push_node(node);
@@ -548,6 +661,10 @@ impl Graph {
     /// カーソルを進めるので、**同じ打ち込みに2度聞くと2度目は空になる**。
     /// そこで打ち込み1本につき1回だけ取り出し、受け皿から配る。
     ///
+    /// **1本のトラックが複数の打ち込みを受けるときは継ぎ足さずに溶かし込む**
+    /// ([`BlockEvents::merge`])。CLAP も VST3 もイベントは時刻順で渡す前提なので、
+    /// 2本目をそのまま後ろへ付けると並びが崩れる。
+    ///
     /// 再生・書き出し・検証バイナリのすべてがここを通る
     /// (配り方が食い違うと、経路によって鳴る音が変わる)。
     ///
@@ -565,28 +682,23 @@ impl Graph {
         } = self;
 
         for index in 0..AUDIO_TRACKS {
-            let Some(midi_track) = tracks[index].midi_track else {
-                continue;
-            };
-            // 同じ打ち込みを見ているトラックが先にあれば、そこで配り済み
-            let first = (0..index).all(|earlier| tracks[earlier].midi_track != Some(midi_track));
-            if !first {
-                continue;
-            }
-
-            emit_scratch.clear();
-            transport.emit_track(midi_track, plan, emit_scratch);
-            if emit_scratch.is_empty() {
-                continue;
-            }
-
-            for target in tracks.iter_mut().skip(index) {
-                if target.midi_track != Some(midi_track) {
+            for midi_track in tracks[index].midi {
+                // 同じ打ち込みを見ているトラックが先にあれば、そこで配り済み
+                let first = (0..index).all(|earlier| !tracks[earlier].midi.contains(midi_track));
+                if !first {
                     continue;
                 }
-                let events = target.processor.events_mut();
-                for event in emit_scratch.iter() {
-                    events.push(*event);
+
+                emit_scratch.clear();
+                transport.emit_track(midi_track, plan, emit_scratch);
+                if emit_scratch.is_empty() {
+                    continue;
+                }
+
+                for target in tracks.iter_mut().skip(index) {
+                    if target.midi.contains(midi_track) {
+                        target.processor.events_mut().merge(emit_scratch);
+                    }
                 }
             }
         }
@@ -951,7 +1063,7 @@ mod tests {
     /// **MIDI の割り当てどおりに配ること。**
     ///
     /// 実際にここで音が出なくなった: 割り当てがオーディオスレッドへ届いておらず、
-    /// 画面には「トラック1」と出ているのに `midi_track` は `None` のままだった。
+    /// 画面には「トラック1」と出ているのにエンジン側は未割り当てのままだった。
     /// 割り当てが無いトラックへイベントが行かないことを、ここで縛っておく。
     #[test]
     fn events_go_to_the_assigned_midi_track_only() {
@@ -974,8 +1086,8 @@ mod tests {
         let _ = transport.handle_msg(TransportMsg::Play);
 
         let mut graph = Graph::new();
-        graph.set_midi_track(1, Some(0)); // 打ち込み0 を鳴らす
-        graph.set_midi_track(2, None); // 未割り当て
+        graph.set_midi_sources(1, MidiSources::one(0)); // 打ち込み0 を鳴らす
+        graph.set_midi_sources(2, MidiSources::default()); // 未割り当て
 
         let plan = transport.plan_block(512);
         graph.clear_events();
@@ -1013,8 +1125,8 @@ mod tests {
         let _ = transport.handle_msg(TransportMsg::Play);
 
         let mut graph = Graph::new();
-        graph.set_midi_track(1, Some(3));
-        graph.set_midi_track(5, Some(3));
+        graph.set_midi_sources(1, MidiSources::one(3));
+        graph.set_midi_sources(5, MidiSources::one(3));
 
         let plan = transport.plan_block(512);
         graph.clear_events();
@@ -1022,6 +1134,141 @@ mod tests {
 
         assert!(!graph.events_mut(1).unwrap().is_empty());
         assert!(!graph.events_mut(5).unwrap().is_empty());
+    }
+
+    /// **1本のトラックが複数の打ち込みを受けられること。**
+    ///
+    /// ドラムをキックとハイハットで別の打ち込みに書き、音源は1つで受ける使い方。
+    /// 見るのは届くことだけでなく、**時刻順に混ざること**まで。継ぎ足しで
+    /// 済ませると 0, 256, 128, 384 と並び、CLAP も VST3 もイベントは時刻順で
+    /// 渡す前提なので音に出る。
+    #[test]
+    fn one_audio_track_can_receive_several_midi_tracks() {
+        use crate::audio::transport::{Transport, TransportMsg, TransportShared};
+        use crate::sequencer::{SeqEvent, SeqEventKind};
+
+        let hit = |sample_time: u64, key: u8| SeqEvent {
+            sample_time,
+            kind: SeqEventKind::NoteOn { key, velocity: 1.0 },
+        };
+
+        let mut transport = Transport::new(TransportShared::new());
+        // キック: 0 と 256
+        let _ = transport.handle_msg(TransportMsg::SetSequence {
+            track: 0,
+            events: vec![hit(0, 36), hit(256, 36)].into_boxed_slice(),
+            end_sample: 4096,
+        });
+        // ハイハット: 128 と 384 (キックの合間に入る)
+        let _ = transport.handle_msg(TransportMsg::SetSequence {
+            track: 1,
+            events: vec![hit(128, 42), hit(384, 42)].into_boxed_slice(),
+            end_sample: 4096,
+        });
+        let _ = transport.handle_msg(TransportMsg::Play);
+
+        let mut midi = MidiSources::default();
+        midi.insert(0);
+        midi.insert(1);
+
+        let mut graph = Graph::new();
+        graph.set_midi_sources(1, midi);
+
+        let plan = transport.plan_block(512);
+        graph.clear_events();
+        graph.emit_from(&mut transport, &plan);
+
+        use crate::audio::events::BlockEvent;
+        let events = graph.events_mut(1).unwrap();
+        let heard: Vec<(u32, u8)> = events
+            .iter()
+            .filter_map(|event| match event {
+                BlockEvent::NoteOn { offset, key, .. } => Some((*offset, *key)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            heard,
+            vec![(0, 36), (128, 42), (256, 36), (384, 42)],
+            "2本が時刻順に混ざること"
+        );
+    }
+
+    /// 複数の打ち込みを受けていても、**1本ぶんを2度取り出さないこと**。
+    ///
+    /// [`Transport::emit_track`] は取り出しながらカーソルを進めるので、
+    /// 同じ打ち込みに2度聞くと2度目は空になる。重ねて割り当てたトラックが
+    /// 先にあると、後ろのトラックが取りこぼす形で出る。
+    #[test]
+    fn a_shared_midi_track_is_taken_once_and_reaches_everyone() {
+        use crate::audio::transport::{Transport, TransportMsg, TransportShared};
+        use crate::sequencer::{SeqEvent, SeqEventKind};
+
+        let mut transport = Transport::new(TransportShared::new());
+        for track in [0, 1] {
+            let _ = transport.handle_msg(TransportMsg::SetSequence {
+                track,
+                events: vec![SeqEvent {
+                    sample_time: 64,
+                    kind: SeqEventKind::NoteOn {
+                        key: 60 + track as u8,
+                        velocity: 1.0,
+                    },
+                }]
+                .into_boxed_slice(),
+                end_sample: 4096,
+            });
+        }
+        let _ = transport.handle_msg(TransportMsg::Play);
+
+        // トラック1 は両方を受け、トラック2 は打ち込み0 だけを受ける
+        let mut both = MidiSources::default();
+        both.insert(0);
+        both.insert(1);
+
+        let mut graph = Graph::new();
+        graph.set_midi_sources(1, both);
+        graph.set_midi_sources(2, MidiSources::one(0));
+
+        let plan = transport.plan_block(512);
+        graph.clear_events();
+        graph.emit_from(&mut transport, &plan);
+
+        assert_eq!(graph.events_mut(1).unwrap().len(), 2, "2本ぶん届くこと");
+        assert_eq!(
+            graph.events_mut(2).unwrap().len(),
+            1,
+            "共有した打ち込みを取りこぼさないこと"
+        );
+    }
+
+    /// 昇順・重複なしで持ち、いっぱいになったら足さないこと
+    #[test]
+    fn midi_sources_stay_sorted_and_unique() {
+        let mut midi = MidiSources::default();
+        assert!(midi.insert(5));
+        assert!(midi.insert(1));
+        assert!(midi.insert(3));
+        assert!(!midi.insert(3), "重複は足さない");
+        assert_eq!(midi.iter().collect::<Vec<_>>(), vec![1, 3, 5], "昇順で持つ");
+
+        assert!(midi.remove(3));
+        assert!(!midi.remove(3));
+        assert_eq!(midi.iter().collect::<Vec<_>>(), vec![1, 5]);
+
+        for track in 10..10 + MAX_MIDI_SOURCES {
+            midi.insert(track);
+        }
+        assert_eq!(midi.len(), MAX_MIDI_SOURCES);
+        assert!(midi.is_full());
+        assert!(!midi.insert(99), "いっぱいなら足さない");
+
+        // 入りきらなかったぶんを数えること (黙って捨てない)
+        let over: Vec<usize> = (0..MAX_MIDI_SOURCES + 3).collect();
+        let (sources, dropped) = MidiSources::from_slice(&over);
+        assert_eq!(sources.len(), MAX_MIDI_SOURCES);
+        assert_eq!(dropped, 3);
     }
 
     /// NaN や負の音量を通さないこと (以降のブロックすべてに波及する)

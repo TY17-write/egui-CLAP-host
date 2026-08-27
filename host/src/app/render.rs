@@ -114,11 +114,12 @@ impl App {
             }
         }
         for (track, chain) in chains.into_iter().enumerate() {
-            let midi_track = self
+            let midi = self
                 .audio_tracks
                 .get(track)
-                .and_then(|slot| slot.midi_track);
-            graph.place_chain(track, midi_track, chain);
+                .map(|slot| slot.midi)
+                .unwrap_or_default();
+            graph.place_chain(track, midi, chain);
         }
         let rendered = audio::offline::render(&mut graph, setup);
         let mut processors = graph.take_nodes();
@@ -292,7 +293,7 @@ impl App {
         // (常にステレオ) をそのまま符号化するので、デバイスが何チャンネルでも
         // Opus に載る。以前はここでデバイスを見ており、3ch 以上のデバイスでは
         // ステレオしか書かないのに断っていた。
-        debug_assert!(graph::BUS_CHANNELS <= 2, "Opus はステレオまで");
+        const { assert!(graph::BUS_CHANNELS <= 2, "Opus はステレオまで") };
 
         // 時間のかかる処理に入る前に保存先を聞く
         let Some(path) = self.ask_save_path("Opus ファイル", "opus", "mix.opus") else {

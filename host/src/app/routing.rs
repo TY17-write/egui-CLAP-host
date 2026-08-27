@@ -155,21 +155,19 @@ impl App {
     pub(super) fn push_engine_state(&mut self) {
         self.ensure_audio_tracks();
         let mixer = self.mixer();
-        let assignments: Vec<(usize, Option<usize>)> = self
+        let assignments: Vec<(usize, graph::MidiSources)> = self
             .audio_tracks
             .iter()
             .enumerate()
-            .map(|(track, slot)| (track, slot.midi_track))
+            .map(|(track, slot)| (track, slot.midi))
             .collect();
 
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
         let _ = engine.producer.push(GuiMsg::SetMixer(mixer));
-        for (track, midi_track) in assignments {
-            let _ = engine
-                .producer
-                .push(GuiMsg::SetMidiTrack { track, midi_track });
+        for (track, midi) in assignments {
+            let _ = engine.producer.push(GuiMsg::SetMidiSources { track, midi });
         }
     }
 
@@ -177,13 +175,20 @@ impl App {
     ///
     /// **返さないと音が出なくなる。** 途中で諦めるときも必ず通ること。
     pub(super) fn return_processors(&mut self, nodes: Vec<(audio::NodeAddr, audio::Node)>) {
+        // **今の割り当てを送り直す。** 既定の対応で埋めると、打ち込みを
+        // 繋ぎ替えているプロジェクトでは書き出しのたびにオーディオスレッド側だけが
+        // 既定へ戻る (画面には元の割り当てが出たまま鳴らなくなる)
+        self.ensure_audio_tracks();
+        let assignments: Vec<graph::MidiSources> =
+            self.audio_tracks.iter().map(|slot| slot.midi).collect();
+
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
         for (addr, node) in nodes {
-            let _ = engine.producer.push(GuiMsg::SetMidiTrack {
+            let _ = engine.producer.push(GuiMsg::SetMidiSources {
                 track: addr.track,
-                midi_track: graph::midi_track_for(addr.track),
+                midi: assignments.get(addr.track).copied().unwrap_or_default(),
             });
             let _ = engine.producer.push(GuiMsg::SetNode {
                 addr,
@@ -287,18 +292,31 @@ impl App {
     }
 
     /// どの打ち込みトラックから MIDI を取るかを決める
-    pub(super) fn set_midi_track(&mut self, track: usize, midi_track: Option<usize>) {
+    pub(super) fn set_midi_sources(&mut self, track: usize, midi: graph::MidiSources) {
         let Some(slot) = self.audio_tracks.get_mut(track) else {
             return;
         };
-        slot.midi_track = midi_track;
+        slot.midi = midi;
         if let Some(engine) = self.engine.as_mut() {
-            let _ = engine
-                .producer
-                .push(GuiMsg::SetMidiTrack { track, midi_track });
+            let _ = engine.producer.push(GuiMsg::SetMidiSources { track, midi });
         }
         // 割り当てが変わったらシーケンスを送り直す
         self.editor.dirty = true;
+    }
+
+    /// 打ち込み1本の割り当てを入れ切りする。
+    ///
+    /// **いっぱいで足せなかったときは `false`。** 呼び出し側が知らせる
+    pub(super) fn toggle_midi_source(&mut self, track: usize, midi_track: usize) -> bool {
+        let Some(slot) = self.audio_tracks.get(track) else {
+            return false;
+        };
+        let mut midi = slot.midi;
+        if !midi.toggle(midi_track) {
+            return false;
+        }
+        self.set_midi_sources(track, midi);
+        true
     }
 }
 

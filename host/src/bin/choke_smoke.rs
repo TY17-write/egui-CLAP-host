@@ -245,7 +245,9 @@ fn bypass_pass(entry: &PluginEntry, plugin_id: &str) -> Result<Vec<String>, Box<
             BYPASS_AT => processor.set_bypassed(0, true),
             UNBYPASS_AT => processor.set_bypassed(0, false),
             STOP_AT => {
-                if transport.handle_msg(TransportMsg::Stop) {
+                // 本体と同じ扱い: 停止で状態が変われば消音を積む
+                let stopped = transport.handle_msg(TransportMsg::Stop);
+                if stopped {
                     transport::push_choke(processor.events_mut(), 0);
                 }
             }

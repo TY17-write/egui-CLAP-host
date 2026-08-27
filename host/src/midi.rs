@@ -247,6 +247,13 @@ fn suppress_redundant_cc_releases(events: &mut Vec<(u32, u8, TrackEventKind)>) {
     events.retain(|_| keep.next().unwrap_or(true));
 }
 
+/// 段番号が決まるまで持ち越す CC 1トラックぶん。
+///
+/// **(アプリのトラック, 名前から分かる段, CC 番号ごとのイベント)**。
+/// CC 段は音符段より下に並べるので、そのトラックの音符段が確定するまで
+/// 段番号を振れない。
+type PendingCc = (usize, Option<usize>, BTreeMap<u8, Vec<(u32, u8)>>);
+
 /// SMF のバイト列を読み込む。段は重ならないように割り振る。
 pub fn from_bytes(bytes: &[u8], scale: ScaleMode) -> Result<Imported, String> {
     let smf = Smf::parse(bytes).map_err(|e| format!("MIDI を読めませんでした: {e}"))?;
@@ -354,8 +361,7 @@ pub fn from_bytes(bytes: &[u8], scale: ScaleMode) -> Result<Imported, String> {
     // CC の復元は、そのトラックの音符段が決まってからでないと段番号を振れない
     // (CC 段は音符段より下に並べる)。ここでは「どの SMF トラックが
     // アプリのどのトラックへ行ったか」を控えておく。
-    // (アプリのトラック, 名前から分かる段, CC 番号ごとのイベント)
-    let mut pending_ccs: Vec<(usize, Option<usize>, BTreeMap<u8, Vec<(u32, u8)>>)> = Vec::new();
+    let mut pending_ccs: Vec<PendingCc> = Vec::new();
     // ファイル全体の終端。閉じていない CC ブロックをここで切る
     let end_tick = parsed_tracks
         .iter()

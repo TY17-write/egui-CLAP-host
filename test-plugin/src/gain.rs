@@ -172,22 +172,22 @@ impl<'a> PluginAudioProcessor<'a, TestGainShared, TestGainMainThread<'a>>
                 match pair {
                     // ホストが入出力に別のバッファを渡してきた場合
                     ChannelPair::InputOutput(input, output) => {
-                        let output = &mut output[range.clone()];
-                        let input = &input[range.clone()];
+                        let output = &mut output[range];
+                        let input = &input[range];
                         for (out, inp) in output.iter_mut().zip(input) {
                             *out = *inp * gain + offset;
                         }
                     }
                     // 同じバッファを入出力に使う場合
                     ChannelPair::InPlace(buffer) => {
-                        for sample in &mut buffer[range.clone()] {
+                        for sample in &mut buffer[range] {
                             *sample = *sample * gain + offset;
                         }
                     }
                     // 入力が繋がっていない。直流だけ出す
                     // (センド先として、音源なしで鳴らせるかを見るため)
                     ChannelPair::OutputOnly(output) => {
-                        output[range.clone()].fill(offset);
+                        output[range].fill(offset);
                     }
                     // 出力が無いので書く先がない
                     ChannelPair::InputOnly(_) => {}

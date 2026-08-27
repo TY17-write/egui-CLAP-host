@@ -21,17 +21,17 @@ pub struct ParamEntry {
 
 /// プラグインの全パラメータを列挙する。params 拡張がなければ空を返す。
 pub fn read_params(instance: &mut PluginInstance<MiniHost>) -> Vec<ParamEntry> {
-    let mut handle = instance.plugin_handle();
+    let handle = instance.plugin_handle();
     let Some(params_ext) = handle.get_extension::<PluginParams>() else {
         return vec![];
     };
 
     let mut buffer = ParamInfoBuffer::new();
-    let count = params_ext.count(&mut handle);
+    let count = params_ext.count(&handle);
     let mut result = Vec::with_capacity(count as usize);
 
     for index in 0..count {
-        let Some(info) = params_ext.get_info(&mut handle, index, &mut buffer) else {
+        let Some(info) = params_ext.get_info(&handle, index, &mut buffer) else {
             continue;
         };
 
@@ -47,7 +47,7 @@ pub fn read_params(instance: &mut PluginInstance<MiniHost>) -> Vec<ParamEntry> {
         let default = info.default_value;
         let is_stepped = info.flags.contains(ParamInfoFlags::IS_STEPPED);
 
-        let value = params_ext.get_value(&mut handle, id).unwrap_or(default);
+        let value = params_ext.get_value(&handle, id).unwrap_or(default);
 
         result.push(ParamEntry {
             id,

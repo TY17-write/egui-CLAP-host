@@ -283,7 +283,7 @@ impl Library {
     /// 名前で並べ替える (走査した順のままだと探しにくい)
     pub fn sort(&mut self) {
         self.plugins
-            .sort_by(|a, b| a.label().to_lowercase().cmp(&b.label().to_lowercase()));
+            .sort_by_key(|plugin| plugin.label().to_lowercase());
     }
 }
 

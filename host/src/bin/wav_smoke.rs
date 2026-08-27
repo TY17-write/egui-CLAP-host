@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut instance = instantiate(&entry, &target.id)?;
         let node = activate_node(&mut instance, &stream_config)?;
         let audio_track = graph::audio_track_for(midi_track).expect("2本なら収まる");
-        graph.place_chain(audio_track, Some(midi_track), vec![node]);
+        graph.place_chain(audio_track, graph::MidiSources::one(midi_track), vec![node]);
         instances.push(instance);
     }
 

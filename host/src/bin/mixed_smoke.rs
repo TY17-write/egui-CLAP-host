@@ -24,7 +24,7 @@
 
 use clack_host::prelude::*;
 use egui_clap_host::audio::config::StreamAudioConfig;
-use egui_clap_host::audio::graph::Graph;
+use egui_clap_host::audio::graph::{Graph, MidiSources};
 use egui_clap_host::audio::offline::{self, RenderSetup};
 use egui_clap_host::audio::transport::{Transport, TransportMsg, TransportShared};
 use egui_clap_host::audio::{self};
@@ -94,8 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // オーディオトラックは 0 がマスターなので、打ち込み 0/1 は 1/2 に載る
     let mut graph = Graph::new();
-    graph.place_chain(1, Some(0), vec![clap_node]);
-    graph.place_chain(2, Some(1), vec![vst3_node]);
+    graph.place_chain(1, MidiSources::one(0), vec![clap_node]);
+    graph.place_chain(2, MidiSources::one(1), vec![vst3_node]);
 
     // ---- シーケンス ----
     // 0〜1拍: CLAP だけ / 1〜2拍: 両方 / 2〜3拍: VST3 だけ / 3〜4拍: 休み

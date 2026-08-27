@@ -47,7 +47,7 @@ cargo run -p egui-clap-host --bin choke_smoke -- target\test_plugin.clap # 停�
 cargo run -p egui-clap-host --bin state_smoke -- target\test_plugin.clap # 音作りの保存・復元の検証
 cargo run -p egui-clap-host --bin gain_smoke -- target\test_plugin.clap  # 検証用エフェクトの挙動確認
 cargo run -p egui-clap-host --bin chain_smoke -- target\test_plugin.clap # 音源→エフェクトのチェーンの検証
-cargo run -p egui-clap-host --bin route_smoke -- target\test_plugin.clap # トラック間のルーティングの検証
+cargo run -p egui-clap-host --bin route_smoke -- target\test_plugin.clap # トラック間のルーティングと MIDI 割り当ての検証
 cargo run -p egui-clap-host --bin loop_smoke -- target\test_plugin.clap  # ループの折り返しの検証
 cargo run -p egui-clap-host --bin meter_smoke -- target\test_plugin.clap # ラウドネス・スペクトルの検証
 
@@ -149,6 +149,11 @@ CMake 4.4.2 / VS Build Tools 2022 で通っている (2026-08-17 時点)。
    押すと詳細が開くので、そこで「＋ 音源 / エフェクトを足す」→ **MIDI** の欄で
    打ち込みトラックを選ぶ。**起動直後はどこも未割り当て**なので、割り当てるまで
    打ち込みトラック欄の「♪」は赤いままになる。
+
+   **MIDI の欄は番号のボタンが並び、複数押せる。** 押されているものが、その音源へ
+   流れる打ち込み。ドラムをキック・スネア・ハイハットと別の打ち込みに書いて、
+   音源1つで受ける、という使い方ができる (逆に、同じ打ち込みを複数の音源に
+   割り当てて重ねることもできる)。1本の音源が受けられるのは**8本まで**。
 
    音源を選ぶときは先に形式を決める (それに合ったダイアログが開く)。
 
@@ -391,7 +396,7 @@ MIDI に「CC 無し」という状態は無く、コントローラは次の値
 
 ```ron
 (
-    version: 3,
+    version: 4,
     tempo: 96,
     beats: 3,
     beat_type: 4,
@@ -555,7 +560,7 @@ cargo run -p egui-clap-host --bin egui-clap-host
     audio_tracks: [
         // 0 はマスター。送り先を持たず、ここの出力が最終出力になる
         (name: "", midi_track: None, sends: [], nodes: []),
-        (name: "", midi_track: Some(0), sends: [(to: 0)], nodes: [
+        (name: "", midi_tracks: [0], sends: [(to: 0)], nodes: [
             (kind: Clap, path: "C:\\...\\音源.clap",
              id: "com.example.synth", state: "AAECAwQFBgcICQoL..."),
         ]),
@@ -566,8 +571,10 @@ cargo run -p egui-clap-host --bin egui-clap-host
 - **`nodes` は上から順に通す列。** 音源とエフェクトを区別しない
   (違いは入力ポートを持つかどうかだけ)。**画面から積めるのはまだ1段**で、
   2段以上あるファイルは先頭だけ載せて残りを通知に出す
-- **`midi_track` がどの打ち込みトラックから MIDI を取るかを決める。**
-  同じ打ち込みを複数のオーディオトラックが見てもよい (重ねられる)
+- **`midi_tracks` がどの打ち込みトラックから MIDI を取るかを決める。**
+  対応は多対多で、同じ打ち込みを複数のオーディオトラックが見てもよく (重ねられる)、
+  1本のオーディオトラックが複数の打ち込みを受けてもよい (ドラムの叩き分けなど)。
+  受けられるのは**8本まで**で、超えたファイルは読み込みで断る
 - **`sends` は送り先。片側だけ書く。** 両側に書くと「A は→B と言い、B は何も
   言っていない」という矛盾したファイルが作れてしまう。
   1本を複数へ送れば枝分かれ (センド) になり、**送り先どうしで足し合わさる**。
@@ -576,9 +583,10 @@ cargo run -p egui-clap-host --bin egui-clap-host
   ので、バスへ送っているトラックをソロにしてもバスは鳴り続ける
 - **`gain` は線形。** 画面では dB (0 dB が等倍) で出しているが、ファイルと
   エンジンは線形で持ち、境目で変換する
-- **バージョン2 以前のファイルは自動で移る。** 打ち込みトラック `i` の音源が
+- **古いファイルは自動で移る。** バージョン2 以前は、打ち込みトラック `i` の音源が
   オーディオトラック `i + 1` の1段目になる (0 がマスターなので1つずれる)。
-  **16本に収まらないぶんは名指しで知らせる** (黙って捨てない)
+  **16本に収まらないぶんは名指しで知らせる** (黙って捨てない)。
+  バージョン3 の `midi_track` (1本まで) は `midi_tracks` へそのまま移る
 - **パスだけでなくプラグイン ID も持つ。** 1つの `.clap` に複数のプラグインが
   入りうるので、パスだけでは特定できない (VST3 はクラス UID)
 - **状態は音源自身に書き出させる** (CLAP は `clap.state`、VST3 は `IComponent::getState`)。
@@ -593,7 +601,8 @@ cargo run -p egui-clap-host --bin egui-clap-host
 (テンポや拍子の範囲、音価0、NaN、存在しないトラックへの参照など)。
 オーディオトラックについては、送り先の範囲・自分自身への送り・重複・
 マスターが送り側になっていないか・**繋ぎ方が輪になっていないか**を見る
-(輪を通すと再生時に無限に辿ることになる)。
+(輪を通すと再生時に無限に辿ることになる)。打ち込みの割り当て本数もここで見る
+(画面では上限まででしか選べないが、手で書いたファイルが入口になりうる)。
 知らないフィールドは無視し、欠けたフィールドは既定値で埋めるので、
 バージョン違いのビルドでも開ける。互換性の門は `version` 1本。
 

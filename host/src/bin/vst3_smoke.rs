@@ -13,7 +13,7 @@
 //! 使い方: cargo run -p egui-clap-host --bin vst3_smoke -- <path\to\plugin.vst3>
 
 use egui_clap_host::audio::config::StreamAudioConfig;
-use egui_clap_host::audio::graph::Graph;
+use egui_clap_host::audio::graph::{Graph, MidiSources};
 use egui_clap_host::audio::offline::{self, RenderSetup};
 use egui_clap_host::audio::transport::{self, Transport, TransportMsg, TransportShared};
 use egui_clap_host::audio::{self, ProcessError};
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 実時間の再生が通っても、こちらが通るとは限らない。
     // オーディオトラックは 0 がマスターなので、打ち込み0 は 1 に載る
     let mut graph = Graph::new();
-    graph.place_chain(1, Some(0), processor.take_nodes());
+    graph.place_chain(1, MidiSources::one(0), processor.take_nodes());
     let setup = RenderSetup {
         sequences: vec![editor
             .to_events_for_track(0, SAMPLE_RATE)

@@ -375,9 +375,19 @@ impl App {
         let mut remove = None;
         let mut moved = None;
         let mut bypass = None;
-        let mut midi_choice = None;
+        let mut midi_toggle = None;
         let mut gui_error = None;
         let mut open = true;
+
+        // 打ち込みトラックの名前 (窓の中では self を借りられないので先に取る)
+        let midi_names: Vec<String> = self
+            .editor
+            .editor
+            .tracks
+            .iter()
+            .take(midi_tracks)
+            .map(|info| info.name.clone())
+            .collect();
 
         // 一覧の左隣に出す (一覧は右上なので、重ならない位置)
         const DETAIL_W: f32 = 420.0;
@@ -397,39 +407,45 @@ impl App {
                 // ---- MIDI の割り当て ----
                 // マスターは音を受けるだけなので、打ち込みを割り当てても意味がない
                 if index != graph::MASTER {
+                    let current = self.audio_tracks[index].midi;
                     ui.horizontal(|ui| {
                         ui.label("MIDI:");
-                        let current = self.audio_tracks[index].midi_track;
-                        let label = match current {
-                            Some(track) => format!("トラック {}", track + 1),
-                            None => "未割り当て".to_string(),
-                        };
-                        egui::ComboBox::from_id_salt(("midi", index))
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(current.is_none(), "未割り当て")
-                                    .clicked()
-                                {
-                                    midi_choice = Some(None);
-                                }
-                                for track in 0..midi_tracks {
-                                    let selected = current == Some(track);
-                                    if ui
-                                        .selectable_label(
-                                            selected,
-                                            format!("トラック {}", track + 1),
-                                        )
-                                        .clicked()
-                                    {
-                                        midi_choice = Some(Some(track));
-                                    }
-                                }
-                            });
-                        if self.audio_tracks[index].midi_track.is_none() {
-                            ui.weak("(音源を鳴らすには割り当てが要ります)");
+                        if current.is_empty() {
+                            ui.weak("未割り当て (音源を鳴らすには割り当てが要ります)");
+                        } else {
+                            let names: Vec<&str> = current
+                                .iter()
+                                .map(|track| {
+                                    midi_names.get(track).map(String::as_str).unwrap_or("?")
+                                })
+                                .collect();
+                            ui.label(names.join(" / "));
                         }
                     });
+
+                    // **複数選べる。** ドラムをキックとハイハットで別の打ち込みに
+                    // 書き、音源1つで受ける、といった使い方のため
+                    ui.horizontal_wrapped(|ui| {
+                        for track in 0..midi_tracks {
+                            let selected = current.contains(track);
+                            // いっぱいのときは、外すほうだけ押せる
+                            let can_click = selected || !current.is_full();
+                            let button = ui.add_enabled(
+                                can_click,
+                                egui::SelectableLabel::new(selected, format!("{}", track + 1)),
+                            );
+                            let name = midi_names.get(track).map(String::as_str).unwrap_or("?");
+                            if button.on_hover_text(name).clicked() {
+                                midi_toggle = Some(track);
+                            }
+                        }
+                    });
+                    if current.is_full() {
+                        ui.weak(format!(
+                            "受けられるのは {} 本までです",
+                            graph::MAX_MIDI_SOURCES
+                        ));
+                    }
                     ui.separator();
                 }
 
@@ -555,8 +571,15 @@ impl App {
         if !open {
             self.detail_track = None;
         }
-        if let Some(choice) = midi_choice {
-            self.set_midi_track(index, choice);
+        if let Some(midi_track) = midi_toggle {
+            // ボタン側で止めてあるので、ここへは来ない想定。
+            // 黙って効かないより、理由が出るほうがよい
+            if !self.toggle_midi_source(index, midi_track) {
+                gui_error = Some(format!(
+                    "打ち込みを受けられるのは1トラックにつき {} 本までです",
+                    graph::MAX_MIDI_SOURCES
+                ));
+            }
         }
         if let Some((at, bypassed)) = bypass {
             self.set_bypassed(audio::NodeAddr { track: index, at }, bypassed);

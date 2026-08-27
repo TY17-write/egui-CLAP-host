@@ -213,7 +213,7 @@ pub(super) fn grid(
     let mut bar_number = 1u32;
     while q <= total_quarters {
         let x = to_x(q);
-        let is_bar = beat_index % state.editor.beats.max(1) == 0;
+        let is_bar = beat_index.is_multiple_of(state.editor.beats.max(1));
         let stroke = if is_bar { bar_stroke } else { beat_stroke };
         let top = if is_bar { origin.y } else { origin.y + RULER_H };
         painter.line_segment(
