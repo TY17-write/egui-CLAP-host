@@ -357,6 +357,10 @@ impl MidiEditor {
     /// 見えているので、ここでは扱わない。
     ///
     /// 端がちょうど接しているだけ (前の終端 = 次の頭) は重なりではない。
+    /// **[`OVERLAP_TOLERANCE`] までの食い込みも接しているとみなす** —
+    /// 連符などで音価が割り切れない値になると、`頭 + 音価` の計算が f32 の
+    /// 丸めでずれて、接しているだけのノートが僅かに食い込んで見えるため
+    /// (実際にプロジェクトの読み込み後に誤検出が出た)。
     pub fn overlapping_notes(&self) -> Vec<bool> {
         let mut flags = vec![false; self.notes.len()];
 
@@ -387,7 +391,7 @@ impl MidiEditor {
                 continue;
             }
 
-            if start < far_end {
+            if start < far_end - OVERLAP_TOLERANCE {
                 flags[idx] = true;
                 flags[far_idx] = true;
             }
@@ -978,6 +982,14 @@ pub enum SeqEventKind {
 /// 無音・左端になる点だけ注意。
 pub const CC_RELEASE: u8 = 0;
 
+/// これ以下の食い込みは「接している」とみなす量 (四分音符)。
+///
+/// 連符やスウィングで音価が 1/3 のような割り切れない値になると、
+/// `頭 + 音価` が f32 の丸めで隣の頭と 1ulp 単位で食い違う。
+/// 置ける最小の幅 (1/32 × 連符 1/7 ≒ 0.0045) より十分小さく、
+/// 実用的な曲の長さ (数千四分音符) での丸め誤差より十分大きい値。
+const OVERLAP_TOLERANCE: f32 = 1e-3;
+
 impl SeqEvent {
     /// 同時刻に並んだときの順序。
     ///
@@ -1021,6 +1033,28 @@ mod tests {
         ];
 
         assert_eq!(editor.overlapping_notes(), vec![true, true, false, false]);
+    }
+
+    /// 丸め誤差ぶんの食い込みは「接している」とみなすこと。
+    /// (連符の音価は f32 で割り切れず、プロジェクトの読み込み後に
+    /// 接しているだけのノートへ誤検出が出た)
+    #[test]
+    fn tiny_float_drift_at_the_boundary_is_not_an_overlap() {
+        let mut editor = MidiEditor::default();
+        // 終端の計算が丸めで 1e-4 だけ次の頭へ食い込んでいる
+        editor.notes = vec![note(0.0, 0.7001, 0, 4), note(0.7, 1.0, 4, 4)];
+        assert_eq!(editor.overlapping_notes(), vec![false, false]);
+
+        // 三連符を並べたときの実際の値でも出ないこと
+        let third = 1.0f32 / 3.0;
+        editor.notes = (0..6)
+            .map(|i| note(i as f32 * third, third, 0, 4))
+            .collect();
+        assert_eq!(editor.overlapping_notes(), vec![false; 6]);
+
+        // 許容量を超えた本当の重なりは引き続き検出する
+        editor.notes = vec![note(0.0, 0.71, 0, 4), note(0.7, 1.0, 4, 4)];
+        assert_eq!(editor.overlapping_notes(), vec![true, true]);
     }
 
     /// 段が違えば重なりとしないこと (見えているので警告は要らない)
