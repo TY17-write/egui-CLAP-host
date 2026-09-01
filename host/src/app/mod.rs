@@ -499,7 +499,8 @@ impl eframe::App for App {
                 load_plugin_track = Some(addr);
             }
 
-            // 詳細ウィンドウの「+」。**走査した一覧から選んでもらう。**
+            // 詳細ウィンドウの「＋」と「差替」。**走査した一覧から選んでもらう。**
+            // どちらも「この番地へ載せる」で、埋まった段なら差し替えになる。
             // ファイルから直接読む道も残してあるが、そちらは一覧の中のボタンから
             if let Some(track) = load_plugin_track {
                 self.pending_load = Some(track);

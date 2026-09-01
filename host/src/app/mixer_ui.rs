@@ -522,6 +522,19 @@ impl App {
                         {
                             moved = Some((at, at + 1));
                         }
+                        // **差し替えは「その段の番地へ載せ直す」だけ。**
+                        // 載せる側 (load_plugin) が埋まった段への上書きを
+                        // 差し替えとして扱うので、足すのと同じ流れに乗せる
+                        if ui
+                            .button("差替")
+                            .on_hover_text(
+                                "この段の音源 / エフェクトを別のものに差し替える\
+                                 (音作りは引き継がれません)",
+                            )
+                            .clicked()
+                        {
+                            add_node = Some(audio::NodeAddr { track: index, at });
+                        }
                         if ui.button("✕").on_hover_text("この段を外す").clicked() {
                             remove = Some(at);
                         }
