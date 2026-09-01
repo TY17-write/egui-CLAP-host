@@ -4,7 +4,7 @@
 //! ので、高さは1行に収まるところまでに抑えてある。
 
 use super::App;
-use crate::meter::{spectrum, REFERENCE_LUFS, SILENCE_LUFS};
+use crate::meter::{spectrum, PeakMeter, REFERENCE_LUFS, SILENCE_DBFS, SILENCE_LUFS};
 use crate::theme::palette;
 use eframe::egui::{self, vec2, CornerRadius, Pos2, Rect, Sense, Stroke};
 
@@ -22,6 +22,18 @@ const SCALE_BOTTOM: f32 = -34.0;
 
 /// 基準からこれだけ離れるまでは「合っている」として緑にする
 const TOLERANCE_LU: f32 = 1.0;
+
+/// dB メーターの棒 (L/R で2本重ねる)
+const DB_BAR_W: f32 = 140.0;
+const DB_BAR_H: f32 = 7.0;
+
+/// dB メーターの目盛りの範囲 (dBFS)
+const DB_TOP: f32 = 0.0;
+const DB_BOTTOM: f32 = -60.0;
+
+/// dB メーターの色の境目。-12 dBFS までは緑、-3 dBFS までは黄、そこから赤
+const DB_YELLOW_FROM: f32 = -12.0;
+const DB_RED_FROM: f32 = -3.0;
 
 impl App {
     /// マスターのメーター一式。上部パネルの中から呼ぶ
@@ -65,7 +77,136 @@ impl App {
             // Momentary は揺れが速すぎて目盛りとしては読めない
             lufs_bar(ui, short_term, integrated, running);
         });
+
+        ui.separator();
+
+        if db_meter(ui, self.meters.peak(), running) {
+            self.meters.restart_peak();
+        }
     }
+}
+
+/// dB (ピーク) メーター。上が L、下が R。
+/// 戻り値が true なら、最大値・クリップ・ホールドの測り直しを求められている。
+fn db_meter(ui: &mut egui::Ui, peak: &PeakMeter, running: bool) -> bool {
+    let mut restart = false;
+
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Peak")
+                    .size(10.0)
+                    .color(palette::FG_DIM),
+            )
+            .on_hover_text(
+                "サンプルピーク (dBFS)。\
+                     オーバーサンプリングしない値なので、真のピークはこれより\
+                     最大 3dB ほど大きいことがあります",
+            );
+
+            let max = peak.max_dbfs();
+            let text = if running && max > SILENCE_DBFS {
+                egui::RichText::new(format!("{max:+6.1}"))
+                    .monospace()
+                    .color(if peak.clipped() {
+                        palette::RED
+                    } else if max > DB_RED_FROM {
+                        palette::YELLOW
+                    } else {
+                        palette::FG
+                    })
+            } else {
+                egui::RichText::new("  -∞  ")
+                    .monospace()
+                    .color(palette::FG_DIM)
+            };
+            restart |= ui
+                .add(egui::Label::new(text).sense(Sense::click()))
+                .on_hover_text("測り直してからの最大。クリックで測り直します")
+                .clicked();
+
+            // **クリップは測り直すまで残す。** 瞬間の点灯だと、見ていない間の
+            // クリップを取りこぼす
+            if running && peak.clipped() {
+                restart |= ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new("CLIP")
+                                .size(10.0)
+                                .strong()
+                                .color(palette::RED),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text("0 dBFS に達しました。クリックで測り直します")
+                    .clicked();
+            }
+        });
+
+        for channel in 0..2 {
+            restart |= db_bar(ui, peak.bar_dbfs(channel), peak.hold_dbfs(channel), running);
+        }
+    });
+
+    restart
+}
+
+/// dB メーターの棒1本。塗りがバー、白い線がホールド (2秒保持)。
+/// 戻り値が true ならクリックされた。
+fn db_bar(ui: &mut egui::Ui, bar_dbfs: f32, hold_dbfs: f32, running: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(DB_BAR_W, DB_BAR_H), Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(2), palette::BG_DARK);
+
+    let to_x = |db: f32| {
+        let t = ((db - DB_BOTTOM) / (DB_TOP - DB_BOTTOM)).clamp(0.0, 1.0);
+        rect.left() + rect.width() * t
+    };
+
+    // 色の境目の位置に薄い目盛りを常に出す (無音でもどこが -12/-3 か分かるように)
+    for mark in [DB_YELLOW_FROM, DB_RED_FROM] {
+        let x = to_x(mark);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0_f32, palette::FG_DIM.gamma_multiply(0.4)),
+        );
+    }
+
+    if running && bar_dbfs > SILENCE_DBFS {
+        // 水準ごとに塗り分ける (下から緑・黄・赤)。1色で塗って色だけ変えると、
+        // 境目をまたいだ瞬間に全体の色が飛んで読みにくい
+        let zones = [
+            (DB_BOTTOM, DB_YELLOW_FROM, palette::GREEN),
+            (DB_YELLOW_FROM, DB_RED_FROM, palette::YELLOW),
+            (DB_RED_FROM, DB_TOP, palette::RED),
+        ];
+        for (from, to, color) in zones {
+            if bar_dbfs <= from {
+                break;
+            }
+            let filled = Rect::from_min_max(
+                Pos2::new(to_x(from), rect.top()),
+                Pos2::new(to_x(bar_dbfs.min(to)), rect.bottom()),
+            );
+            painter.rect_filled(filled, CornerRadius::ZERO, color.gamma_multiply(0.8));
+        }
+    }
+
+    if running && hold_dbfs > SILENCE_DBFS {
+        let x = to_x(hold_dbfs);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.5_f32, palette::FG),
+        );
+    }
+
+    response
+        .on_hover_text(
+            "マスターのピーク (上が L、下が R)。白い線が直近の山。クリックで測り直します",
+        )
+        .clicked()
 }
 
 /// 読み値の文字。**基準からのずれで色を変える**

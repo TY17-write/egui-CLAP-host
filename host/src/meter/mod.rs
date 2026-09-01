@@ -13,13 +13,16 @@
 //! [オーディオスレッド]                    [メインスレッド]
 //!   graph.master() ── rtrb (f32) ──▶  Meters::drain
 //!                                        ├─ LoudnessMeter (BS.1770 K特性)
-//!                                        └─ Spectrum (FFT 2048点)
+//!                                        ├─ Spectrum (FFT 2048点)
+//!                                        └─ PeakMeter (サンプルピーク dBFS)
 //! ```
 
 pub mod loudness;
+pub mod peak;
 pub mod spectrum;
 
 pub use loudness::{LoudnessMeter, REFERENCE_LUFS, SILENCE_LUFS};
+pub use peak::{PeakMeter, SILENCE_DBFS};
 pub use spectrum::Spectrum;
 
 /// 一度に取り込む上限 (フレーム数 × 2ch)。
@@ -36,6 +39,7 @@ const MAX_DRAIN_SAMPLES: usize = 48_000;
 pub struct Meters {
     loudness: LoudnessMeter,
     spectrum: Spectrum,
+    peak: PeakMeter,
 }
 
 impl Meters {
@@ -43,6 +47,7 @@ impl Meters {
         Self {
             loudness: LoudnessMeter::new(sample_rate),
             spectrum: Spectrum::new(sample_rate),
+            peak: PeakMeter::new(),
         }
     }
 
@@ -66,22 +71,26 @@ impl Meters {
                 let head = first.len() & !1;
                 self.loudness.push(&first[..head]);
                 self.spectrum.push(&first[..head]);
+                self.peak.push(&first[..head]);
                 if head == first.len() {
                     let tail = second.len() & !1;
                     self.loudness.push(&second[..tail]);
                     self.spectrum.push(&second[..tail]);
+                    self.peak.push(&second[..tail]);
                 }
                 chunk.commit_all();
             }
         }
 
         self.spectrum.update(dt);
+        self.peak.update(dt);
     }
 
     /// 溜めたものを捨てる (エンジンを止めたとき)
     pub fn reset(&mut self) {
         self.loudness.reset();
         self.spectrum.reset();
+        self.peak.reset();
     }
 
     /// **Integrated だけ**を測り直す (再生開始・ループの折り返し)。
@@ -110,6 +119,16 @@ impl Meters {
     /// 帯ごとのレベル (dB)。左が低域
     pub fn spectrum_levels(&self) -> &[f32; spectrum::BANDS] {
         self.spectrum.levels()
+    }
+
+    /// ピークメーター (dB メーターの表示用)
+    pub fn peak(&self) -> &PeakMeter {
+        &self.peak
+    }
+
+    /// ピークの最大値・クリップ・ホールドを測り直す (ユーザーの操作)
+    pub fn restart_peak(&mut self) {
+        self.peak.restart();
     }
 }
 
@@ -149,6 +168,13 @@ mod tests {
             (meters.short_term_lufs() - (-23.0)).abs() < 0.1,
             "{} LUFS (期待 -23.0)",
             meters.short_term_lufs()
+        );
+        // 正弦波の振幅 -23 dBFS はサンプルピークでも -23 dBFS
+        // (山の頂点とサンプルが少しずれるぶんの誤差だけ許す)
+        assert!(
+            (meters.peak().max_dbfs() - (-23.0)).abs() < 0.1,
+            "{} dBFS (期待 -23.0)",
+            meters.peak().max_dbfs()
         );
     }
 

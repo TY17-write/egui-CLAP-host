@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ---- 1. 規格の試験信号 ----
     println!("-- EBU Tech 3341 試験信号1 (1kHz {TEST_TONE_DBFS} dBFS) --");
     for rate in [44_100u32, 48_000, 96_000] {
-        let (short_term, integrated) = measure_tone(rate);
+        let (short_term, integrated, peak) = measure_tone(rate);
         // 一定の水準なので S と I は揃うはず (ゲートで何も落ちない)
         for (name, lufs) in [("S", short_term), ("I", integrated)] {
             let off = (lufs - TEST_TONE_DBFS as f32).abs();
@@ -57,6 +57,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "  {rate:>6} Hz {name} → {lufs:+7.2} LUFS (期待 {TEST_TONE_DBFS:+.1}) {verdict}"
             );
         }
+        // 正弦波の振幅 -23 dBFS はサンプルピークでも -23 dBFS
+        // (山の頂点とサンプルのずれのぶんだけ小さく読める)
+        let off = (peak - TEST_TONE_DBFS as f32).abs();
+        let verdict = if off <= TOLERANCE_LU {
+            "OK"
+        } else {
+            failed = true;
+            "**ずれている**"
+        };
+        println!("  {rate:>6} Hz Peak → {peak:+7.2} dBFS (期待 {TEST_TONE_DBFS:+.1}) {verdict}");
     }
     println!();
 
@@ -66,11 +76,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         momentary,
         short_term,
         integrated,
+        peak_dbfs,
         peak_band,
     } = measure_plugin(&plugin_path)?;
     println!("  Momentary : {momentary:+7.2} LUFS");
     println!("  Short-term: {short_term:+7.2} LUFS");
     println!("  Integrated: {integrated:+7.2} LUFS");
+    println!("  Peak      : {peak_dbfs:+7.2} dBFS");
     println!(
         "  いちばん強い帯: {:.0} Hz",
         spectrum::Spectrum::center_hz(peak_band)
@@ -97,7 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// 試験信号をリングバッファ越しに流して (Short-term, Integrated) を測る。
 /// **本体と同じく、オーディオ側は塊で押し込み、画面側は毎フレーム取り込む。**
-fn measure_tone(sample_rate: u32) -> (f32, f32) {
+fn measure_tone(sample_rate: u32) -> (f32, f32, f32) {
     let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(1 << 16);
     let mut meters = Meters::new(sample_rate);
 
@@ -119,7 +131,11 @@ fn measure_tone(sample_rate: u32) -> (f32, f32) {
         meters.drain(&mut consumer, sample_rate, 1.0 / 60.0);
     }
     meters.drain(&mut consumer, sample_rate, 1.0 / 60.0);
-    (meters.short_term_lufs(), meters.integrated_lufs())
+    (
+        meters.short_term_lufs(),
+        meters.integrated_lufs(),
+        meters.peak().max_dbfs(),
+    )
 }
 
 /// 検証用プラグインの出力の読み
@@ -127,6 +143,8 @@ struct Plugin {
     momentary: f32,
     short_term: f32,
     integrated: f32,
+    /// サンプルピークの最大 (dBFS)
+    peak_dbfs: f32,
     /// いちばん強い帯
     peak_band: usize,
 }
@@ -213,6 +231,7 @@ fn measure_plugin(plugin_path: &str) -> Result<Plugin, Box<dyn Error>> {
         momentary: meters.momentary_lufs(),
         short_term: meters.short_term_lufs(),
         integrated: meters.integrated_lufs(),
+        peak_dbfs: meters.peak().max_dbfs(),
         peak_band,
     })
 }
