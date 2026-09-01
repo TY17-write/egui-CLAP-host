@@ -144,6 +144,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         tail_samples: (offline::TAIL_SECONDS * SAMPLE_RATE) as u64,
         block_frames: BLOCK_SIZE,
         sample_rate: SAMPLE_RATE as u32,
+        tempo: 120.0,
+        beats: 4,
+        beat_type: 4,
     };
     let rendered = offline::render(&mut graph, setup);
     let offline_peaks = region_peaks(&rendered.samples, spq);
@@ -247,7 +250,7 @@ fn run_realtime(
     editor: &MidiEditor,
     end_sample: u64,
 ) -> Result<[f32; 4], Box<dyn Error>> {
-    let mut transport = Transport::new(TransportShared::new());
+    let mut transport = Transport::new(TransportShared::new(), SAMPLE_RATE);
     for track in 0..editor.track_count() {
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track,
@@ -271,9 +274,14 @@ fn run_realtime(
         graph.emit_from(&mut transport, &plan);
 
         let mut failure = None;
-        graph.process(position, BLOCK_SIZE, &mut |track, e| {
-            failure.get_or_insert_with(|| format!("オーディオトラック {track} の処理に失敗: {e}"));
-        });
+        graph.process(
+            &transport.describe(&plan, position),
+            BLOCK_SIZE,
+            &mut |track, e| {
+                failure
+                    .get_or_insert_with(|| format!("オーディオトラック {track} の処理に失敗: {e}"));
+            },
+        );
         if let Some(failure) = failure {
             return Err(failure.into());
         }

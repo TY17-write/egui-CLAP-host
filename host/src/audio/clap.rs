@@ -8,15 +8,18 @@
 use crate::audio::buffers::HostAudioBuffers;
 use crate::audio::config::FullAudioConfig;
 use crate::audio::events::{BlockEvent, BlockEvents};
+use crate::audio::transport::BlockTransport;
 use crate::audio::ProcessError;
 use crate::host::MiniHost;
 use crate::sequencer::CC_RELEASE;
 use clack_extensions::note_ports::{NoteDialects, NotePortInfoBuffer, PluginNotePorts};
 use clack_host::events::event_types::{
-    MidiEvent, NoteChokeEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent,
+    MidiEvent, NoteChokeEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent,
+    TransportFlags,
 };
-use clack_host::events::{EventFlags, Match, Pckn};
+use clack_host::events::{EventFlags, EventHeader, Match, Pckn};
 use clack_host::prelude::*;
+use clack_host::utils::{BeatTime, SecondsTime};
 
 /// CLAP の音源1つぶんの処理器
 pub struct ClapProcessor {
@@ -64,11 +67,14 @@ impl ClapProcessor {
     /// 長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
     ///
     /// `node` はチェーンの何段目か。**自分に宛てたパラメータだけを拾う**ために使う。
+    ///
+    /// `transport` は再生ヘッドの盤面。CLAP の transport イベントに移して毎ブロック渡す
+    /// (渡さないとプラグインは「拍のないホスト」とみなし、小節表示が自走する)。
     pub fn process(
         &mut self,
         events: &BlockEvents,
         node: usize,
-        steady: u64,
+        transport: &BlockTransport,
         buf: &mut [f32],
     ) -> Result<(), ProcessError> {
         self.translate(events, node);
@@ -77,13 +83,14 @@ impl ClapProcessor {
         let input_events = self.native.as_input();
         let (ins, mut outs) = self.buffers.prepare_plugin_buffers(buf.len(), buf);
 
+        let transport_event = transport_event(transport);
         self.audio_processor.process(
             &ins,
             &mut outs,
             &input_events,
             &mut OutputEvents::void(),
-            Some(steady),
-            None,
+            Some(transport.steady),
+            Some(&transport_event),
         )?;
         self.buffers.write_into(buf);
         Ok(())
@@ -241,6 +248,41 @@ impl ClapProcessor {
     }
 }
 
+/// 中立の盤面を CLAP の transport イベントへ移す。
+///
+/// CLAP の拍 (`BeatTime`) は**四分音符**単位。換算は [`BlockTransport`] に
+/// 1本化してあり、ここは値を詰め替えるだけ。ループ始端は常に 0 (ホストの仕様)。
+fn transport_event(bt: &BlockTransport) -> TransportEvent {
+    let mut flags = TransportFlags::HAS_TEMPO
+        | TransportFlags::HAS_BEATS_TIMELINE
+        | TransportFlags::HAS_SECONDS_TIMELINE
+        | TransportFlags::HAS_TIME_SIGNATURE;
+    if bt.playing {
+        flags |= TransportFlags::IS_PLAYING;
+    }
+    if bt.looping {
+        flags |= TransportFlags::IS_LOOP_ACTIVE;
+    }
+
+    TransportEvent {
+        header: EventHeader::new_core(0, EventFlags::empty()),
+        flags,
+        song_pos_beats: BeatTime::from_float(bt.pos_quarters()),
+        song_pos_seconds: SecondsTime::from_float(bt.pos_seconds()),
+        tempo: bt.tempo,
+        // ブロック内でテンポは変えない
+        tempo_inc: 0.0,
+        loop_start_beats: BeatTime::from_int(0),
+        loop_end_beats: BeatTime::from_float(bt.end_quarters()),
+        loop_start_seconds: SecondsTime::from_int(0),
+        loop_end_seconds: SecondsTime::from_float(bt.end_seconds()),
+        bar_start: BeatTime::from_float(bt.bar_start_quarters()),
+        bar_number: bt.bar_number(),
+        time_signature_numerator: bt.beats.max(1),
+        time_signature_denominator: bt.beat_type.max(1),
+    }
+}
+
 /// 使うノート入力ポートと、そこで通じる表し方。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoteInput {
@@ -284,4 +326,57 @@ pub fn find_main_note_port(instance: &mut PluginInstance<MiniHost>) -> Option<No
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 中立の盤面が CLAP の transport イベントへ正しく移ること。
+    /// (拍は四分音符単位。ここがずれると同期系プラグインが全部ずれる)
+    #[test]
+    fn transport_event_mirrors_the_block_transport() {
+        let bt = BlockTransport {
+            steady: 0,
+            playing: true,
+            looping: true,
+            // 48kHz・90BPM で 2 秒 = 3 四分音符
+            pos_samples: 96_000,
+            end_samples: 96_000 * 2,
+            sample_rate: 48_000.0,
+            tempo: 90.0,
+            beats: 3,
+            beat_type: 4,
+        };
+        let event = transport_event(&bt);
+
+        assert!(event.flags.contains(TransportFlags::IS_PLAYING));
+        assert!(event.flags.contains(TransportFlags::IS_LOOP_ACTIVE));
+        assert!(event.flags.contains(TransportFlags::HAS_TEMPO));
+        assert!(event.flags.contains(TransportFlags::HAS_TIME_SIGNATURE));
+
+        assert!((event.song_pos_beats.to_float() - 3.0).abs() < 1e-6);
+        assert!((event.song_pos_seconds.to_float() - 2.0).abs() < 1e-6);
+        assert_eq!(event.tempo, 90.0);
+        assert!((event.loop_end_beats.to_float() - 6.0).abs() < 1e-6);
+        // 3/4 の 3拍目終わり = 2小節目 (0始まりで1) の頭
+        assert_eq!(event.bar_number, 1);
+        assert!((event.bar_start.to_float() - 3.0).abs() < 1e-6);
+        assert_eq!(event.time_signature_numerator, 3);
+        assert_eq!(event.time_signature_denominator, 4);
+    }
+
+    /// 停止中は IS_PLAYING が立たないこと (これが立ちっぱなしだと
+    /// 停止しても小節が進み続けるプラグインがある)
+    #[test]
+    fn a_stopped_transport_clears_the_playing_flag() {
+        let bt = BlockTransport {
+            playing: false,
+            looping: false,
+            ..BlockTransport::free_run(0, 48_000.0)
+        };
+        let event = transport_event(&bt);
+        assert!(!event.flags.contains(TransportFlags::IS_PLAYING));
+        assert!(!event.flags.contains(TransportFlags::IS_LOOP_ACTIVE));
+    }
 }

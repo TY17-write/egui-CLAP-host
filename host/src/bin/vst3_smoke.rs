@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let events = editor.to_events(SAMPLE_RATE).into_boxed_slice();
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
 
-    let mut transport = Transport::new(TransportShared::new());
+    let mut transport = Transport::new(TransportShared::new(), SAMPLE_RATE);
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
         events,
@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let queued = processor.events_mut().len();
 
         mix.fill(0.0);
-        let result = processor.process(0, &mut mix);
+        let result = processor.process(&transport.describe(&plan, 0), &mut mix);
 
         match result {
             Err(ProcessError::Busy) => {}
@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         transport.emit_track(0, &plan, processor.events_mut());
 
         mix.fill(0.0);
-        if let Err(e) = processor.process(steady, &mut mix) {
+        if let Err(e) = processor.process(&transport.describe(&plan, steady), &mut mix) {
             failures.push(format!("ブロック {block} の処理に失敗: {e}"));
             break;
         }
@@ -174,6 +174,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         tail_samples: (offline::TAIL_SECONDS * SAMPLE_RATE) as u64,
         block_frames: BLOCK_SIZE,
         sample_rate: SAMPLE_RATE as u32,
+        tempo: 120.0,
+        beats: 4,
+        beat_type: 4,
     };
     let rendered = offline::render(&mut graph, setup);
     let node = graph

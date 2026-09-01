@@ -16,6 +16,7 @@
 
 use crate::audio::config::StreamAudioConfig;
 use crate::audio::events::{BlockEvent, BlockEvents};
+use crate::audio::transport::BlockTransport;
 use crate::audio::ProcessError;
 use crate::sequencer::CC_RELEASE;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -129,6 +130,10 @@ pub struct Vst3Processor {
     /// バッファの器は1chぶん作ってあるので、これが無いと「無音を書き込む段」に
     /// なってしまい、そこから後ろが鳴らなくなる。
     produces_audio: bool,
+    /// 前のブロックで伝えたトランスポート (再生中か, BPM, 拍子分子, 拍子分母)。
+    /// 変わったときだけ設定し直すための控え。位置はここに入れない
+    /// (位置は毎ブロック合わせる。[`sync_transport`](Self::sync_transport) を参照)。
+    last_transport: Option<(bool, f64, u16, u16)>,
 }
 
 impl Vst3Processor {
@@ -161,6 +166,7 @@ impl Vst3Processor {
             active_ccs: 0,
             deferred: Vec::with_capacity(MAX_DEFERRED),
             produces_audio,
+            last_transport: None,
         }
     }
 
@@ -183,10 +189,15 @@ impl Vst3Processor {
     /// 長さがそのままブロック長 (フレーム数 × チャンネル数) になる。
     ///
     /// `node` はチェーンの何段目か。**自分に宛てたパラメータだけを拾う**ために使う。
+    ///
+    /// `transport` は再生ヘッドの盤面。`ProcessContext` に反映してから処理する
+    /// (反映しないと `vst3-host` の既定 (再生中・位置は自走) のままになり、
+    /// 停止しても小節が進み続ける)。
     pub fn process(
         &mut self,
         events: &BlockEvents,
         node: usize,
+        transport: &BlockTransport,
         buf: &mut [f32],
     ) -> Result<(), ProcessError> {
         let Some(mut plugin) = self.plugin.try_lock() else {
@@ -201,6 +212,8 @@ impl Vst3Processor {
             return Ok(());
         }
         resize_buffers(&mut self.buffers, frames);
+
+        Self::sync_transport(&mut self.last_transport, &mut plugin, transport);
 
         // 溜めておいたぶんを先に送る (順序は保つ)
         for index in 0..self.deferred.len() {
@@ -237,6 +250,30 @@ impl Vst3Processor {
 
         self.write_into(buf, frames);
         Ok(())
+    }
+
+    /// トランスポートを盤面に合わせる。
+    ///
+    /// テンポ・拍子・再生状態は**変わったときだけ**設定し直す。再生位置は
+    /// `vst3-host` 側が勝手に進めてしまうので**毎ブロック**ピン留めする
+    /// (これを怠ると、停止・シーク・ループが位置に反映されない)。
+    /// どの呼び出しもフィールドを書くだけで、確保もロックも起きない。
+    ///
+    /// 関連関数なのは、呼ぶ時点で `self.plugin` のロックを握っていて
+    /// `&mut self` を取れないため (`defer` などと同じ事情)。
+    fn sync_transport(
+        last: &mut Option<(bool, f64, u16, u16)>,
+        plugin: &mut Plugin,
+        bt: &BlockTransport,
+    ) {
+        let now = (bt.playing, bt.tempo, bt.beats, bt.beat_type);
+        if *last != Some(now) {
+            let _ = plugin.set_tempo(bt.tempo);
+            let _ = plugin.set_time_signature(bt.beats.max(1) as i32, bt.beat_type.max(1) as i32);
+            let _ = plugin.set_playing(bt.playing);
+            *last = Some(now);
+        }
+        let _ = plugin.set_project_time(bt.pos_samples.min(i64::MAX as u64) as i64);
     }
 
     /// 送れなかったイベントを取っておく。上限を超えたぶんは捨てる。

@@ -27,7 +27,7 @@ use clap::ClapProcessor;
 use config::*;
 use events::{BlockEvent, BlockEvents};
 use graph::Graph;
-use transport::{Transport, TransportMsg, TransportShared};
+use transport::{BlockTransport, Transport, TransportMsg, TransportShared};
 use vst3::{SharedPlugin, Vst3Processor};
 
 /// プラグインに見せるストリーム構成。
@@ -216,6 +216,7 @@ impl Node {
 
     /// 1ブロック処理して `buf` を置き換える。
     /// `index` はチェーンの何段目か (自分宛てのパラメータを拾うために使う)。
+    /// `transport` は再生ヘッドの盤面 (両形式とも自分の形へ移して使う)。
     ///
     /// **バイパスはここでは見ない。** 出した音を捨てるのは呼び出し側
     /// ([`TrackProcessor::process`]) の仕事で、ここは常に通す
@@ -224,12 +225,12 @@ impl Node {
         &mut self,
         events: &BlockEvents,
         index: usize,
-        steady: u64,
+        transport: &BlockTransport,
         buf: &mut [f32],
     ) -> Result<(), ProcessError> {
         match &mut self.backend {
-            Backend::Clap(processor) => processor.process(events, index, steady, buf),
-            Backend::Vst3(processor) => processor.process(events, index, buf),
+            Backend::Clap(processor) => processor.process(events, index, transport, buf),
+            Backend::Vst3(processor) => processor.process(events, index, transport, buf),
         }
     }
 }
@@ -380,13 +381,17 @@ impl TrackProcessor {
     /// `buf` は呼び出し側が 0 で埋めてから渡すこと。先頭が音源なら中身は
     /// 読まれずに上書きされ、先頭がエフェクトなら無音を加工することになる。
     ///
-    /// `steady` は再生開始からの通し時間 (サンプル)。CLAP はこれを受け取るが、
-    /// VST3 は `ProcessContext` を自前で組み立てる作りなので使わない。
+    /// `transport` は再生ヘッドの盤面 (位置・テンポ・拍子・再生状態)。
+    /// 全ノードへ同じものを見せる。
     ///
     /// **どこか1段でも失敗したら、そのブロックは無音にして返す。** 途中まで
     /// 処理した音を出すと、加工されていない原音が混ざって出てしまう
     /// (呼び出し側は「失敗したトラックは無音のまま混ざる」前提で記録している)。
-    pub fn process(&mut self, steady: u64, buf: &mut [f32]) -> Result<(), ProcessError> {
+    pub fn process(
+        &mut self,
+        transport: &BlockTransport,
+        buf: &mut [f32],
+    ) -> Result<(), ProcessError> {
         let Self {
             events,
             nodes,
@@ -413,7 +418,7 @@ impl TrackProcessor {
                 bypass_scratch[..buf.len()].copy_from_slice(buf);
             }
 
-            if let Err(e) = node.process(events, index, steady, buf) {
+            if let Err(e) = node.process(events, index, transport, buf) {
                 buf.fill(0.0);
                 return Err(e);
             }
@@ -456,6 +461,7 @@ pub fn start_engine(
         monitor,
         stream_config.output_channel_count,
         stream_config.max_likely_buffer_size as usize,
+        stream_config.sample_rate as f64,
     );
 
     let stream = build_output_stream_for_sample_format(
@@ -706,6 +712,7 @@ impl StreamAudioProcessor {
         monitor: rtrb::Producer<f32>,
         output_channel_count: usize,
         max_frames: usize,
+        sample_rate: f64,
     ) -> Self {
         let mut graph = Graph::new();
         // 想定される最大ブロック長ぶんを先に取っておく
@@ -716,7 +723,7 @@ impl StreamAudioProcessor {
             retired,
             gui_events,
             output_channel_count,
-            transport: Transport::new(transport_shared),
+            transport: Transport::new(transport_shared, sample_rate),
             steady_counter: 0,
             monitor,
         }
@@ -734,7 +741,8 @@ impl StreamAudioProcessor {
 
     /// GUI からのメッセージをすべて取り出し、トラックごとのイベントに変換する。
     /// その後、再生中ならシーケンスのイベントを sample_count 分発行する。
-    fn collect_gui_events(&mut self, sample_count: u64) {
+    /// 戻り値はこのブロックのトランスポート情報 (プラグインへ見せる盤面)。
+    fn collect_gui_events(&mut self, sample_count: u64) -> BlockTransport {
         self.graph.clear_events();
 
         while let Ok(msg) = self.gui_events.pop() {
@@ -805,6 +813,7 @@ impl StreamAudioProcessor {
         // (オーディオスレッドで確保しないよう、区間の計画は固定長で持ち回る)
         let plan = self.transport.plan_block(sample_count);
         self.graph.emit_from(&mut self.transport, &plan);
+        self.transport.describe(&plan, self.steady_counter)
     }
 
     /// CPAL の出力バッファ1回分を処理する。
@@ -814,14 +823,13 @@ impl StreamAudioProcessor {
     fn process<S: FromSample<f32>>(&mut self, data: &mut [S]) {
         let frames = data.len() / self.output_channel_count.max(1);
 
-        self.collect_gui_events(frames as u64);
+        let transport = self.collect_gui_events(frames as u64);
 
         // 想定より長いブロックが来たときだけ伸びる (普段は起きない)
         self.graph.reserve(frames);
 
-        let steady = self.steady_counter;
         self.graph
-            .process(steady, frames, &mut |track, error| match error {
+            .process(&transport, frames, &mut |track, error| match error {
                 // 想定内で、放っておけば直る。VST3 のエディタを開くときに
                 // 数秒ぶん出ることがあり (音源の生成が重い)、そのたびに
                 // オーディオスレッドから書き出すほうが害が大きい

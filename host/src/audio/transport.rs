@@ -24,6 +24,18 @@ pub enum TransportMsg {
     SetLoop {
         enabled: bool,
     },
+    /// テンポと拍子を差し替える。
+    ///
+    /// **鳴らす位置には効かない** (イベントのサンプル時刻はエディタ側で
+    /// 計算済みのため)。プラグインへ見せる拍の情報 ([`BlockTransport`]) にだけ効く。
+    SetTime {
+        /// BPM
+        tempo: f64,
+        /// 拍子の分子
+        beats: u16,
+        /// 拍子の分母
+        beat_type: u16,
+    },
 }
 
 /// UI と共有する再生状態
@@ -89,17 +101,31 @@ pub struct Transport {
     looping: bool,
     /// 現在位置 (サンプル)
     pos: u64,
+    /// サンプルレート。プラグインへ見せる拍の情報 ([`BlockTransport`]) の
+    /// 換算にだけ使う (イベントの時刻はエディタ側で計算済み)
+    sample_rate: f64,
+    /// BPM (プラグインへ見せる値)
+    tempo: f64,
+    /// 拍子の分子
+    beats: u16,
+    /// 拍子の分母
+    beat_type: u16,
     shared: TransportShared,
 }
 
 impl Transport {
-    pub fn new(shared: TransportShared) -> Self {
+    pub fn new(shared: TransportShared, sample_rate: f64) -> Self {
         Self {
             tracks: vec![TrackSequence::new()],
             end_sample: 0,
             playing: false,
             looping: false,
             pos: 0,
+            sample_rate,
+            // エディタの既定値 (MidiEditor::default) と揃えてある
+            tempo: 120.0,
+            beats: 4,
+            beat_type: 4,
             shared,
         }
     }
@@ -169,6 +195,18 @@ impl Transport {
             TransportMsg::SetLoop { enabled } => {
                 self.looping = enabled;
             }
+            TransportMsg::SetTime {
+                tempo,
+                beats,
+                beat_type,
+            } => {
+                // 送る側 (GUI) が値域を持っているので、ここは壊れた値を弾くだけ
+                if tempo.is_finite() && tempo > 0.0 {
+                    self.tempo = tempo;
+                }
+                self.beats = beats.max(1);
+                self.beat_type = beat_type.max(1);
+            }
         }
         self.publish_state();
         needs_choke
@@ -229,6 +267,26 @@ impl Transport {
 
         self.publish_state();
         plan
+    }
+
+    /// このブロックのトランスポート情報 (プラグインへ見せる盤面) を作る。
+    ///
+    /// `plan` は**同じブロック**の [`plan_block`](Self::plan_block) の結果。
+    /// 再生位置は plan の先頭区間から取るので、plan_block が位置を進めた
+    /// **あとに呼んでよい**。終端で自動停止したブロックも、先頭時点では
+    /// 再生中だったとして扱う (CLAP のトランスポートは「サンプル0時点」の値)。
+    pub fn describe(&self, plan: &BlockPlan, steady: u64) -> BlockTransport {
+        BlockTransport {
+            steady,
+            playing: !plan.is_empty() || self.playing,
+            looping: self.looping,
+            pos_samples: plan.spans().first().map_or(self.pos, |span| span.start),
+            end_samples: self.end_sample,
+            sample_rate: self.sample_rate,
+            tempo: self.tempo,
+            beats: self.beats,
+            beat_type: self.beat_type,
+        }
     }
 
     /// 1トラック分のイベントを、計画した区間に沿って発行する
@@ -314,6 +372,97 @@ impl BlockPlan {
     }
 }
 
+/// 1ブロックぶんのトランスポート情報 (プラグインへ見せる盤面)。
+///
+/// **どの形式も知らない中立の形。** CLAP はこれを transport イベントへ、
+/// VST3 は `ProcessContext` のピン留めへ移す。位置はブロック先頭の値。
+///
+/// 拍への換算はここに1本化してある。CLAP の「beat」は四分音符
+/// (拍子分母に依らない) なので、換算はすべて四分音符単位で行う。
+#[derive(Clone, Copy, Debug)]
+pub struct BlockTransport {
+    /// 再生開始からの通し時間 (サンプル)。再生ヘッドとは無関係に単調増加する
+    pub steady: u64,
+    /// ブロック先頭時点で再生中だったか
+    pub playing: bool,
+    /// ループ再生か
+    pub looping: bool,
+    /// ブロック先頭の再生位置 (サンプル)
+    pub pos_samples: u64,
+    /// シーケンス終端 = ループ終端 (サンプル)。ループ始端は常に 0
+    pub end_samples: u64,
+    pub sample_rate: f64,
+    /// BPM
+    pub tempo: f64,
+    /// 拍子の分子
+    pub beats: u16,
+    /// 拍子の分母
+    pub beat_type: u16,
+}
+
+impl BlockTransport {
+    /// 検証バイナリ用の簡易盤面。通し時間をそのまま再生位置として
+    /// 120BPM・4/4 で流しっぱなしにする (実際のトランスポートは持たない経路のため)。
+    pub fn free_run(steady: u64, sample_rate: f64) -> Self {
+        Self {
+            steady,
+            playing: true,
+            looping: false,
+            pos_samples: steady,
+            end_samples: 0,
+            sample_rate,
+            tempo: 120.0,
+            beats: 4,
+            beat_type: 4,
+        }
+    }
+
+    /// サンプル数 → 秒
+    fn seconds(&self, samples: u64) -> f64 {
+        samples as f64 / self.sample_rate.max(1.0)
+    }
+
+    /// サンプル数 → 四分音符
+    fn quarters(&self, samples: u64) -> f64 {
+        self.seconds(samples) * self.tempo / 60.0
+    }
+
+    /// 再生位置 (秒)
+    pub fn pos_seconds(&self) -> f64 {
+        self.seconds(self.pos_samples)
+    }
+
+    /// 再生位置 (四分音符)
+    pub fn pos_quarters(&self) -> f64 {
+        self.quarters(self.pos_samples)
+    }
+
+    /// 終端 (秒)
+    pub fn end_seconds(&self) -> f64 {
+        self.seconds(self.end_samples)
+    }
+
+    /// 終端 (四分音符)
+    pub fn end_quarters(&self) -> f64 {
+        self.quarters(self.end_samples)
+    }
+
+    /// 1小節の長さ (四分音符)。例: 4/4 は 4.0、3/4 は 3.0、6/8 は 3.0
+    pub fn quarters_per_bar(&self) -> f64 {
+        self.beats.max(1) as f64 * 4.0 / self.beat_type.max(1) as f64
+    }
+
+    /// いま何小節目か (0始まり)
+    pub fn bar_number(&self) -> i32 {
+        (self.pos_quarters() / self.quarters_per_bar()).floor() as i32
+    }
+
+    /// いまの小節の頭 (四分音符)
+    pub fn bar_start_quarters(&self) -> f64 {
+        self.bar_number() as f64 * self.quarters_per_bar()
+    }
+}
+
 /// 全ノート消音イベントを積む
 pub fn push_choke(events: &mut BlockEvents, offset: u32) {
     events.push(BlockEvent::Choke { offset });
@@ -342,7 +491,7 @@ mod tests {
 
     fn make_transport(events: Vec<SeqEvent>, end_sample: u64) -> (Transport, TransportShared) {
         let shared = TransportShared::new();
-        let mut transport = Transport::new(shared.clone());
+        let mut transport = Transport::new(shared.clone(), 44100.0);
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track: 0,
             events: events.into_boxed_slice(),
@@ -448,6 +597,89 @@ mod tests {
         // [100,200) + 終端フラッシュ + 巻き戻して [0,100) → オフ1 + オン1
         process_block(&mut transport, &mut events, 200);
         assert_eq!(events.len(), 2);
+    }
+
+    /// describe はブロック**先頭**の位置を返すこと。
+    /// (plan_block は位置をブロック末尾まで進めてしまうので、進めたあとに
+    /// 呼んでも先頭の値が得られる必要がある)
+    #[test]
+    fn describe_reports_the_block_start_position() {
+        let (mut transport, _shared) = make_transport(vec![on(0)], 44100);
+        let _ = transport.handle_msg(TransportMsg::Play);
+
+        let plan = transport.plan_block(512);
+        let bt = transport.describe(&plan, 0);
+        assert_eq!(bt.pos_samples, 0, "1ブロック目の先頭は 0");
+        assert!(bt.playing);
+
+        let plan = transport.plan_block(512);
+        let bt = transport.describe(&plan, 512);
+        assert_eq!(bt.pos_samples, 512, "2ブロック目の先頭は 512");
+    }
+
+    /// 終端で自動停止したブロックも「先頭時点では再生中」と報告すること。
+    /// (このブロックの音はまだ鳴っている)
+    #[test]
+    fn describe_keeps_playing_through_the_final_block() {
+        let (mut transport, _shared) = make_transport(vec![on(0), off(200)], 200);
+        let _ = transport.handle_msg(TransportMsg::Play);
+
+        let plan = transport.plan_block(512); // 終端をまたいで自動停止する
+        let bt = transport.describe(&plan, 0);
+        assert!(bt.playing, "最後のブロックの先頭では再生中だった");
+
+        let plan = transport.plan_block(512); // 停止後
+        let bt = transport.describe(&plan, 512);
+        assert!(!bt.playing);
+    }
+
+    /// SetTime がプラグインへ見せる拍の情報に反映されること
+    #[test]
+    fn set_time_updates_the_block_transport() {
+        let (mut transport, _shared) = make_transport(vec![], 0);
+        let _ = transport.handle_msg(TransportMsg::SetTime {
+            tempo: 90.0,
+            beats: 6,
+            beat_type: 8,
+        });
+
+        let bt = transport.describe(&BlockPlan::default(), 0);
+        assert_eq!(bt.tempo, 90.0);
+        assert_eq!((bt.beats, bt.beat_type), (6, 8));
+    }
+
+    /// 拍への換算。CLAP の「beat」は四分音符なので、拍子分母に依らず
+    /// サンプル→四分音符の直線変換になること。
+    #[test]
+    fn quarters_follow_tempo_and_bars_follow_the_time_signature() {
+        let bt = BlockTransport {
+            steady: 0,
+            playing: true,
+            looping: false,
+            // 44100Hz・120BPM で 2.5 秒 = 5 四分音符
+            pos_samples: 44100 * 5 / 2,
+            end_samples: 44100 * 4,
+            sample_rate: 44100.0,
+            tempo: 120.0,
+            beats: 3,
+            beat_type: 4,
+        };
+        assert!((bt.pos_seconds() - 2.5).abs() < 1e-9);
+        assert!((bt.pos_quarters() - 5.0).abs() < 1e-9);
+        assert!((bt.end_quarters() - 8.0).abs() < 1e-9);
+
+        // 3/4: 1小節 = 3 四分音符。5拍目は2小節目 (0始まりで1) の途中
+        assert!((bt.quarters_per_bar() - 3.0).abs() < 1e-9);
+        assert_eq!(bt.bar_number(), 1);
+        assert!((bt.bar_start_quarters() - 3.0).abs() < 1e-9);
+
+        // 6/8: 1小節 = 3 四分音符 (分母8は八分音符6つぶん)
+        let bt = BlockTransport {
+            beats: 6,
+            beat_type: 8,
+            ..bt
+        };
+        assert!((bt.quarters_per_bar() - 3.0).abs() < 1e-9);
     }
 
     /// 消音イベントが中立の形で積まれること (バックエンドが自分の形へ移す)

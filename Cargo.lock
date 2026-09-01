@@ -3775,7 +3775,7 @@ dependencies = [
 [[package]]
 name = "vst3-host"
 version = "0.9.0"
-source = "git+https://github.com/TY17-write/rust-vst3-host.git#b63c5387b2559ebaec2d830fb10a1102d3be67ae"
+source = "git+https://github.com/TY17-write/rust-vst3-host.git#a0beefb6c0156e4ad3ea0348b4a301e95b0eae15"
 dependencies = [
  "core-foundation 0.10.1",
  "crossbeam-queue",

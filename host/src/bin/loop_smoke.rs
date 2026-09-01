@@ -170,7 +170,7 @@ fn render(
     let end_sample = (total_quarters as f64 * spq) as u64;
 
     let shared = TransportShared::new();
-    let mut transport = Transport::new(shared.clone());
+    let mut transport = Transport::new(shared.clone(), rate);
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
         events: editor.to_events_for_track(0, rate).into_boxed_slice(),
@@ -192,9 +192,13 @@ fn render(
         let plan = transport.plan_block(BLOCK_SIZE as u64);
         graph.clear_events();
         graph.emit_from(&mut transport, &plan);
-        graph.process(steady, BLOCK_SIZE, &mut |track, e| {
-            eprintln!("オーディオトラック {track}: {e}");
-        });
+        graph.process(
+            &transport.describe(&plan, steady),
+            BLOCK_SIZE,
+            &mut |track, e| {
+                eprintln!("オーディオトラック {track}: {e}");
+            },
+        );
         samples.extend_from_slice(graph.master(BLOCK_SIZE));
         steady += BLOCK_SIZE as u64;
     }

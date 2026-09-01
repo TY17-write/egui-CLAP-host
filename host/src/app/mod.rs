@@ -401,6 +401,15 @@ impl eframe::App for App {
                         };
                         let msg = match command {
                             EditorCommand::Commit => {
+                                // テンポと拍子を先に届ける (プラグインへ見せる拍の情報。
+                                // イベントの時刻には効かない — spq で計算済みのため)
+                                let _ = engine.producer.push(GuiMsg::Transport(
+                                    TransportMsg::SetTime {
+                                        tempo: self.editor.editor.tempo.max(1) as f64,
+                                        beats: self.editor.editor.beats.max(1) as u16,
+                                        beat_type: self.editor.editor.beat_type.max(1) as u16,
+                                    },
+                                ));
                                 // トラックごとに分けて送る (音源が別々のため)
                                 let end_sample = (self.editor.editor.length_quarters_bar_aligned()
                                     as f64

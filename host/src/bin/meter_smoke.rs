@@ -176,6 +176,9 @@ fn measure_plugin(plugin_path: &str) -> Result<Plugin, Box<dyn Error>> {
         tail_samples: 0,
         block_frames: BLOCK_SIZE as usize,
         sample_rate: SAMPLE_RATE,
+        tempo: 120.0,
+        beats: 4,
+        beat_type: 4,
     };
     let rendered = offline::render(&mut graph, setup);
 

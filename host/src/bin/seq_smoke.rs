@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64; // 4拍 = 88200
 
     let shared = TransportShared::new();
-    let mut transport = Transport::new(shared.clone());
+    let mut transport = Transport::new(shared.clone(), SAMPLE_RATE);
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
         events,
@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         transport.emit_track(0, &plan, processor.events_mut());
 
         mix.fill(0.0);
-        processor.process(pos, &mut mix)?;
+        processor.process(&transport.describe(&plan, pos), &mut mix)?;
 
         // このブロックがどの区間に完全に収まるかを判定してピークを記録
         let block_start = pos;

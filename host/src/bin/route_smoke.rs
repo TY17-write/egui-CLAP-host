@@ -27,7 +27,7 @@ use egui_clap_host::audio;
 use egui_clap_host::audio::config::StreamAudioConfig;
 use egui_clap_host::audio::events::BlockEvent;
 use egui_clap_host::audio::graph::{self, Graph, Mixer, Routing};
-use egui_clap_host::audio::transport::{Transport, TransportMsg, TransportShared};
+use egui_clap_host::audio::transport::{BlockTransport, Transport, TransportMsg, TransportShared};
 use egui_clap_host::discovery;
 use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
 use egui_clap_host::sequencer::{MidiEditor, Note};
@@ -277,7 +277,7 @@ fn render_master(
     let sample_rate = SAMPLE_RATE as f64;
     let spq = editor.samples_per_quarter(sample_rate);
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
-    let mut transport = Transport::new(TransportShared::new());
+    let mut transport = Transport::new(TransportShared::new(), sample_rate);
     for track in 0..editor.track_count() {
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track,
@@ -298,9 +298,13 @@ fn render_master(
         graph.emit_from(&mut transport, &plan);
 
         let mut error = None;
-        graph.process(pos, BLOCK_SIZE, &mut |track, e| {
-            error.get_or_insert_with(|| format!("オーディオトラック {track}: {e}"));
-        });
+        graph.process(
+            &transport.describe(&plan, pos),
+            BLOCK_SIZE,
+            &mut |track, e| {
+                error.get_or_insert_with(|| format!("オーディオトラック {track}: {e}"));
+            },
+        );
         if let Some(error) = error {
             return Err(error.into());
         }
@@ -386,7 +390,9 @@ fn run(
         }
 
         let mut error = None;
-        graph.process((block * BLOCK_SIZE) as u64, BLOCK_SIZE, &mut |track, e| {
+        // トランスポートを持たない経路なので簡易盤面で流す
+        let transport = BlockTransport::free_run((block * BLOCK_SIZE) as u64, SAMPLE_RATE as f64);
+        graph.process(&transport, BLOCK_SIZE, &mut |track, e| {
             error.get_or_insert_with(|| format!("オーディオトラック {track}: {e}"));
         });
         if let Some(error) = error {

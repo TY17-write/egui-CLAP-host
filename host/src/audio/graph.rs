@@ -25,7 +25,7 @@
 //! モノラルになる**。デバイスへ落とすのは [`write_to_device`] の1回だけ。
 
 use super::events::BlockEvents;
-use super::transport::{BlockPlan, Transport};
+use super::transport::{BlockPlan, BlockTransport, Transport};
 use super::{Node, NodeAddr, ProcessError, TrackProcessor};
 use cpal::FromSample;
 
@@ -737,7 +737,7 @@ impl Graph {
     /// (途中まで処理した音を出すと、加工されていない原音が漏れる)。
     pub fn process(
         &mut self,
-        steady: u64,
+        transport: &BlockTransport,
         frames: usize,
         on_error: &mut dyn FnMut(usize, ProcessError),
     ) {
@@ -753,7 +753,7 @@ impl Graph {
 
         let mixer = self.mixer;
         for index in mixer.routing.order() {
-            self.run_track(index, steady, len, on_error);
+            self.run_track(index, transport, len, on_error);
 
             // チェーンの後に音量とパンを掛ける。**送りに入る前**なので、
             // すべての送り先に同じように効く。
@@ -786,7 +786,7 @@ impl Graph {
     fn run_track(
         &mut self,
         index: usize,
-        steady: u64,
+        transport: &BlockTransport,
         len: usize,
         on_error: &mut dyn FnMut(usize, ProcessError),
     ) {
@@ -796,7 +796,7 @@ impl Graph {
             return; // 何も刺さっていない。入ってきた音をそのまま流す
         }
         let buffer = &mut self.buffers[index * stride..][..len];
-        if let Err(e) = processor.process(steady, buffer) {
+        if let Err(e) = processor.process(transport, buffer) {
             on_error(index, e);
         }
     }
@@ -1070,7 +1070,7 @@ mod tests {
         use crate::audio::transport::{Transport, TransportMsg, TransportShared};
         use crate::sequencer::{SeqEvent, SeqEventKind};
 
-        let mut transport = Transport::new(TransportShared::new());
+        let mut transport = Transport::new(TransportShared::new(), 44100.0);
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track: 0,
             events: vec![SeqEvent {
@@ -1109,7 +1109,7 @@ mod tests {
         use crate::audio::transport::{Transport, TransportMsg, TransportShared};
         use crate::sequencer::{SeqEvent, SeqEventKind};
 
-        let mut transport = Transport::new(TransportShared::new());
+        let mut transport = Transport::new(TransportShared::new(), 44100.0);
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track: 3,
             events: vec![SeqEvent {
@@ -1152,7 +1152,7 @@ mod tests {
             kind: SeqEventKind::NoteOn { key, velocity: 1.0 },
         };
 
-        let mut transport = Transport::new(TransportShared::new());
+        let mut transport = Transport::new(TransportShared::new(), 44100.0);
         // キック: 0 と 256
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track: 0,
@@ -1205,7 +1205,7 @@ mod tests {
         use crate::audio::transport::{Transport, TransportMsg, TransportShared};
         use crate::sequencer::{SeqEvent, SeqEventKind};
 
-        let mut transport = Transport::new(TransportShared::new());
+        let mut transport = Transport::new(TransportShared::new(), 44100.0);
         for track in [0, 1] {
             let _ = transport.handle_msg(TransportMsg::SetSequence {
                 track,

@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let events = editor.to_events(SAMPLE_RATE).into_boxed_slice();
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
 
-    let mut transport = Transport::new(TransportShared::new());
+    let mut transport = Transport::new(TransportShared::new(), SAMPLE_RATE);
 
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         transport.emit_track(0, &plan, processor.events_mut());
 
         mix.fill(0.0);
-        processor.process(pos, &mut mix)?;
+        processor.process(&transport.describe(&plan, pos), &mut mix)?;
 
         let peak = mix.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
         // 操作したブロック自体は境界なので、どの区間にも数えない
@@ -227,7 +227,7 @@ fn bypass_pass(entry: &PluginEntry, plugin_id: &str) -> Result<Vec<String>, Box<
     let spq = editor.samples_per_quarter(SAMPLE_RATE);
     let end_sample = (editor.length_quarters_bar_aligned() as f64 * spq) as u64;
 
-    let mut transport = Transport::new(TransportShared::new());
+    let mut transport = Transport::new(TransportShared::new(), SAMPLE_RATE);
     let _ = transport.handle_msg(TransportMsg::SetSequence {
         track: 0,
         events: editor.to_events(SAMPLE_RATE).into_boxed_slice(),
@@ -260,7 +260,7 @@ fn bypass_pass(entry: &PluginEntry, plugin_id: &str) -> Result<Vec<String>, Box<
         transport.emit_track(0, &plan, processor.events_mut());
 
         mix.fill(0.0);
-        processor.process(pos, &mut mix)?;
+        processor.process(&transport.describe(&plan, pos), &mut mix)?;
 
         let peak = mix.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
         match block {

@@ -8,7 +8,7 @@
 //! 音作りした結果が書き出しに乗らなくなる。
 
 use super::graph::{self, Graph};
-use super::transport::{self, Transport, TransportMsg, TransportShared};
+use super::transport::{self, BlockPlan, Transport, TransportMsg, TransportShared};
 use crate::sequencer::SeqEvent;
 
 /// 終端のあと、残響やリリースを録り切るために余分に回す長さ (秒)。
@@ -31,6 +31,13 @@ pub struct RenderSetup {
     /// 1ブロックのフレーム数。activate 時に宣言した上限を超えてはいけない。
     pub block_frames: usize,
     pub sample_rate: u32,
+    /// テンポ (BPM)。**鳴らす位置には効かない** (イベントの時刻は計算済み)。
+    /// プラグインへ見せる拍の情報にだけ使う。
+    pub tempo: f64,
+    /// 拍子の分子
+    pub beats: u16,
+    /// 拍子の分母
+    pub beat_type: u16,
 }
 
 /// レンダリング結果
@@ -103,7 +110,12 @@ pub fn render(graph: &mut Graph, setup: RenderSetup) -> Rendered {
     graph.reserve(block_frames);
 
     // 再生用の位置表示を巻き込まないよう、共有状態は使い捨てのものを渡す
-    let mut transport = Transport::new(TransportShared::new());
+    let mut transport = Transport::new(TransportShared::new(), setup.sample_rate as f64);
+    let _ = transport.handle_msg(TransportMsg::SetTime {
+        tempo: setup.tempo,
+        beats: setup.beats,
+        beat_type: setup.beat_type,
+    });
     for (track, events) in setup.sequences.into_iter().enumerate() {
         let _ = transport.handle_msg(TransportMsg::SetSequence {
             track,
@@ -111,18 +123,24 @@ pub fn render(graph: &mut Graph, setup: RenderSetup) -> Rendered {
             end_sample: setup.end_sample,
         });
     }
-    let _ = transport.handle_msg(TransportMsg::Play);
 
     let mut samples = Vec::with_capacity((total_frames as usize + block_frames) * channels);
     let mut failures = FailureLog::default();
 
     // 直前まで鳴っていた音を消してから録り始める (無音から始めるため)。
-    // このブロックの出力は捨てる。
+    // このブロックの出力は捨てる。まだ Play を送っていないので、
+    // プラグインには「停止中」の盤面が見える。
     graph.clear_events();
     for (_, processor) in graph.processors_mut() {
         transport::push_choke(processor.events_mut(), 0);
     }
-    graph.process(0, block_frames, &mut |track, e| failures.record(track, e));
+    graph.process(
+        &transport.describe(&BlockPlan::default(), 0),
+        block_frames,
+        &mut |track, e| failures.record(track, e),
+    );
+
+    let _ = transport.handle_msg(TransportMsg::Play);
 
     // 端数ブロックを作らず、常に同じ長さで回して最後に切る。
     // min_frames_count を下回るブロックをプラグインへ渡さずに済む。
@@ -133,9 +151,11 @@ pub fn render(graph: &mut Graph, setup: RenderSetup) -> Rendered {
         graph.clear_events();
         graph.emit_from(&mut transport, &plan);
 
-        graph.process(steady, block_frames, &mut |track, e| {
-            failures.record(track, e)
-        });
+        graph.process(
+            &transport.describe(&plan, steady),
+            block_frames,
+            &mut |track, e| failures.record(track, e),
+        );
         samples.extend_from_slice(graph.master(block_frames));
 
         steady += block_frames as u64;

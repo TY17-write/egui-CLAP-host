@@ -40,6 +40,10 @@ impl App {
             // activate 時に宣言した上限。これを超えるブロックは渡せない。
             block_frames: config.max_likely_buffer_size as usize,
             sample_rate: config.sample_rate,
+            // プラグインへ見せる拍の情報 (再生時と同じ値)
+            tempo: self.editor.editor.tempo.max(1) as f64,
+            beats: self.editor.editor.beats.max(1) as u16,
+            beat_type: self.editor.editor.beat_type.max(1) as u16,
         }
     }
 

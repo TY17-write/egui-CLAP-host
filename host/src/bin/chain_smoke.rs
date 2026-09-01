@@ -38,6 +38,7 @@
 use clack_host::prelude::*;
 use egui_clap_host::audio::config::StreamAudioConfig;
 use egui_clap_host::audio::events::BlockEvent;
+use egui_clap_host::audio::transport::BlockTransport;
 use egui_clap_host::audio::{self, TrackProcessor};
 use egui_clap_host::discovery;
 use egui_clap_host::host::{MiniHost, MiniHostMainThread, MiniHostShared};
@@ -359,9 +360,12 @@ fn run_chain(
             }
         }
 
-        // 呼び出し側が 0 で埋めてから渡す約束 (本体の再生・書き出しと同じ)
+        // 呼び出し側が 0 で埋めてから渡す約束 (本体の再生・書き出しと同じ)。
+        // トランスポートを持たない経路なので簡易盤面で流す
         buffer.fill(0.0);
-        track.process((block * BLOCK_SIZE as usize) as u64, &mut buffer)?;
+        let transport =
+            BlockTransport::free_run((block * BLOCK_SIZE as usize) as u64, SAMPLE_RATE as f64);
+        track.process(&transport, &mut buffer)?;
 
         // 1ブロック目は音の立ち上がりで値が安定しないので数えない
         if block > 0 {
