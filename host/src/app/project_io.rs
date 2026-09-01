@@ -7,6 +7,7 @@ use super::App;
 use crate::audio::graph;
 use crate::project::PluginSnapshot;
 use crate::{audio, midi, project};
+use eframe::egui;
 use std::path::PathBuf;
 
 /// 描画ループの中でファイルダイアログを開けないので、種類だけ持ち帰る
@@ -19,6 +20,13 @@ pub(super) enum FileAction {
     ExportWav,
     ExportOpus,
     ExportCcs,
+}
+
+/// 閉じる確認のボタンで選ばれたもの
+enum CloseChoice {
+    SaveAndClose,
+    Close,
+    Cancel,
 }
 
 impl App {
@@ -139,10 +147,12 @@ impl App {
 
     /// プロジェクトを保存する。
     /// `ask` が false なら、保存先が決まっていれば黙って上書きする (Ctrl+S)。
-    pub(super) fn save_project(&mut self, ask: bool) {
+    /// プロジェクトを保存する。**保存できたら true** (閉じる前の保存で見る)。
+    /// ダイアログをやめたときや書き込みに失敗したときは false。
+    pub(super) fn save_project(&mut self, ask: bool) -> bool {
         let path = if ask || self.project_path.is_none() {
             let Some(path) = self.ask_save_path("プロジェクト", "ron", "song") else {
-                return;
+                return false;
             };
             path
         } else {
@@ -155,22 +165,111 @@ impl App {
             Ok(text) => text,
             Err(e) => {
                 self.notice = Some(Notice::error("保存できません", e));
-                return;
+                return false;
             }
         };
 
-        match std::fs::write(&path, text) {
+        match std::fs::write(&path, &text) {
             Ok(()) => {
                 self.set_project_path(path.clone());
+                // 書けた内容が「保存済み」の新しい基準になる
+                self.saved_project = Some(text);
                 self.error = None;
+                true
             }
             Err(e) => {
                 self.notice = Some(Notice::error(
                     "保存できません",
                     format!("書き込めません:\n{e}"),
                 ));
+                false
             }
         }
+    }
+
+    /// 今の状態をプロジェクト形式の文字列にする (未保存の判定用)。
+    /// 直列化に失敗したら None (呼ぶ側は安全側 = 未保存扱いにする)
+    pub(super) fn project_text(&mut self) -> Option<String> {
+        let snapshots = self.audio_track_snapshots();
+        project::to_string(&self.editor.editor, &snapshots).ok()
+    }
+
+    /// 最後に保存 / 読み込みしてから変更があるか。
+    /// どちらかが直列化できていないときは**あるものとして扱う** (消える側に倒さない)
+    fn has_unsaved_changes(&mut self) -> bool {
+        match (self.project_text(), &self.saved_project) {
+            (Some(now), Some(saved)) => now != *saved,
+            _ => true,
+        }
+    }
+
+    /// ウィンドウを閉じる要求の扱い。**未保存の変更があれば止めて確認を出す。**
+    ///
+    /// eframe に「閉じる前に聞く」仕組みは無いので、閉じる要求を
+    /// `CancelClose` でいったん打ち消し、確認ウィンドウのボタンから
+    /// 改めて `Close` を送る。`close_confirmed` が立っていれば素通しする。
+    pub(super) fn confirm_close_window(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.close_confirmed
+            && self.has_unsaved_changes()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if !self.confirm_close {
+            return;
+        }
+
+        let mut action = None;
+        egui::Window::new("未保存の変更があります")
+            // 位置がリセットされないよう ID は固定する (notice と同じ流儀)
+            .id(egui::Id::new("confirm_close"))
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                match &self.project_path {
+                    Some(path) => ui.label(format!(
+                        "{} に保存していない変更があります。",
+                        file_label(path)
+                    )),
+                    None => ui.label("プロジェクトをまだ保存していません。"),
+                };
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("保存して終了").clicked() {
+                        action = Some(CloseChoice::SaveAndClose);
+                    }
+                    if ui.button("保存せずに終了").clicked() {
+                        action = Some(CloseChoice::Close);
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        action = Some(CloseChoice::Cancel);
+                    }
+                    ui.weak("(Esc でキャンセル)");
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            action = Some(CloseChoice::Cancel);
+        }
+
+        match action {
+            // 保存できたときだけ閉じる (ダイアログをやめたら閉じるのもやめる)
+            Some(CloseChoice::SaveAndClose) if self.save_project(false) => self.close(ctx),
+            Some(CloseChoice::Close) => self.close(ctx),
+            Some(CloseChoice::SaveAndClose) | None => {}
+            Some(CloseChoice::Cancel) => self.confirm_close = false,
+        }
+    }
+
+    /// 確認済みとして閉じる (次の閉じる要求は素通しになる)
+    fn close(&mut self, ctx: &egui::Context) {
+        self.close_confirmed = true;
+        self.confirm_close = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// プロジェクトを選んで読み込む。
@@ -212,6 +311,10 @@ impl App {
                 failures.extend(loaded.overflow);
 
                 self.set_project_path(path.clone());
+                // 「保存済み」の基準は**読み込んだ結果をもう一度直列化して**控える。
+                // ファイルの文字列そのものと比べると、プラグインが状態を
+                // 別の形で書き直しただけで未保存扱いになってしまう
+                self.saved_project = self.project_text();
                 self.error = None;
 
                 let mut body = format!(
@@ -396,5 +499,28 @@ mod tests {
     fn without_a_project_the_fallback_is_used() {
         assert_eq!(save_file_name(None, "opus", "mix"), "mix.opus");
         assert_eq!(save_file_name(None, "mid", "sequence"), "sequence.mid");
+    }
+
+    /// 基準と同じなら未保存なし、編集すると未保存あり、になること
+    #[test]
+    fn unsaved_changes_are_measured_against_the_saved_baseline() {
+        let mut app = App::default();
+        app.saved_project = app.project_text();
+        assert!(!app.has_unsaved_changes(), "直後は変更なしのはず");
+
+        app.editor.editor.tempo += 10;
+        assert!(app.has_unsaved_changes(), "テンポの変更は未保存の変更");
+
+        // 保存済みの基準を取り直せば、また変更なしに戻る
+        app.saved_project = app.project_text();
+        assert!(!app.has_unsaved_changes());
+    }
+
+    /// 基準が無い (直列化できていない) ときは、安全側 = 未保存として扱うこと
+    #[test]
+    fn a_missing_baseline_counts_as_unsaved() {
+        let mut app = App::default();
+        app.saved_project = None;
+        assert!(app.has_unsaved_changes());
     }
 }

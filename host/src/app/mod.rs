@@ -77,6 +77,18 @@ pub struct App {
     /// プロジェクトの保存先。Ctrl+S はここへ上書きする。
     /// MIDI のインポートでは設定しない (読み込んだファイルを上書きしないため)
     project_path: Option<PathBuf>,
+    /// 最後に保存 / 読み込みした時点のプロジェクト文字列。
+    ///
+    /// **今の状態を直列化してこれと比べる**のが「未保存の変更」の判定。
+    /// フラグを編集箇所ごとに立てる方式にしないのは、テンポ・ルーティング・
+    /// 音量・プラグインの状態まで漏れなく拾うため。比べるのは閉じる要求が
+    /// 来たときだけなので、毎フレームの負担にはならない。
+    /// 起動直後の状態が最初の基準になる (最初の `update` で控える)
+    saved_project: Option<String>,
+    /// 未保存のまま閉じようとしていて、確認ウィンドウを出している最中か
+    confirm_close: bool,
+    /// 「閉じてよい」と確認が済んだか。**次の閉じる要求を素通しする**
+    close_confirmed: bool,
     /// 最後に読み書きしたフォルダ (ダイアログの初期位置)
     last_directory: Option<PathBuf>,
     /// 画面中央に出す結果通知 (閉じるまで残る)。
@@ -131,6 +143,12 @@ impl eframe::App for App {
         // (付けないと、本体をクリックしたときに裏へ回る)
         if self.main_window.is_none() {
             self.main_window = crate::plugin_window::owner_of(frame);
+        }
+
+        // 起動直後の状態を「保存済み」の基準として1回だけ控える (未保存の判定用)。
+        // 自動ロード (検証用 CLI) より前に取るので、自動ロードは未保存扱いになる
+        if self.saved_project.is_none() {
+            self.saved_project = self.project_text();
         }
 
         // 起動時の自動ロード (検証用 CLI)
@@ -464,8 +482,12 @@ impl eframe::App for App {
                 Some(FileAction::ImportMidi) => self.import_midi(),
                 Some(FileAction::ExportMidi) => self.export_midi(),
                 Some(FileAction::OpenProject) => self.open_project(),
-                Some(FileAction::SaveProject) => self.save_project(false),
-                Some(FileAction::SaveProjectAs) => self.save_project(true),
+                Some(FileAction::SaveProject) => {
+                    self.save_project(false);
+                }
+                Some(FileAction::SaveProjectAs) => {
+                    self.save_project(true);
+                }
                 Some(FileAction::ExportWav) => self.export_wav(),
                 Some(FileAction::ExportOpus) => self.export_opus(),
                 Some(FileAction::ExportCcs) => self.export_ccs(),
@@ -530,6 +552,9 @@ impl eframe::App for App {
 
         // 結果通知は最前面に出したいので、パネルを描いたあとに重ねる
         notice_window(ctx, &mut self.notice);
+
+        // ウィンドウを閉じる要求。**未保存の変更があれば止めて確認する**
+        self.confirm_close_window(ctx);
 
         // 鍵盤の離鍵検出などのために定期的に再描画する。
         //
