@@ -493,7 +493,7 @@ pub(super) fn grid(
             ) {
                 // 複数選択中のノートを掴んだら選択全体を操作する (選択は変えない)
                 let bulk = state.selection.len() > 1 && state.is_selected(idx);
-                let targets = if bulk {
+                let mut targets = if bulk {
                     // 掴んだノートを先頭に置く (移動量・スナップの基準になる)
                     let mut targets = vec![(idx, state.editor.notes[idx])];
                     targets.extend(
@@ -508,6 +508,24 @@ pub(super) fn grid(
                     state.select_single(idx);
                     vec![(idx, state.editor.notes[idx])]
                 };
+
+                // **Shift+ドラッグは複製してから動かす** (元は置いたまま)。
+                // 端を掴んだときは通常どおり伸縮 (複製で伸縮を始めても押し違いにしか
+                // ならない)。複製の追加と続く移動は Move の1グループ = アンドゥ1回で
+                // 複製ごと戻る。動かさずに離すと元と重なったままになるが、
+                // 重なり警告 (赤枠) が出るので気付ける。
+                if matches!(hit, Hit::Body) && ui.input(|i| i.modifiers.shift) {
+                    state.history.record(EditGroup::Move);
+                    let base = state.editor.notes.len();
+                    for (offset, (source, note)) in targets.iter_mut().enumerate() {
+                        state.editor.notes.push(*note);
+                        *source = base + offset; // 以降のドラッグは複製のほうを動かす
+                    }
+                    // 選択も複製側へ移す (動かしているのはそちらのため)
+                    state.select_many(targets.iter().map(|(idx, _)| *idx).collect());
+                    state.dirty = true;
+                }
+
                 state.drag = Some(DragState {
                     kind: match hit {
                         Hit::Body => DragKind::Move,
