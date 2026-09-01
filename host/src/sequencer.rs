@@ -349,6 +349,56 @@ impl MidiEditor {
         }
     }
 
+    /// 同じトラックの同じ段で、時間の重なっているノートの印。
+    /// 戻り値は `notes` と同じ並びで、true のものがどれかと重なっている。
+    ///
+    /// **画面の警告用。** 同じ段のブロックは重なると隠れ合って、置いたことに
+    /// 気付けない (音符・CC・ヴェロシティのどの段でも同じ)。段が違えば
+    /// 見えているので、ここでは扱わない。
+    ///
+    /// 端がちょうど接しているだけ (前の終端 = 次の頭) は重なりではない。
+    pub fn overlapping_notes(&self) -> Vec<bool> {
+        let mut flags = vec![false; self.notes.len()];
+
+        // 段ごとに頭の位置で並べ、前後だけを比べる (総当たりにしない)
+        let mut order: Vec<usize> = (0..self.notes.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (na, nb) = (&self.notes[a], &self.notes[b]);
+            (na.track, na.lane)
+                .cmp(&(nb.track, nb.lane))
+                .then(na.start_tick.total_cmp(&nb.start_tick))
+        });
+
+        // 同じ段の中で「ここまでで一番遠い終端」を持ち回る。
+        // 頭がそれより手前なら、その終端のノートと必ず重なっている
+        // (頭で並べてあるので、終端側のノートの頭はこちらの頭より手前にある)。
+        let mut group: Option<(usize, usize)> = None; // (track, lane)
+        let mut far_end = f32::NEG_INFINITY;
+        let mut far_idx = 0usize;
+        for &idx in &order {
+            let note = &self.notes[idx];
+            let start = note.start_tick;
+            let end = start + note.duration.max(0.0);
+
+            if group != Some((note.track, note.lane)) {
+                group = Some((note.track, note.lane));
+                far_end = end;
+                far_idx = idx;
+                continue;
+            }
+
+            if start < far_end {
+                flags[idx] = true;
+                flags[far_idx] = true;
+            }
+            if end > far_end {
+                far_end = end;
+                far_idx = idx;
+            }
+        }
+        flags
+    }
+
     /// トラックを末尾に追加する
     pub fn add_track(&mut self) {
         self.tracks.push(TrackInfo::new(self.tracks.len()));
@@ -957,6 +1007,48 @@ mod tests {
             track: 0,
             lane: 0,
         }
+    }
+
+    /// 同じ段で時間の重なったノートは両方に印が付くこと
+    #[test]
+    fn overlapping_notes_on_the_same_lane_are_flagged() {
+        let mut editor = MidiEditor::default();
+        editor.notes = vec![
+            note(0.0, 2.0, 0, 4),  // 0〜2
+            note(1.0, 2.0, 4, 4),  // 1〜3 (前と重なる。音高が違っても隠れるのは同じ)
+            note(3.0, 1.0, 7, 4),  // 3〜4 (前の終端に接するだけ = 重なりではない)
+            note(10.0, 1.0, 0, 4), // 離れている
+        ];
+
+        assert_eq!(editor.overlapping_notes(), vec![true, true, false, false]);
+    }
+
+    /// 段が違えば重なりとしないこと (見えているので警告は要らない)
+    #[test]
+    fn different_lanes_or_tracks_do_not_count_as_overlap() {
+        let mut editor = MidiEditor::default();
+        editor.add_track();
+        let mut other_lane = note(0.0, 4.0, 0, 4);
+        other_lane.lane = 1;
+        let mut other_track = note(0.0, 4.0, 0, 4);
+        other_track.track = 1;
+        editor.notes = vec![note(0.0, 4.0, 0, 4), other_lane, other_track];
+
+        assert_eq!(editor.overlapping_notes(), vec![false, false, false]);
+    }
+
+    /// 長いノートの中に複数入っているときは、関わったもの全部に印が付くこと。
+    /// (直前だけを比べる作りだと3つ目が漏れる)
+    #[test]
+    fn every_note_inside_a_long_one_is_flagged() {
+        let mut editor = MidiEditor::default();
+        editor.notes = vec![
+            note(0.0, 8.0, 0, 4), // 全体を覆う
+            note(1.0, 1.0, 4, 4), // 中
+            note(4.0, 1.0, 7, 4), // 中 (2つ目とは接していない)
+        ];
+
+        assert_eq!(editor.overlapping_notes(), vec![true, true, true]);
     }
 
     /// トラックと段の増減は、ノートを消してしまわないこと

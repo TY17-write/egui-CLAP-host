@@ -238,6 +238,8 @@ pub(super) fn grid(
     }
 
     // ---- ノート ----
+    // 同じ段で重なっているノートの印 (ドラッグ中も毎フレーム追従する)
+    let overlapped = state.editor.overlapping_notes();
     for (idx, note) in state.editor.notes.iter().enumerate() {
         let rect = note_rect(origin, note_row(&row_offsets, note), note, ppq, row_h);
         // CC ブロックは音高で色を変えても意味が無い。音符と取り違えないよう、
@@ -281,6 +283,29 @@ pub(super) fn grid(
                     }
                 },
                 fill,
+            );
+        }
+
+        // **重なりの警告は内・外の二重枠。** 同じ段のブロックは重なると
+        // 隠れ合って、置いたことに気付けない。内側の明るい赤はノート色の上で、
+        // 外側の濃い赤は暗い背景の上で浮く — 1本だけだと赤いノートに
+        // 赤枠が沈む。選択中は外側が白枠 (あとから描く) に替わるが、
+        // 内側は残るので警告は見失わない。
+        if overlapped[idx] {
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(4),
+                Stroke::new(
+                    2.0_f32,
+                    palette::RED.lerp_to_gamma(egui::Color32::WHITE, 0.5),
+                ),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(4),
+                Stroke::new(2.0_f32, palette::RED),
+                egui::StrokeKind::Outside,
             );
         }
 
