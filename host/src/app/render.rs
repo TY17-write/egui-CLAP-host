@@ -186,7 +186,7 @@ impl App {
         }
 
         // 時間のかかる処理に入る前に保存先を聞く
-        let Some(path) = self.ask_save_path("WAV ファイル", "wav", "mix.wav") else {
+        let Some(path) = self.ask_save_path("WAV ファイル", "wav", "mix") else {
             return;
         };
 
@@ -300,7 +300,7 @@ impl App {
         const { assert!(graph::BUS_CHANNELS <= 2, "Opus はステレオまで") };
 
         // 時間のかかる処理に入る前に保存先を聞く
-        let Some(path) = self.ask_save_path("Opus ファイル", "opus", "mix.opus") else {
+        let Some(path) = self.ask_save_path("Opus ファイル", "opus", "mix") else {
             return;
         };
 
@@ -414,7 +414,7 @@ impl App {
             }
         };
 
-        let Some(path) = self.ask_save_path("CeVIO プロジェクト", "ccs", "song.ccs") else {
+        let Some(path) = self.ask_save_path("CeVIO プロジェクト", "ccs", "song") else {
             return;
         };
 

@@ -199,13 +199,18 @@ impl App {
         }
     }
 
-    /// ファイルダイアログを開くフォルダ
+    /// ファイルダイアログを開くフォルダ。
+    ///
+    /// プロジェクトの場所 → 前回使った場所 → 既定の保存先 (exe の隣の saves\)
+    /// の順で決める。前回の場所を挟むのは、ユーザーが自分で選んだ場所を
+    /// 既定で上書きしないため。
     pub(super) fn dialog_directory(&self) -> Option<PathBuf> {
         self.project_path
             .as_ref()
             .and_then(|path| path.parent())
             .map(PathBuf::from)
             .or_else(|| self.last_directory.clone())
+            .or_else(default_save_directory)
     }
 
     /// 選んだプラグインを指定の段に載せる (詳細ウィンドウからの操作)
@@ -336,4 +341,14 @@ impl App {
             }
         }
     }
+}
+
+/// 既定の保存先: **exe のあるフォルダの saves\\**。無ければここで作る。
+///
+/// 作れないとき (読み取り専用の場所に置かれた等) は None を返し、
+/// ダイアログは OS の既定の場所で開く。
+fn default_save_directory() -> Option<PathBuf> {
+    let directory = std::env::current_exe().ok()?.parent()?.join("saves");
+    std::fs::create_dir_all(&directory).ok()?;
+    Some(directory)
 }

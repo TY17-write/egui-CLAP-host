@@ -86,7 +86,7 @@ impl App {
     /// **画面上は「出力」の仲間**だが、コードは MIDI の読み込みと隣に置いてある
     /// (同じ形式の入り口と出口を離すほうが探しにくい)。
     pub(super) fn export_midi(&mut self) {
-        let Some(path) = self.ask_save_path("MIDI ファイル", "mid", "sequence.mid") else {
+        let Some(path) = self.ask_save_path("MIDI ファイル", "mid", "sequence") else {
             return;
         };
 
@@ -141,7 +141,7 @@ impl App {
     /// `ask` が false なら、保存先が決まっていれば黙って上書きする (Ctrl+S)。
     pub(super) fn save_project(&mut self, ask: bool) {
         let path = if ask || self.project_path.is_none() {
-            let Some(path) = self.ask_save_path("プロジェクト", "ron", "song.ron") else {
+            let Some(path) = self.ask_save_path("プロジェクト", "ron", "song") else {
                 return;
             };
             path
@@ -248,15 +248,19 @@ impl App {
     }
 
     /// 保存先を選ばせる。拡張子を省略されたら補う。
+    ///
+    /// 既定のファイル名は**プロジェクトを開いていればその名前**
+    /// (song.ron → song.opus)。開いていなければ `fallback_stem` を使う。
     pub(super) fn ask_save_path(
         &mut self,
         filter: &str,
         extension: &str,
-        default_name: &str,
+        fallback_stem: &str,
     ) -> Option<PathBuf> {
+        let name = save_file_name(self.project_path.as_deref(), extension, fallback_stem);
         let mut dialog = rfd::FileDialog::new()
             .add_filter(filter, &[extension])
-            .set_file_name(default_name);
+            .set_file_name(name);
         if let Some(directory) = self.dialog_directory() {
             dialog = dialog.set_directory(directory);
         }
@@ -353,5 +357,44 @@ impl App {
             self.set_midi_sources(index, midi);
         }
         failures
+    }
+}
+
+/// 保存ダイアログに出す既定のファイル名。
+///
+/// プロジェクトを開いていれば**プロジェクト名 + 書き出す形式の拡張子**
+/// (song.ron → song.opus)。開いていなければ `fallback_stem` + 拡張子。
+fn save_file_name(
+    project_path: Option<&std::path::Path>,
+    extension: &str,
+    fallback_stem: &str,
+) -> String {
+    let stem = project_path
+        .and_then(|path| path.file_stem())
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fallback_stem.to_string());
+    format!("{stem}.{extension}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// プロジェクトを開いていれば、その名前で書き出すこと (song.ron → song.opus)
+    #[test]
+    fn exports_take_the_project_name() {
+        let project = Path::new(r"C:\music\saves\song.ron");
+        assert_eq!(save_file_name(Some(project), "opus", "mix"), "song.opus");
+        assert_eq!(save_file_name(Some(project), "wav", "mix"), "song.wav");
+        // プロジェクト自身の保存 (名前を付けて保存) も今の名前が既定になる
+        assert_eq!(save_file_name(Some(project), "ron", "song"), "song.ron");
+    }
+
+    /// プロジェクトが無ければ従来どおりの名前になること
+    #[test]
+    fn without_a_project_the_fallback_is_used() {
+        assert_eq!(save_file_name(None, "opus", "mix"), "mix.opus");
+        assert_eq!(save_file_name(None, "mid", "sequence"), "sequence.mid");
     }
 }
