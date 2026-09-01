@@ -4,11 +4,11 @@
 //! [`egui_clap_host::app`](egui_clap_host::app) にあり、ライブラリ側に置いてあるので
 //! `cargo test --lib` に一緒に乗る。
 
-// GUI アプリなので、起動時に黒いコンソールを出さない (Windows のみ効く)。
-// 引き換えに標準出力・標準エラーの行き先が無くなるため、cargo run で
-// パニックのメッセージを見たいときは一時的に外すこと。
+// GUI アプリなので、リリースビルドでは起動時に黒いコンソールを出さない
+// (Windows のみ効く)。引き換えに標準出力・標準エラーの行き先が無くなるため、
+// デバッグビルドには付けず、cargo run でパニックのメッセージを見られるままにする。
 // smoke 系のバイナリはコンソールで使うものなので、こちらには付けない。
-//#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use egui_clap_host::{app::App, theme};
 
@@ -33,8 +33,12 @@ fn main() -> eframe::Result {
         .map(PathBuf::from);
 
     let options = eframe::NativeOptions {
-        // 幅は上部のメーター (スペクトル + ラウドネス) が入る大きさにしてある。
-        // これより狭いと、オーディオトラックのボタンとメーターが折り返す
+        // inner_size は最大化を解除したときに戻る大きさで、
+        // 上部のメーター (スペクトル + ラウドネス) が入る幅にしてある。
+        // これより狭いと、オーディオトラックのボタンとメーターが折り返す。
+        // 起動時の最大化はここ (ViewportBuilder::with_maximized) では行わない:
+        // inner_size と併用すると Windows では「最大化フラグだけ立って寸法が
+        // 従来サイズのまま」になる。代わりに下でコマンドとして送る
         viewport: egui::ViewportBuilder::default().with_inner_size([1320.0, 620.0]),
         ..Default::default()
     };
@@ -44,6 +48,10 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             setup_japanese_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
+            // 起動時に最大化する。コマンドはキューされ、最初のフレームの後に
+            // ウィンドウへ適用される (生成時に指定しない理由は上のコメント)
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             Ok(Box::new(App::with_autoload(
                 autoload_path.map(|p| (p, auto_open_gui)),
             )))
