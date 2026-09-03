@@ -40,6 +40,15 @@ fn main() -> eframe::Result {
         // inner_size と併用すると Windows では「最大化フラグだけ立って寸法が
         // 従来サイズのまま」になる。代わりに下でコマンドとして送る
         viewport: egui::ViewportBuilder::default().with_inner_size([1320.0, 620.0]),
+        // **vsync は切る。** ON だと毎フレームの SwapBuffers が次の垂直同期まで
+        // スレッドを塞ぎ (最大 16.7ms)、内蔵 GPU の古いドライバはそれを
+        // ビジーウェイトで行う。同じスレッドで動くプラグインのエディタが
+        // その間止まり、2コア機ではエディタがほぼ動かなくなった
+        // (ホスト自身の描画は 3ms なのに、エディタのタイトルバーを掴んで
+        // ホストの描画を止めると滑らかになる、という症状)。
+        // 描画の間隔は App が request_repaint_after で自前に刻んでいるので、
+        // 上限としての vsync は要らない。DWM が合成するので tearing も出ない
+        vsync: false,
         ..Default::default()
     };
     eframe::run_native(

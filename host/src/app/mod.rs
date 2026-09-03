@@ -103,6 +103,12 @@ pub struct App {
     /// ([`TransportShared::pass`](crate::audio::transport::TransportShared::pass))。
     /// **増えていたら Integrated を測り直す**
     meter_pass: u64,
+    /// 1 フレームの処理時間 (ms) をならしたもの (上部バーの右端に出す)。
+    ///
+    /// **遅い機でプラグインのエディタが止まる件の目安。** ホストの描画が
+    /// 同じスレッドのプラグインの時間を奪うので、この値が大きいほど
+    /// エディタは動かなくなる。手元で再現しない機の数字をもらうための表示
+    frame_ms: f32,
     /// 走査したプラグインの一覧 (`config\plugins.ron`)
     library: Library,
     /// 走査の進行。**`Some` の間は毎フレーム1ファイルずつ進む**
@@ -143,6 +149,12 @@ impl eframe::App for App {
         // (付けないと、本体をクリックしたときに裏へ回る)
         if self.main_window.is_none() {
             self.main_window = crate::plugin_window::owner_of(frame);
+        }
+
+        // 直前のフレームの処理時間をならして控える (表示用。急な上下で
+        // 数字がちらつかないよう、1/10 ずつ寄せる)
+        if let Some(secs) = frame.info().cpu_usage.filter(|secs| secs.is_finite()) {
+            self.frame_ms += (secs * 1000.0 - self.frame_ms) * 0.1;
         }
 
         // 起動直後の状態を「保存済み」の基準として1回だけ控える (未保存の判定用)。
@@ -344,6 +356,16 @@ impl eframe::App for App {
 
                 ui.separator();
                 self.master_meters(ui);
+
+                // **1 フレームの処理時間。** 遅い機でプラグインのエディタが止まる
+                // 件の目安 (ホストの描画が重いほどエディタの取り分が減る)
+                ui.separator();
+                ui.weak(format!("描画 {:.0} ms", self.frame_ms))
+                    .on_hover_text(
+                        "ホストの 1 フレームの処理時間 (update + 描画。vsync 待ちを除く)。\n\
+                         プラグインのエディタは同じスレッドで動くので、これが大きいほど\n\
+                         エディタの動きが鈍くなります。目安: 10 ms 未満なら余裕あり",
+                    );
             });
         });
 
@@ -573,7 +595,65 @@ impl eframe::App for App {
         // (Native Instruments の音源で発覚。経緯は docs/archive/vst3_host_plan.md のフェーズ7)。
         //
         // エディタを開いていないときは誰も割を食わないので、そのまま滑らかに保つ。
-        let interval = if self.any_editor_open() { 33 } else { 16 };
-        ctx.request_repaint_after(Duration::from_millis(interval));
+        //
+        // **固定値ではなく、直前のフレーム時間からも決める。** 遅い機
+        // (2コア + 内蔵 GPU で 1 フレームが 33ms を超える) では 33ms でも
+        // 毎回期限切れになり、上と同じ症状 (プラグインのタイマーが動かず
+        // エディタが止まる) が出た。`cpu_usage` は update + 描画の実時間
+        // (vsync 待ちを除く) なので、その2倍を下限に足しておけば、期限が
+        // 描画の終わりより先に来て必ず待機に入る。
+        let floor = if self.any_editor_open() { 33 } else { 16 };
+        let interval = repaint_interval(floor, frame.info().cpu_usage);
+        ctx.request_repaint_after(interval);
+    }
+}
+
+/// 次の再描画までの間隔。`floor_ms` と「直前のフレーム時間の2倍」の大きいほう。
+///
+/// 上限を設けるのは、プラグインの読み込みのように**1回だけ数秒かかるフレーム**の
+/// あとで、その2倍も待たされないため (待たされる間は画面が固まって見える)。
+fn repaint_interval(floor_ms: u64, last_frame_secs: Option<f32>) -> Duration {
+    /// 待つ長さの上限。これより遅い機ではどのみち fps は出ないので、
+    /// 待機に入ることのほうを優先する
+    const CEILING: Duration = Duration::from_millis(250);
+
+    let floor = Duration::from_millis(floor_ms);
+    // ミリ秒に丸める (f32 の秒をそのまま Duration にすると 80ms が 79.999998ms に
+    // なるような端数が出る。ここにサブミリ秒の精度は要らない)。
+    // 最初のフレームには値が無い。負や NaN は弾く (as u64 は 0 に潰す)
+    let last = last_frame_secs
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .map_or(Duration::ZERO, |secs| {
+            Duration::from_millis((secs * 2000.0).round() as u64)
+        });
+    floor.max(last).min(CEILING)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 速い機では従来どおりの固定値になること
+    #[test]
+    fn a_fast_machine_keeps_the_floor() {
+        assert_eq!(repaint_interval(33, Some(0.005)), Duration::from_millis(33));
+        assert_eq!(repaint_interval(16, None), Duration::from_millis(16));
+    }
+
+    /// 遅い機では直前のフレーム時間の2倍まで伸びること
+    #[test]
+    fn a_slow_machine_waits_twice_the_last_frame() {
+        assert_eq!(repaint_interval(33, Some(0.040)), Duration::from_millis(80));
+    }
+
+    /// 1回だけ長いフレームがあっても上限で止まること。おかしな値は無視すること
+    #[test]
+    fn spikes_are_capped_and_garbage_is_ignored() {
+        assert_eq!(repaint_interval(33, Some(3.0)), Duration::from_millis(250));
+        assert_eq!(repaint_interval(33, Some(-1.0)), Duration::from_millis(33));
+        assert_eq!(
+            repaint_interval(33, Some(f32::NAN)),
+            Duration::from_millis(33)
+        );
     }
 }

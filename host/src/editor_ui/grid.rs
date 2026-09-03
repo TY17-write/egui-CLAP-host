@@ -645,8 +645,11 @@ pub(super) fn grid(
                         Stroke::new(1.0_f32, palette::FG_DIM),
                         egui::StrokeKind::Inside,
                     );
-                    // 選択枠はノートより後に描くので、次フレームで囲みを反映させる
-                    ui.ctx().request_repaint();
+                    // 選択枠はノートより後に描くので、次フレームで囲みを反映させる。
+                    // vsync を切ってあるので、即時ではなく 1 フレームぶん待つ
+                    // (即時だと描けるだけ描いて CPU を使い切る)
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
                 }
             }
 
@@ -658,7 +661,9 @@ pub(super) fn grid(
                 if delta != egui::Vec2::ZERO {
                     ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
                     // カーソルが静止していてもスクロールを続けるため再描画を要求する
-                    ui.ctx().request_repaint();
+                    // (vsync を切ってあるので 1 フレームぶん待つ。上と同じ理由)
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
                 }
             }
         }
