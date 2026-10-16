@@ -174,7 +174,16 @@ impl App {
     /// 借りたノードをオーディオスレッドへ返す。
     ///
     /// **返さないと音が出なくなる。** 途中で諦めるときも必ず通ること。
-    pub(super) fn return_processors(&mut self, nodes: Vec<(audio::NodeAddr, audio::Node)>) {
+    ///
+    /// 並びは問わない (ここで段の昇順へ直す)。
+    pub(super) fn return_processors(&mut self, mut nodes: Vec<(audio::NodeAddr, audio::Node)>) {
+        // **前の段から載せる。** `SetNode` は段数と同じ位置なら末尾へ足し、
+        // それより前なら差し替える。借りたときの逆順 (後ろの段が先) のまま送ると、
+        // 空のチェーンへ 1 段目が先頭に入り、続く 0 段目がそれを押し出す。
+        // 押し出された処理器は drain_retired で「時間切れで返ってきたもの」と
+        // 見なされ、画面の段まで消えていた
+        nodes.sort_by_key(|(addr, _)| (addr.track, addr.at));
+
         // **今の割り当てを送り直す。** 既定の対応で埋めると、打ち込みを
         // 繋ぎ替えているプロジェクトでは書き出しのたびにオーディオスレッド側だけが
         // 既定へ戻る (画面には元の割り当てが出たまま鳴らなくなる)

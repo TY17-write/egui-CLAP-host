@@ -239,8 +239,12 @@ pub(super) fn collect_processors(
 /// 出力ストリームを1本だけ作る (最初に音源をロードするときに一度だけ呼ぶ)
 pub(super) fn start_engine() -> Result<Engine, Box<dyn Error>> {
     let (producer, consumer) = rtrb::RingBuffer::new(256);
-    // 外した音源をメインスレッドへ返す口 (オーディオスレッドで解放しないため)
-    let (retired_producer, retired) = rtrb::RingBuffer::new(8);
+    // 外した音源をメインスレッドへ返す口 (オーディオスレッドで解放しないため)。
+    // **載せられる段を全部入れられる大きさにする。** 書き出しでは全段を
+    // 1ブロックの間にまとめて外すので、ここが段の総数より小さいと、
+    // 溢れたぶんがオーディオスレッドで捨てられる (以前は 8 で、10 段の
+    // プロジェクトを書き出すと 2 段の処理器が失われていた)
+    let (retired_producer, retired) = rtrb::RingBuffer::new(graph::AUDIO_TRACKS * graph::MAX_NODES);
     // マスターの出力をメーターへ渡す口。**0.5秒ぶん**あれば、画面が少し
     // 止まっても取りこぼさない。溢れたぶんはオーディオ側が捨てる
     let (monitor_producer, monitor) = rtrb::RingBuffer::new(MONITOR_RING_SAMPLES);
